@@ -206,7 +206,7 @@ func TestFetchHTTPBodyLimitExceededNeverLeaksURL(t *testing.T) {
 
 func TestFetchFileScheme(t *testing.T) {
 	dir := t.TempDir()
-	p := filepath.Join(dir, "data with space #?%.txt")
+	p := filepath.Join(dir, "data with space #%.txt")
 	if err := os.WriteFile(p, []byte("hello file scheme"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -228,6 +228,9 @@ func TestFileURLConstruction(t *testing.T) {
 		{"C:\\Users\\runner\\data.txt", "file:///C:/Users/runner/data.txt"},
 		{"C:/Users/runner/data.txt", "file:///C:/Users/runner/data.txt"},
 		{"/C:/Users/runner/data.txt", "file:///C:/Users/runner/data.txt"},
+		// '?' is forbidden in Windows filenames; cover its URL escaping
+		// without creating a file on disk.
+		{"C:/Users/runner/data with space #?%.txt", "file:///C:/Users/runner/data%20with%20space%20%23%3F%25.txt"},
 	}
 	for _, tc := range cases {
 		got := fileURL(tc.input)
