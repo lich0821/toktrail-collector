@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf16"
 )
 
 // ---------------------------------------------------------------------------
@@ -19,29 +20,51 @@ import (
 // ---------------------------------------------------------------------------
 
 // recordingRunner records every command it is asked to run and can be
-// primed to fail specific command names.
+// primed to fail or return output for specific command names.
 type recordingRunner struct {
 	runs    []string
 	failers map[string]error
+	outputs map[string][]byte
 }
 
 func (r *recordingRunner) Run(name string, args ...string) error {
-	line := name + " " + strings.Join(args, " ")
+	_, err := r.RunOutput(name, args...)
+	return err
+}
+
+func (r *recordingRunner) RunOutput(name string, args ...string) ([]byte, error) {
+	line := name
+	if len(args) > 0 {
+		line += " " + strings.Join(args, " ")
+	}
 	r.runs = append(r.runs, line)
 	if r.failers != nil {
 		if err, ok := r.failers[name]; ok {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	if r.outputs != nil {
+		if out, ok := r.outputs[line]; ok {
+			return out, nil
+		}
+		if out, ok := r.outputs[name]; ok {
+			return out, nil
+		}
+	}
+	return nil, nil
 }
 
 // failingRunner fails every command; used for uninstall tolerance tests.
 type failingRunner struct{ runs []string }
 
 func (r *failingRunner) Run(name string, args ...string) error {
+	_, err := r.RunOutput(name, args...)
+	return err
+}
+
+func (r *failingRunner) RunOutput(name string, args ...string) ([]byte, error) {
 	r.runs = append(r.runs, name)
-	return errors.New("command unavailable")
+	return nil, errors.New("command unavailable")
 }
 
 // testConfig builds a valid TaskConfig rooted at temp paths so tests never
@@ -325,7 +348,7 @@ func TestInstallWritesFilesAndRunsCommandsInOrder(t *testing.T) {
 		if err != nil || !info.IsDir() {
 			t.Fatalf("ensure dir missing: %s (%v)", dir, err)
 		}
-		if info.Mode().Perm() != 0o700 {
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o700 {
 			t.Fatalf("ensure dir must be 0700, got %#o", info.Mode().Perm())
 		}
 	}
@@ -532,6 +555,102 @@ func TestIsInstalledAndOwnedFileCheck(t *testing.T) {
 	if err := OwnedFileCheck(files[0], plan.TaskName, "/other/state"); err == nil {
 		t.Fatal("foreign marker must fail the owned-file check")
 	}
+}
+
+func TestIsInstalledAndOwnedFileCheckWindows(t *testing.T) {
+	cfg, _, _ := testConfig(t)
+	cfg.Platform = "windows"
+
+	// 1. Missing task (runner returns error indicating task not found)
+	notFoundRunner := &recordingRunner{
+		failers: map[string]error{
+			"schtasks": &commandError{err: errors.New("exit status 1"), name: "schtasks", output: "ERROR: The system cannot find the file specified."},
+		},
+	}
+	installed, _, err := IsInstalledWithRunner(cfg, notFoundRunner)
+	if err != nil || installed {
+		t.Fatalf("expected not installed when schtasks returns not found: installed=%v, err=%v", installed, err)
+	}
+
+	plan, err := RenderInstall(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Installed task with UTF-8 XML output
+	utf8Runner := &recordingRunner{
+		outputs: map[string][]byte{
+			"schtasks": []byte(plan.Files[0].Content),
+		},
+	}
+	taskName := windowsTaskName(plan.TaskName)
+	installed, files, err := IsInstalledWithRunner(cfg, utf8Runner)
+	if err != nil || !installed {
+		t.Fatalf("expected installed with UTF-8 schtasks output: %v %v", installed, err)
+	}
+	if len(files) != 1 || files[0] != "schtasks:"+taskName {
+		t.Fatalf("expected schtasks task to be reported: %v", files)
+	}
+
+	// 3. Installed task with UTF-16LE (with BOM) XML output
+	utf16LE := encodeUTF16LEWithBOM(plan.Files[0].Content)
+	utf16Runner := &recordingRunner{
+		outputs: map[string][]byte{
+			"schtasks": utf16LE,
+		},
+	}
+	installed, files, err = IsInstalledWithRunner(cfg, utf16Runner)
+	if err != nil || !installed {
+		t.Fatalf("expected installed with UTF-16LE schtasks output: %v %v", installed, err)
+	}
+	if len(files) != 1 || files[0] != "schtasks:"+taskName {
+		t.Fatalf("expected schtasks task to be reported: %v", files)
+	}
+
+	// 4. Foreign task XML output (wrong state dir / identity)
+	foreignRunner := &recordingRunner{
+		outputs: map[string][]byte{
+			"schtasks": []byte("<Task><Description>foreign task</Description></Task>"),
+		},
+	}
+	installed, _, err = IsInstalledWithRunner(cfg, foreignRunner)
+	if installed || err == nil {
+		t.Fatalf("expected foreign task query to fail ownership check: installed=%v, err=%v", installed, err)
+	}
+
+	// 5. Access denied error must surface as a query failure error, not absent
+	accessDeniedRunner := &recordingRunner{
+		failers: map[string]error{
+			"schtasks": &commandError{err: errors.New("exit status 1"), name: "schtasks", output: "ERROR: Access is denied."},
+		},
+	}
+	installed, _, err = IsInstalledWithRunner(cfg, accessDeniedRunner)
+	if installed || err == nil {
+		t.Fatalf("access denied must return a query failure error: installed=%v, err=%v", installed, err)
+	}
+
+	// 6. Malformed odd-length UTF-16 output must fail ownership check without panic
+	malformedRunner := &recordingRunner{
+		outputs: map[string][]byte{
+			"schtasks": {0xFF, 0xFE, 'A', 0x00, 'B'},
+		},
+	}
+	installed, _, err = IsInstalledWithRunner(cfg, malformedRunner)
+	if installed || err == nil {
+		t.Fatalf("malformed UTF-16 output must fail ownership check without panic: installed=%v, err=%v", installed, err)
+	}
+}
+
+func encodeUTF16LEWithBOM(s string) []byte {
+	u16 := utf16.Encode([]rune(s))
+	b := make([]byte, 2+2*len(u16))
+	b[0] = 0xFF
+	b[1] = 0xFE
+	for i, v := range u16 {
+		b[2+2*i] = byte(v)
+		b[2+2*i+1] = byte(v >> 8)
+	}
+	return b
 }
 
 func TestWritePlanIsSafeDryRun(t *testing.T) {

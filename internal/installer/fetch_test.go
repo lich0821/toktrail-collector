@@ -206,16 +206,86 @@ func TestFetchHTTPBodyLimitExceededNeverLeaksURL(t *testing.T) {
 
 func TestFetchFileScheme(t *testing.T) {
 	dir := t.TempDir()
-	p := filepath.Join(dir, "data.txt")
+	p := filepath.Join(dir, "data with space #?%.txt")
 	if err := os.WriteFile(p, []byte("hello file scheme"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got, err := Fetch("file://"+filepath.ToSlash(p), 1024)
+	got, err := Fetch(fileURL(p), 1024)
 	if err != nil {
 		t.Fatalf("Fetch file: %v", err)
 	}
 	if string(got) != "hello file scheme" {
 		t.Errorf("got %q, want %q", got, "hello file scheme")
+	}
+}
+
+func TestFileURLConstruction(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"/tmp/data.txt", "file:///tmp/data.txt"},
+		{"C:\\Users\\runner\\data.txt", "file:///C:/Users/runner/data.txt"},
+		{"C:/Users/runner/data.txt", "file:///C:/Users/runner/data.txt"},
+		{"/C:/Users/runner/data.txt", "file:///C:/Users/runner/data.txt"},
+	}
+	for _, tc := range cases {
+		got := fileURL(tc.input)
+		if got != tc.want {
+			t.Errorf("fileURL(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestResolveFilePathWindows(t *testing.T) {
+	cases := []struct {
+		rawURL string
+		want   string
+	}{
+		{"file:///C:/path/to/file.txt", "C:\\path\\to\\file.txt"},
+		{"file:///c:/path/to/file.txt", "c:\\path\\to\\file.txt"},
+		{"file://localhost/C:/path/to/file.txt", "C:\\path\\to\\file.txt"},
+	}
+	for _, tc := range cases {
+		u, err := url.Parse(tc.rawURL)
+		if err != nil {
+			t.Fatalf("url.Parse(%q): %v", tc.rawURL, err)
+		}
+		got, err := resolveFilePathOS(u, "windows")
+		if err != nil {
+			t.Errorf("resolveFilePathOS(%q, windows) error: %v", tc.rawURL, err)
+			continue
+		}
+		wantSlash := strings.ReplaceAll(tc.want, "\\", string(filepath.Separator))
+		if got != wantSlash {
+			t.Errorf("resolveFilePathOS(%q, windows) = %q, want %q", tc.rawURL, got, wantSlash)
+		}
+	}
+}
+
+func TestResolveFilePathRejectsRemoteHost(t *testing.T) {
+	badURLs := []struct {
+		rawURL   string
+		wantHost string
+	}{
+		{"file://remotehost/share/data.txt", "remotehost"},
+		{"file://example.com/data.txt", "example.com"},
+		{"file://C:/Users/runner/data.txt", "C:"},
+	}
+	for _, tc := range badURLs {
+		u, err := url.Parse(tc.rawURL)
+		if err != nil {
+			t.Fatalf("url.Parse(%q): %v", tc.rawURL, err)
+		}
+		_, err = resolveFilePathOS(u, "windows")
+		if err == nil {
+			t.Errorf("resolveFilePathOS(%q) expected error for remote host", tc.rawURL)
+			continue
+		}
+		wantMsg := fmt.Sprintf("file url with remote host %q is not supported", tc.wantHost)
+		if err.Error() != wantMsg {
+			t.Errorf("resolveFilePathOS(%q) error = %q, want %q", tc.rawURL, err.Error(), wantMsg)
+		}
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -49,13 +50,49 @@ func sanitizedParseError(err error) error {
 	return errors.New("parse url: invalid url (input redacted)")
 }
 
-func fetchFile(u *url.URL, maxBytes int64) ([]byte, error) {
+func isWindowsDrive(s string) bool {
+	if len(s) != 2 {
+		return false
+	}
+	c := s[0]
+	return ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) && s[1] == ':'
+}
+
+// fileURL converts a local filesystem path to a standard file:/// URL.
+func fileURL(p string) string {
+	slash := filepath.ToSlash(p)
+	slash = strings.ReplaceAll(slash, "\\", "/")
+	if !strings.HasPrefix(slash, "/") {
+		slash = "/" + slash
+	}
+	return (&url.URL{Scheme: "file", Path: slash}).String()
+}
+
+func resolveFilePathOS(u *url.URL, goos string) (string, error) {
 	if u.Host != "" && u.Host != "localhost" {
-		return nil, fmt.Errorf("file url with remote host %q is not supported", u.Host)
+		return "", fmt.Errorf("file url with remote host %q is not supported", u.Host)
 	}
 	path := u.Path
 	if path == "" {
-		return nil, errors.New("file url has empty path")
+		return "", errors.New("file url has empty path")
+	}
+	if goos == "windows" {
+		if len(path) >= 3 && path[0] == '/' && isWindowsDrive(path[1:3]) {
+			path = path[1:]
+		}
+		path = filepath.FromSlash(path)
+	}
+	return path, nil
+}
+
+func resolveFilePath(u *url.URL) (string, error) {
+	return resolveFilePathOS(u, runtime.GOOS)
+}
+
+func fetchFile(u *url.URL, maxBytes int64) ([]byte, error) {
+	path, err := resolveFilePath(u)
+	if err != nil {
+		return nil, err
 	}
 	f, err := os.Open(path)
 	if err != nil {

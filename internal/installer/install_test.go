@@ -167,7 +167,7 @@ func TestInstallHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm()&0o111 == 0 {
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o111 == 0 {
 		t.Errorf("installed binary not executable: %v", info.Mode())
 	}
 	entries, err := os.ReadDir(filepath.Dir(res.BinaryPath))
@@ -187,7 +187,7 @@ func TestInstallFromBaseURLFileScheme(t *testing.T) {
 	fd := newFakeDist(t, "v0.2.0")
 	opts := fd.installOpts(t)
 	opts.DistDir = ""
-	opts.BaseURL = "file://" + filepath.ToSlash(fd.versionDir)
+	opts.BaseURL = fileURL(fd.versionDir)
 	res, err := Install(opts)
 	if err != nil {
 		t.Fatalf("Install via file:// base url: %v", err)

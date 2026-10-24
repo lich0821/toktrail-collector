@@ -322,20 +322,26 @@ func TestDoctorDetectsInstalledTask(t *testing.T) {
 	if len(plan.Files) == 0 {
 		t.Fatal("expected install plan files")
 	}
-	for _, f := range plan.Files {
-		if err := os.MkdirAll(filepath.Dir(f.Path), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(f.Path, []byte(f.Content), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	report, err := Doctor(DoctorOptions{
+	docOpts := DoctorOptions{
 		StateDir: stateDir,
 		Binary:   binary,
 		HomeDir:  home,
-	})
+	}
+
+	if runtime.GOOS == "windows" {
+		docOpts.Runner = &mockTaskRunner{xmlOutput: plan.Files[0].Content}
+	} else {
+		for _, f := range plan.Files {
+			if err := os.MkdirAll(filepath.Dir(f.Path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(f.Path, []byte(f.Content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	report, err := Doctor(docOpts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -394,4 +400,16 @@ func TestDoctorRequiresStateDir(t *testing.T) {
 	if _, err := Doctor(DoctorOptions{}); err == nil {
 		t.Fatal("expected an error for a missing state dir")
 	}
+}
+
+type mockTaskRunner struct {
+	xmlOutput string
+}
+
+func (m *mockTaskRunner) Run(name string, args ...string) error {
+	return nil
+}
+
+func (m *mockTaskRunner) RunOutput(name string, args ...string) ([]byte, error) {
+	return []byte(m.xmlOutput), nil
 }

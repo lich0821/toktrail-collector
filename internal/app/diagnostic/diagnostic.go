@@ -167,6 +167,8 @@ type DoctorOptions struct {
 	Binary string
 	// HomeDir is the user home directory for scheduler path resolution.
 	HomeDir string
+	// Runner is an optional command runner for scheduler inspection (used in tests).
+	Runner scheduler.Runner
 }
 
 type CheckStatus string
@@ -293,7 +295,7 @@ func Doctor(opt DoctorOptions) (DoctorReport, error) {
 			Interval: scheduler.DefaultInterval,
 			HomeDir:  home,
 		}
-		installed, files, err := scheduler.IsInstalled(cfg)
+		installed, files, err := scheduler.IsInstalledWithRunner(cfg, opt.Runner)
 		if err != nil {
 			add("scheduler", CheckWarn, "task inspection failed: %v", err)
 		} else if installed {

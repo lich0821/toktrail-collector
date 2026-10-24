@@ -31,10 +31,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
+	"unicode/utf16"
 )
 
 // DefaultInterval is the approved default scheduling period.
@@ -49,10 +51,43 @@ type Runner interface {
 	Run(name string, args ...string) error
 }
 
+// OutputRunner is an optional extension to Runner for commands whose
+// stdout output is needed (e.g. schtasks /Query /XML).
+type OutputRunner interface {
+	Runner
+	RunOutput(name string, args ...string) ([]byte, error)
+}
+
 // ExecRunner runs commands without a shell.
 type ExecRunner struct{}
 
 func (ExecRunner) Run(name string, args ...string) error { return runCommand(name, args...) }
+
+func (ExecRunner) RunOutput(name string, args ...string) ([]byte, error) {
+	cmd := exec.Command(name, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			return nil, err
+		}
+		if len(msg) > 400 {
+			msg = msg[:400] + "..."
+		}
+		return nil, &commandError{err: err, name: name, output: msg}
+	}
+	return out, nil
+}
+
+func runCommandOutput(runner Runner, name string, args ...string) ([]byte, error) {
+	if runner == nil {
+		runner = ExecRunner{}
+	}
+	if or, ok := runner.(OutputRunner); ok {
+		return or.RunOutput(name, args...)
+	}
+	return nil, fmt.Errorf("runner %T does not implement OutputRunner", runner)
+}
 
 // TaskConfig describes the scheduled task to render.
 type TaskConfig struct {
@@ -68,9 +103,8 @@ type TaskConfig struct {
 	// Interval is the scheduling period (>= MinInterval).
 	Interval time.Duration
 	// HomeDir is the user's home directory the user-scope scheduler paths
-	// are derived from. Required on darwin/linux (LaunchAgents /
-	// ~/.config/systemd/user); unused on windows. It is part of the
-	// configuration so tests and dry runs never target the real home.
+	// are derived from. Required and must be absolute on all platforms so
+	// tests and dry runs never target the real home.
 	HomeDir string
 }
 
@@ -182,14 +216,12 @@ func (c TaskConfig) Validate() error {
 	if c.Interval < MinInterval {
 		return fmt.Errorf("interval %s is below the minimum %s", c.Interval, MinInterval)
 	}
-	if c.Platform == "darwin" || c.Platform == "linux" {
-		home := strings.TrimSpace(c.HomeDir)
-		if home == "" {
-			return errors.New("user home directory is required for user-scope scheduler paths")
-		}
-		if !filepath.IsAbs(home) {
-			return fmt.Errorf("user home directory %q must be absolute", home)
-		}
+	home := strings.TrimSpace(c.HomeDir)
+	if home == "" {
+		return errors.New("user home directory is required for user-scope scheduler paths")
+	}
+	if !filepath.IsAbs(home) {
+		return fmt.Errorf("user home directory %q must be absolute", home)
 	}
 	return nil
 }
@@ -551,9 +583,15 @@ func quoteForDisplay(s string) string {
 	return b.String()
 }
 
-// IsInstalled reports whether the scheduler-owned files for this config
-// currently exist (used by diagnostics; performs no mutation).
+// IsInstalled reports whether the scheduler task or scheduler-owned files
+// for this config currently exist (used by diagnostics; performs no mutation).
 func IsInstalled(cfg TaskConfig) (bool, []string, error) {
+	return IsInstalledWithRunner(cfg, ExecRunner{})
+}
+
+// IsInstalledWithRunner reports whether the scheduler task or scheduler-owned
+// files for this config currently exist using the provided command runner.
+func IsInstalledWithRunner(cfg TaskConfig, runner Runner) (bool, []string, error) {
 	plan, err := RenderUninstall(cfg)
 	if err != nil {
 		return false, nil, err
@@ -567,7 +605,62 @@ func IsInstalled(cfg TaskConfig) (bool, []string, error) {
 			found = append(found, path)
 		}
 	}
+	if cfg.Platform == "windows" {
+		taskName := windowsTaskName(plan.TaskName)
+		out, err := runCommandOutput(runner, "schtasks", "/Query", "/TN", taskName, "/XML")
+		if err != nil {
+			if isTaskNotFound(err) {
+				return false, nil, nil
+			}
+			return false, nil, fmt.Errorf("windows scheduled task query failed: %w", err)
+		}
+		xmlText := decodeUTF16LEOrUTF8(out)
+		if err := OwnedFileCheckText(xmlText, plan.TaskName, plan.Marker); err != nil {
+			return false, nil, fmt.Errorf("scheduled task %s ownership check failed: %w", taskName, err)
+		}
+		found = append(found, "schtasks:"+taskName)
+	}
 	return len(found) > 0, found, nil
+}
+
+func decodeUTF16LEOrUTF8(b []byte) string {
+	if len(b) >= 2 && b[0] == 0xFF && b[1] == 0xFE {
+		b = b[2:]
+		u16 := make([]uint16, len(b)/2)
+		for i := 0; i < len(u16); i++ {
+			u16[i] = uint16(b[2*i]) | (uint16(b[2*i+1]) << 8)
+		}
+		return string(utf16.Decode(u16))
+	}
+	if len(b) >= 4 && (b[1] == 0x00 || b[3] == 0x00) {
+		u16 := make([]uint16, len(b)/2)
+		for i := 0; i < len(u16); i++ {
+			u16[i] = uint16(b[2*i]) | (uint16(b[2*i+1]) << 8)
+		}
+		return string(utf16.Decode(u16))
+	}
+	return string(b)
+}
+
+func isTaskNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	var cmdErr *commandError
+	if errors.As(err, &cmdErr) {
+		out := strings.ToLower(cmdErr.output)
+		if strings.Contains(out, "cannot find") ||
+			strings.Contains(out, "does not exist") ||
+			strings.Contains(out, "no tasks") ||
+			strings.Contains(out, "not found") {
+			return true
+		}
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "cannot find") ||
+		strings.Contains(msg, "does not exist") ||
+		strings.Contains(msg, "no tasks") ||
+		strings.Contains(msg, "not found")
 }
 
 // OwnedFileCheck validates that a file on disk belongs to this task: it
@@ -577,14 +670,22 @@ func OwnedFileCheck(path, identity, marker string) error {
 	if err != nil {
 		return err
 	}
-	text := string(content)
-	if !strings.Contains(text, identity) {
-		return fmt.Errorf("%s does not reference task identity %s", path, identity)
+	if err := OwnedFileCheckText(string(content), identity, marker); err != nil {
+		return fmt.Errorf("%s %w", path, err)
+	}
+	return nil
+}
+
+// OwnedFileCheckText validates that text content belongs to this task: it
+// must contain both the task identity and the state-dir marker.
+func OwnedFileCheckText(text, identity, marker string) error {
+	if !strings.Contains(text, identity) && !strings.Contains(text, windowsTaskName(identity)) {
+		return fmt.Errorf("does not reference task identity %s", identity)
 	}
 	// XML-backed files (launchd plist, windows task XML) store the state
 	// dir with entity escaping, so accept the raw or the escaped form.
 	if !strings.Contains(text, marker) && !strings.Contains(text, xmlEscape(marker)) {
-		return fmt.Errorf("%s does not reference state directory %s", path, marker)
+		return fmt.Errorf("does not reference state directory %s", marker)
 	}
 	return nil
 }

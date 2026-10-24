@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -384,7 +385,8 @@ func TestFourthSourcePrepareAndSplitAndWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("file not written: %v", err)
 	}
-	if perm := fi.Mode().Perm(); perm != 0o600 {
+	// Windows mode bits do not represent NTFS access control.
+	if perm := fi.Mode().Perm(); runtime.GOOS != "windows" && perm != 0o600 {
 		t.Fatalf("expected 0600 permissions, got %o", perm)
 	}
 
