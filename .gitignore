@@ -1,0 +1,7 @@
+.*
+!.gitignore
+!.github
+
+bin/
+dist/
+*.log

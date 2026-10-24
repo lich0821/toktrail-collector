@@ -1,0 +1,612 @@
+package scheduler
+
+import (
+	"bytes"
+	"encoding/xml"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+// recordingRunner records every command it is asked to run and can be
+// primed to fail specific command names.
+type recordingRunner struct {
+	runs    []string
+	failers map[string]error
+}
+
+func (r *recordingRunner) Run(name string, args ...string) error {
+	line := name + " " + strings.Join(args, " ")
+	r.runs = append(r.runs, line)
+	if r.failers != nil {
+		if err, ok := r.failers[name]; ok {
+			return err
+		}
+	}
+	return nil
+}
+
+// failingRunner fails every command; used for uninstall tolerance tests.
+type failingRunner struct{ runs []string }
+
+func (r *failingRunner) Run(name string, args ...string) error {
+	r.runs = append(r.runs, name)
+	return errors.New("command unavailable")
+}
+
+// testConfig builds a valid TaskConfig rooted at temp paths so tests never
+// touch the real home directory.
+func testConfig(t *testing.T) (TaskConfig, string, string) {
+	t.Helper()
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state dir with spaces & 'quotes'")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(root, "bin", "toktrail-collector")
+	if err := os.MkdirAll(filepath.Dir(binary), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return TaskConfig{
+		Platform: runtime.GOOS,
+		StateDir: stateDir,
+		Binary:   binary,
+		Interval: DefaultInterval,
+		HomeDir:  filepath.Join(root, "home"),
+	}, root, stateDir
+}
+
+func planOrFatal(t *testing.T, cfg TaskConfig) Plan {
+	t.Helper()
+	plan, err := RenderInstall(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plan
+}
+
+// ---------------------------------------------------------------------------
+// identity
+// ---------------------------------------------------------------------------
+
+func TestTaskIdentityDeterministicAndDistinct(t *testing.T) {
+	a, err := TaskIdentity("/tmp/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := TaskIdentity("/tmp/b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b {
+		t.Fatalf("expected distinct identities, got %s twice", a)
+	}
+	if !strings.HasPrefix(a, "toktrail-collector-") {
+		t.Fatalf("unexpected identity prefix: %s", a)
+	}
+	again, err := TaskIdentity("/tmp/a")
+	if err != nil || again != a {
+		t.Fatalf("identity not deterministic: %s vs %s (%v)", a, again, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// renderers
+// ---------------------------------------------------------------------------
+
+func TestLaunchdPlistParsesAsXMLAndEscapesMetacharacters(t *testing.T) {
+	cfg, _, stateDir := testConfig(t)
+	cfg.Platform = "darwin"
+	plan := planOrFatal(t, cfg)
+	if len(plan.Files) != 1 {
+		t.Fatalf("expected one plist file, got %#v", plan.Files)
+	}
+	plist := plan.Files[0]
+	if plist.Path != filepath.Join(cfg.HomeDir, "Library", "LaunchAgents", plan.TaskName+".plist") {
+		t.Fatalf("unexpected plist path: %s", plist.Path)
+	}
+	// The whole document must parse as XML even with metacharacters in
+	// the state directory path.
+	var doc any
+	if err := xml.Unmarshal([]byte(plist.Content), &doc); err != nil {
+		t.Fatalf("plist does not parse as XML: %v\n%s", err, plist.Content)
+	}
+	if !strings.Contains(plist.Content, xmlEscape(stateDir)) {
+		t.Fatal("state dir missing from plist")
+	}
+	if !strings.Contains(plist.Content, "<key>Label</key>\n\t<string>"+plan.TaskName+"</string>") {
+		t.Fatal("label missing from plist")
+	}
+	if !strings.Contains(plist.Content, "<false/>") {
+		t.Fatal("RunAtLoad must be false so nothing runs at install time")
+	}
+	if !strings.Contains(plist.Content, fmt.Sprintf("<integer>%d</integer>", int(DefaultInterval/time.Second))) {
+		t.Fatal("StartInterval missing")
+	}
+	// Program arguments must be separate strings, not a shell line.
+	if strings.Contains(plist.Content, "periodic --state-dir") {
+		t.Fatal("program arguments must be encoded as separate array items")
+	}
+}
+
+func TestSystemdUnitsEscapeStateDirWithSpacesAndMetacharacters(t *testing.T) {
+	cfg, _, stateDir := testConfig(t)
+	cfg.Platform = "linux"
+	plan := planOrFatal(t, cfg)
+	if len(plan.Files) != 2 {
+		t.Fatalf("expected service+timer files, got %#v", plan.Files)
+	}
+	var service, timer string
+	for _, file := range plan.Files {
+		switch filepath.Ext(file.Path) {
+		case ".service":
+			service = file.Content
+		case ".timer":
+			timer = file.Content
+		}
+	}
+	if service == "" || timer == "" {
+		t.Fatalf("missing units: service=%q timer=%q", service, timer)
+	}
+	if !strings.Contains(service, "Type=oneshot") {
+		t.Fatal("service must be oneshot (complete-exit)")
+	}
+	if !strings.Contains(service, plan.TaskName) {
+		t.Fatal("service must carry the task identity for owned-file checks")
+	}
+	if !strings.Contains(service, stateDir) {
+		t.Fatal("service must carry the state dir marker for owned-file checks")
+	}
+	// ExecStart with a spaced path must be quoted, never shell-escaped.
+	quoted := systemdEscapeArg(stateDir)
+	if !strings.Contains(service, "ExecStart="+systemdEscapeArg(cfg.Binary)+" periodic --state-dir "+quoted) {
+		t.Fatalf("unexpected ExecStart in:\n%s", service)
+	}
+	if strings.Contains(service, "\\ ") {
+		t.Fatal("ExecStart must use systemd quoting, not shell backslash escaping")
+	}
+	if !strings.Contains(timer, "Unit="+plan.TaskName+".service") {
+		t.Fatal("timer must target the service unit")
+	}
+	if !strings.Contains(timer, "OnUnitActiveSec=30m") {
+		t.Fatal("timer must repeat at the configured interval")
+	}
+	unitDir := filepath.Join(cfg.HomeDir, ".config", "systemd", "user")
+	for _, path := range plan.RemoveFiles {
+		if !strings.HasPrefix(path, unitDir) {
+			t.Fatalf("remove path outside user unit dir: %s", path)
+		}
+	}
+}
+
+func TestWindowsTaskXMLParsesAndQuotesStateDir(t *testing.T) {
+	cfg, _, stateDir := testConfig(t)
+	cfg.Platform = "windows"
+	plan := planOrFatal(t, cfg)
+	if len(plan.Files) != 1 || !plan.Files[0].Temp {
+		t.Fatalf("windows plan must write exactly one scratch (Temp) XML file: %#v", plan.Files)
+	}
+	var doc any
+	if err := xml.Unmarshal([]byte(plan.Files[0].Content), &doc); err != nil {
+		t.Fatalf("task XML does not parse: %v\n%s", err, plan.Files[0].Content)
+	}
+	if len(plan.RemoveFiles) != 0 {
+		t.Fatalf("windows plan must not own persistent files: %#v", plan.RemoveFiles)
+	}
+	if !strings.Contains(plan.Files[0].Content, "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>") {
+		t.Fatal("overlapping instances must be refused by policy as well as the process lock")
+	}
+	// The schtasks command must pass the XML file and task name as
+	// separate argv entries.
+	cmd := plan.Commands[0]
+	if cmd.Name != "schtasks" {
+		t.Fatalf("expected schtasks, got %#v", cmd)
+	}
+	for _, arg := range cmd.Args {
+		if strings.Contains(arg, " && ") || strings.Contains(arg, "|") || strings.HasPrefix(arg, "\"") {
+			t.Fatalf("schtasks args must be literal argv entries, got %q", arg)
+		}
+	}
+	if !containsArg(cmd.Args, "/XML") || !containsArg(cmd.Args, "/TN") {
+		t.Fatalf("schtasks must use /XML and /TN, got %#v", cmd.Args)
+	}
+	_ = stateDir
+}
+
+func containsArg(args []string, target string) bool {
+	for _, arg := range args {
+		if arg == target {
+			return true
+		}
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// validation
+// ---------------------------------------------------------------------------
+
+func TestValidateRejectsBadConfigsBeforeAnyMutation(t *testing.T) {
+	cfg, _, _ := testConfig(t)
+	cases := map[string]func(*TaskConfig){
+		"relative state dir": func(c *TaskConfig) { c.StateDir = "relative/state" },
+		"missing state dir":  func(c *TaskConfig) { c.StateDir = filepath.Join(t.TempDir(), "absent") },
+		"relative binary":    func(c *TaskConfig) { c.Binary = "toktrail" },
+		"missing binary":     func(c *TaskConfig) { c.Binary = filepath.Join(t.TempDir(), "nope") },
+		"short interval":     func(c *TaskConfig) { c.Interval = 30 * time.Second },
+		"unknown platform":   func(c *TaskConfig) { c.Platform = "plan9" },
+		"missing home":       func(c *TaskConfig) { c.HomeDir = "" },
+		"relative home":      func(c *TaskConfig) { c.HomeDir = "home" },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			mutated := cfg
+			mutate(&mutated)
+			if err := mutated.Validate(); err == nil {
+				t.Fatal("expected validation error")
+			}
+			// Install must refuse before writing anything.
+			runner := &recordingRunner{}
+			_, err := Install(InstallOptions{Config: mutated, Runner: runner})
+			if err == nil {
+				t.Fatal("expected install to fail")
+			}
+			if len(runner.runs) != 0 {
+				t.Fatalf("no command may run on validation failure: %v", runner.runs)
+			}
+			// And no file may exist anywhere under the fake home.
+			homeEntries, readErr := os.ReadDir(cfg.HomeDir)
+			if readErr == nil && len(homeEntries) > 0 {
+				t.Fatalf("validation failure left files in home: %v", homeEntries)
+			}
+		})
+	}
+}
+
+func TestPlanPathValidationRefusesEscapes(t *testing.T) {
+	cfg, _, _ := testConfig(t)
+	cfg.Platform = "darwin"
+	plan, err := RenderInstall(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A hostile plan writing outside the scheduler base must be refused
+	// before any file is touched.
+	plan.Files = append(plan.Files, FileWrite{Path: filepath.Join(cfg.HomeDir, "..", "escape.txt"), Content: "x", Mode: 0o600})
+	if err := validatePlanPaths(plan); err == nil {
+		t.Fatal("expected write-path validation to refuse the escape")
+	}
+	// And on windows the scratch file must stay inside the temp base.
+	winCfg := cfg
+	winCfg.Platform = "windows"
+	winPlan, err := RenderInstall(winCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePlanPaths(winPlan); err != nil {
+		t.Fatalf("windows scratch file must be inside temp dir: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// install success / rollback / idempotent uninstall
+// ---------------------------------------------------------------------------
+
+func installOrFatal(t *testing.T, cfg TaskConfig, runner *recordingRunner) Plan {
+	t.Helper()
+	plan, err := Install(InstallOptions{Config: cfg, Runner: runner})
+	if err != nil {
+		t.Fatalf("install failed: %v", err)
+	}
+	return plan
+}
+
+func TestInstallWritesFilesAndRunsCommandsInOrder(t *testing.T) {
+	cfg, _, _ := testConfig(t)
+	cfg.Platform = "linux"
+	runner := &recordingRunner{}
+	plan := installOrFatal(t, cfg, runner)
+
+	for _, dir := range plan.EnsureDirs {
+		info, err := os.Stat(dir)
+		if err != nil || !info.IsDir() {
+			t.Fatalf("ensure dir missing: %s (%v)", dir, err)
+		}
+		if info.Mode().Perm() != 0o700 {
+			t.Fatalf("ensure dir must be 0700, got %#o", info.Mode().Perm())
+		}
+	}
+	for _, file := range plan.Files {
+		info, err := os.Stat(file.Path)
+		if err != nil || info.IsDir() {
+			t.Fatalf("file missing after install: %s (%v)", file.Path, err)
+		}
+	}
+	if len(runner.runs) < 2 {
+		t.Fatalf("expected systemctl commands to run, got %v", runner.runs)
+	}
+	for _, line := range runner.runs {
+		if !strings.HasPrefix(line, "systemctl --user ") {
+			t.Fatalf("unexpected command on linux: %s", line)
+		}
+	}
+	if !strings.Contains(strings.Join(runner.runs, "\n"), "daemon-reload") {
+		t.Fatal("expected daemon-reload before enable")
+	}
+
+	// Re-install must be idempotent: same runner succeeds again.
+	installOrFatal(t, cfg, &recordingRunner{})
+}
+
+func TestInstallCommandFailureRollsBackFiles(t *testing.T) {
+	cfg, _, _ := testConfig(t)
+	cfg.Platform = "darwin"
+	runner := &recordingRunner{failers: map[string]error{"launchctl": errors.New("bootstrap refused")}}
+	_, err := Install(InstallOptions{Config: cfg, Runner: runner})
+	if err == nil || !strings.Contains(err.Error(), "register") && !strings.Contains(err.Error(), "bootstrap") {
+		t.Fatalf("expected install failure, got %v", err)
+	}
+	// Every owned file must be gone after rollback.
+	plan, _ := RenderInstall(cfg)
+	for _, file := range plan.Files {
+		if _, statErr := os.Stat(file.Path); !os.IsNotExist(statErr) {
+			t.Fatalf("file survived rollback: %s", file.Path)
+		}
+	}
+	// Undo commands (best-effort bootout) must have been attempted.
+	sawUndo := false
+	for _, line := range runner.runs {
+		if strings.Contains(line, "bootout") {
+			sawUndo = true
+		}
+	}
+	if !sawUndo {
+		t.Fatalf("rollback did not run undo commands: %v", runner.runs)
+	}
+}
+
+func TestInstallWindowsCleansUpTempXML(t *testing.T) {
+	cfg, _, _ := testConfig(t)
+	cfg.Platform = "windows"
+	plan := installOrFatal(t, cfg, &recordingRunner{})
+	for _, file := range plan.Files {
+		if !file.Temp {
+			continue
+		}
+		if _, err := os.Stat(file.Path); !os.IsNotExist(err) {
+			t.Fatalf("temp XML must be deleted after success: %s", file.Path)
+		}
+	}
+}
+
+func TestInstallWindowsDeletesTempXMLEvenOnFailure(t *testing.T) {
+	cfg, _, _ := testConfig(t)
+	cfg.Platform = "windows"
+	runner := &recordingRunner{failers: map[string]error{"schtasks": errors.New("registration refused")}}
+	_, err := Install(InstallOptions{Config: cfg, Runner: runner})
+	if err == nil {
+		t.Fatal("expected install failure")
+	}
+	plan, _ := RenderInstall(cfg)
+	for _, file := range plan.Files {
+		if _, statErr := os.Stat(file.Path); !os.IsNotExist(statErr) {
+			t.Fatalf("temp XML survived failed install: %s", file.Path)
+		}
+	}
+}
+
+func TestUninstallIdempotentAndToleratesCommandErrors(t *testing.T) {
+	cfg, _, _ := testConfig(t)
+	cfg.Platform = "linux"
+	installOrFatal(t, cfg, &recordingRunner{})
+	runner := &failingRunner{}
+	if _, err := Uninstall(UninstallOptions{Config: cfg, Runner: runner}); err != nil {
+		t.Fatalf("uninstall must tolerate command errors, got %v", err)
+	}
+	if len(runner.runs) == 0 {
+		t.Fatal("deactivate commands must still be attempted")
+	}
+	plan, _ := RenderUninstall(cfg)
+	for _, path := range plan.RemoveFiles {
+		if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+			t.Fatalf("owned file not removed: %s", path)
+		}
+	}
+	// Uninstalling again with everything missing must stay a success.
+	if _, err := Uninstall(UninstallOptions{Config: cfg, Runner: &recordingRunner{}}); err != nil {
+		t.Fatalf("idempotent uninstall failed: %v", err)
+	}
+}
+
+func TestUninstallRefusesForeignFiles(t *testing.T) {
+	cfg, _, _ := testConfig(t)
+	cfg.Platform = "darwin"
+	plan := planOrFatal(t, cfg)
+	if err := os.MkdirAll(filepath.Dir(plan.Files[0].Path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Foreign content without identity or marker must never be removed.
+	foreign := plan.Files[0].Path
+	if err := os.WriteFile(foreign, []byte("<?xml version=\"1.0\"?><plist><dict><key>Label</key><string>com.apple.SomethingElse</string></dict></plist>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Uninstall(UninstallOptions{Config: cfg, Runner: &recordingRunner{}}); err == nil {
+		t.Fatal("uninstall must refuse to remove a foreign file")
+	}
+	if _, statErr := os.Stat(foreign); statErr != nil {
+		t.Fatal("foreign file must survive")
+	}
+
+	// Content with identity but a foreign marker (different state dir)
+	// must also be refused. The plist stores the marker XML-escaped, so
+	// swap the escaped form.
+	hijacked := strings.ReplaceAll(plan.Files[0].Content, xmlEscape(plan.Marker), xmlEscape("/some/other/state dir"))
+	if err := os.WriteFile(foreign, []byte(hijacked), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Uninstall(UninstallOptions{Config: cfg, Runner: &recordingRunner{}}); err == nil {
+		t.Fatal("uninstall must refuse to remove a file for another state dir")
+	}
+	if _, statErr := os.Stat(foreign); statErr != nil {
+		t.Fatal("foreign-marker file must survive")
+	}
+}
+
+func TestUninstallWindowsRunsDeactivateWithoutFiles(t *testing.T) {
+	cfg, _, _ := testConfig(t)
+	cfg.Platform = "windows"
+	runner := &recordingRunner{}
+	if _, err := Uninstall(UninstallOptions{Config: cfg, Runner: runner}); err != nil {
+		t.Fatalf("windows uninstall failed: %v", err)
+	}
+	sawDelete := false
+	for _, line := range runner.runs {
+		if strings.Contains(line, "/Delete") {
+			sawDelete = true
+		}
+	}
+	if !sawDelete {
+		t.Fatalf("windows uninstall must always run the deactivate command: %v", runner.runs)
+	}
+}
+
+func TestUninstallRefusesRemovePathsOutsideBase(t *testing.T) {
+	cfg, _, _ := testConfig(t)
+	cfg.Platform = "linux"
+	// A hostile plan that wants to remove a file outside the unit dir
+	// must be refused before any command runs.
+	victim := filepath.Join(t.TempDir(), "important.txt")
+	if err := os.WriteFile(victim, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := RenderUninstall(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.RemoveFiles = append(plan.RemoveFiles, victim)
+	runner := &recordingRunner{}
+	if err := validateRemovePaths(plan); err == nil {
+		t.Fatal("expected path validation to refuse")
+	}
+	_ = runner
+}
+
+// ---------------------------------------------------------------------------
+// IsInstalled / OwnedFileCheck / WritePlan
+// ---------------------------------------------------------------------------
+
+func TestIsInstalledAndOwnedFileCheck(t *testing.T) {
+	cfg, _, _ := testConfig(t)
+	cfg.Platform = "darwin"
+	installed, files, err := IsInstalled(cfg)
+	if err != nil || installed {
+		t.Fatalf("expected not installed: %v %v", installed, err)
+	}
+	plan := installOrFatal(t, cfg, &recordingRunner{})
+	installed, files, err = IsInstalled(cfg)
+	if err != nil || !installed {
+		t.Fatalf("expected installed after install: %v %v", installed, err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected the plist to be found: %v", files)
+	}
+	if err := OwnedFileCheck(files[0], plan.TaskName, plan.Marker); err != nil {
+		t.Fatalf("installed file must pass the owned-file check: %v", err)
+	}
+	if err := OwnedFileCheck(files[0], "toktrail-collector-other", plan.Marker); err == nil {
+		t.Fatal("foreign identity must fail the owned-file check")
+	}
+	if err := OwnedFileCheck(files[0], plan.TaskName, "/other/state"); err == nil {
+		t.Fatal("foreign marker must fail the owned-file check")
+	}
+}
+
+func TestWritePlanIsSafeDryRun(t *testing.T) {
+	cfg, _, _ := testConfig(t)
+	cfg.Platform = "windows"
+	plan, err := RenderInstall(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := WritePlan(&out, plan, "install"); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "platform=windows") || !strings.Contains(text, "schtasks") {
+		t.Fatalf("unexpected dry-run output:\n%s", text)
+	}
+	if !strings.Contains(text, plan.Files[0].Content) {
+		t.Fatal("dry-run must show the full file contents for review")
+	}
+	// Dry-run install must not create anything.
+	if _, err := Install(InstallOptions{Config: cfg, Runner: &recordingRunner{}, DryRun: true, Out: io.Discard}); err != nil {
+		t.Fatal(err)
+	}
+	if _, statErr := os.Stat(plan.Files[0].Path); !os.IsNotExist(statErr) {
+		t.Fatal("dry-run must not write the XML file")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// escape helpers
+// ---------------------------------------------------------------------------
+
+func TestSystemdEscapeArg(t *testing.T) {
+	cases := map[string]string{
+		"/plain/path":         "/plain/path",
+		"":                    `""`,
+		"/dir with space":     `"/dir with space"`,
+		`/dir'quote`:          `"/dir'quote"`,
+		`/dir"dquote`:         `"/dir\"dquote"`,
+		`C:\path with spaces`: `"C:\\path with spaces"`,
+	}
+	for input, expected := range cases {
+		if got := systemdEscapeArg(input); got != expected {
+			t.Errorf("systemdEscapeArg(%q) = %q, want %q", input, got, expected)
+		}
+	}
+	if got := systemdEscapeArg("bad\x02control"); strings.ContainsRune(got, '\x02') {
+		t.Errorf("control characters must be stripped, got %q", got)
+	}
+}
+
+func TestWindowsQuoteArg(t *testing.T) {
+	if got := windowsQuoteArg(`C:\Program Files\toktrail`); got != `"C:\Program Files\toktrail"` {
+		t.Fatalf("unexpected windows quoting: %q", got)
+	}
+	if got := windowsQuoteArg(`C:\plain`); got != `C:\plain` {
+		t.Fatalf("plain paths must stay unquoted: %q", got)
+	}
+	if got := windowsQuoteArg(`C:\weird"quote`); got != `"C:\weird\"quote"` {
+		t.Fatalf("embedded quotes must be escaped, got %q", got)
+	}
+}
+
+func TestXMLEscape(t *testing.T) {
+	out := xmlEscape(`<>&"'` + "plain")
+	// The raw markup characters must be gone; & survives only as part of
+	// the entity names themselves.
+	if strings.ContainsAny(out, "<>\"'") {
+		t.Fatalf("entities not escaped: %q", out)
+	}
+	if !strings.Contains(out, "&lt;") || !strings.Contains(out, "&amp;") || !strings.Contains(out, "&quot;") || !strings.Contains(out, "&apos;") {
+		t.Fatalf("unexpected escape output: %q", out)
+	}
+	if xmlEscape("ctrl\x01char") != "ctrlchar" {
+		t.Fatal("control characters must be stripped")
+	}
+}

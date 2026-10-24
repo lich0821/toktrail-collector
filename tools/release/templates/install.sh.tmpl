@@ -1,0 +1,83 @@
+#!/bin/sh
+# toktrail bootstrap installer for {{.Version}}
+#
+# TRUST MODEL - read docs/RELEASE.md before using this script:
+#   * This script pins the release Ed25519 public key and the SHA-256 of
+#     each platform's toktrail-release binary. It must be obtained from a
+#     channel you trust (the project repository or official release notes),
+#     NEVER from the download mirror that serves the artifacts.
+#   * Everything downloaded afterwards is verified before installation:
+#     the manifest's detached Ed25519 signature under the pinned public
+#     key, then every archive and binary hash, platform and version.
+#   * This installer only places the toktrail binary. It does not read or
+#     change upload consent or collector state, does not register any
+#     scheduler/launch agent, and never contacts the toktrail upload
+#     (sync) server. BASE_URL below is the release DOWNLOAD/update
+#     endpoint, which must be a separate origin from any upload endpoint.
+#
+# Usage: install-{{.Version}}.sh BASE_URL [INSTALL_DIR]
+#   BASE_URL      release download root that serves manifest.json et al.
+#                 (also via TOKTRAIL_DOWNLOAD_BASE)
+#   INSTALL_DIR   default $HOME/.local/bin (also via TOKTRAIL_INSTALL_DIR)
+set -eu
+
+VERSION='{{.Version}}'
+BASE_URL="${1:-${TOKTRAIL_DOWNLOAD_BASE:-}}"
+INSTALL_DIR="${2:-${TOKTRAIL_INSTALL_DIR:-$HOME/.local/bin}}"
+
+fail() { echo "install: $*" >&2; exit 1; }
+
+[ -n "$BASE_URL" ] || fail "usage: $0 BASE_URL [INSTALL_DIR]"
+
+case "$(uname -s)/$(uname -m)" in
+{{- range .UnixPins}}
+{{.Match}}) TOOL_FILE='{{.ToolFile}}'; TOOL_SHA256='{{.Sha256}}' ;;
+{{- end}}
+*) fail "unsupported platform $(uname -s)/$(uname -m); this release provides:{{range .UnixPins}} {{.OS}}/{{.Arch}}{{end}}" ;;
+esac
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+fetch() {
+  # $1 url, $2 destination
+  if have_cmd curl; then curl -fsSL -o "$2" "$1"
+  elif have_cmd wget; then wget -q -O "$2" "$1"
+  else fail "need curl or wget to download release files"
+  fi
+}
+
+sha256_of() {
+  if have_cmd sha256sum; then sha256sum "$1" | cut -d' ' -f1
+  elif have_cmd shasum; then shasum -a 256 "$1" | cut -d' ' -f1
+  else fail "need sha256sum or shasum to verify downloads"
+  fi
+}
+
+TMP="$(mktemp -d 2>/dev/null || fail "mktemp failed")"
+cleanup() {
+  if [ -n "${TMP:-}" ] && [ -d "$TMP" ]; then
+    case "$TMP" in
+      /*) rm -rf "$TMP" ;;
+    esac
+  fi
+}
+trap cleanup EXIT
+
+echo "==> downloading release tool $TOOL_FILE"
+fetch "$BASE_URL/$TOOL_FILE" "$TMP/toktrail-release" || fail "download failed: $BASE_URL/$TOOL_FILE"
+
+ACTUAL="$(sha256_of "$TMP/toktrail-release" || fail "hashing failed")"
+if [ "$ACTUAL" != "$TOOL_SHA256" ]; then
+  fail "release tool hash mismatch (expected $TOOL_SHA256, got $ACTUAL) - aborting, nothing was installed"
+fi
+chmod 0755 "$TMP/toktrail-release"
+
+cat > "$TMP/pub.pem" <<'PUBEOF'
+{{.PublicKeyPEM}}PUBEOF
+
+echo "==> verifying release {{.Version}} and installing to $INSTALL_DIR"
+"$TMP/toktrail-release" install \
+  -base-url "$BASE_URL" \
+  -version "$VERSION" \
+  -pubkey "$TMP/pub.pem" \
+  -install-dir "$INSTALL_DIR"

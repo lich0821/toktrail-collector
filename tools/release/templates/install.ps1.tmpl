@@ -1,0 +1,71 @@
+# toktrail bootstrap installer for {{.Version}}
+#
+# TRUST MODEL - read docs/RELEASE.md before using this script:
+#   * This script pins the release Ed25519 public key and the SHA-256 of
+#     each platform's toktrail-release.exe. It must be obtained from a
+#     channel you trust (the project repository or official release notes),
+#     NEVER from the download mirror that serves the artifacts.
+#   * Everything downloaded afterwards is verified before installation:
+#     the manifest's detached Ed25519 signature under the pinned public
+#     key, then every archive and binary hash, platform and version.
+#   * This installer only places toktrail.exe. It does not read or change
+#     upload consent or collector state, does not register any scheduled
+#     task or service, and never contacts the toktrail upload (sync)
+#     server. -BaseUrl below is the release DOWNLOAD/update endpoint,
+#     which must be a separate origin from any upload endpoint.
+#
+# Usage:
+#   powershell -ExecutionPolicy Bypass -File install-{{.Version}}.ps1 -BaseUrl <root> [-InstallDir <dir>]
+param(
+  [Parameter(Mandatory = $true)][string]$BaseUrl,
+  [string]$InstallDir = "$env:LOCALAPPDATA\Programs\toktrail"
+)
+$ErrorActionPreference = 'Stop'
+$version = '{{.Version}}'
+
+switch ($env:PROCESSOR_ARCHITECTURE) {
+{{- range .WinPins}}
+  '{{.Arch}}' { $arch = '{{.Arch}}' }
+{{- end}}
+  default { Write-Error "unsupported architecture $($env:PROCESSOR_ARCHITECTURE)" }
+}
+$pins = @{
+{{- range .WinPins}}
+  '{{.Arch}}' = '{{.Sha256}}'
+{{- end}}
+}
+$toolName = "toktrail-release-$version-windows-$arch.exe"
+$tmp = New-Item -ItemType Directory -Path (Join-Path $env:TEMP ("toktrail-install-" + [guid]::NewGuid().ToString("N")))
+$tool = Join-Path $tmp 'toktrail-release.exe'
+
+try {
+  Write-Host "==> downloading release tool $toolName"
+  & curl.exe -fsSL -o $tool "$BaseUrl/$toolName"
+  if ($LASTEXITCODE -ne 0) {
+    $code = $LASTEXITCODE
+    Write-Error "download failed: $BaseUrl/$toolName"
+    exit $code
+  }
+
+  $actual = (Get-FileHash -Algorithm SHA256 -Path $tool).Hash.ToLower()
+  if ($actual -ne $pins[$arch]) {
+    Write-Error "release tool hash mismatch (expected $($pins[$arch]), got $actual) - aborting, nothing was installed"
+    exit 1
+  }
+
+  $pub = Join-Path $tmp 'pub.pem'
+  $pubKey = @'
+{{.PublicKeyPEM}}'@
+  [IO.File]::WriteAllText($pub, $pubKey)
+
+  Write-Host "==> verifying release $version and installing to $InstallDir"
+  & $tool install -base-url $BaseUrl -version $version -pubkey $pub -install-dir $InstallDir
+  if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+  }
+}
+finally {
+  if ($tmp -and (Test-Path $tmp)) {
+    Remove-Item -Recurse -Force $tmp
+  }
+}

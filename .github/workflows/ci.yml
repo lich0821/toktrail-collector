@@ -1,0 +1,80 @@
+# toktrail-collector CI
+#
+# Paths are relative to the repository root. This workflow is active only when
+# this directory is used as an independent Git repository because GitHub reads
+# workflows only from the repository root's .github/workflows directory. Inside
+# a larger monorepo workspace, this file is inert documentation for the split
+# repository.
+#
+# Design notes:
+# - Run go vet and go test on Linux, macOS, and Windows.
+# - This module currently has no third-party dependencies and no go.sum, so the
+#   workflow runs with GOPROXY=off to validate offline buildability.
+# - The release end-to-end test is gated by TOKTRAIL_RELEASE_E2E=1 and runs only
+#   on Linux. It generates a temporary TEST signing key and builds all platform
+#   artifacts without reading any production signing secret.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Quote off so YAML 1.1 parsers do not treat it as boolean false.
+  GOPROXY: 'off'
+
+jobs:
+  test:
+    name: Vet + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false # No go.sum exists because there are no module dependencies.
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./... -count=1
+
+  release-e2e:
+    name: Release end-to-end (Linux, temporary TEST key)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TOKTRAIL_RELEASE_E2E: '1'
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      # Full chain: keygen with a temporary TEST private key, build six platform
+      # artifacts, sign, verify, install, and run. No production secret is
+      # required. See docs/RELEASE.md for the production release process.
+      - name: TestEndToEndRelease
+        run: go test ./tools/release/ -run '^TestEndToEndRelease$' -count=1 -v

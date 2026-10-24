@@ -1,0 +1,121 @@
+# Active when toktrail-collector is the Git repository root, as with ci.yml.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GOPROXY: 'off'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+      - name: Validate tag and test
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          go run ./tools/release validate-version -version "$RELEASE_VERSION"
+          go vet ./...
+          go test ./... -count=1
+      - name: Test signed release chain with a temporary test key
+        env:
+          TOKTRAIL_RELEASE_E2E: '1'
+        run: go test ./tools/release -run '^TestEndToEndRelease$' -count=1 -v
+
+  build:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [darwin, linux, windows]
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+      - name: Build collector and installer
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+          TARGET_OS: ${{ matrix.os }}
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: sh scripts/release.sh build-target "$RELEASE_VERSION" "$TARGET_OS" "$TARGET_ARCH" --dist dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: raw-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/${{ github.ref_name }}/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Configure environment reviewers and tag restrictions in repository settings.
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: raw-*
+          merge-multiple: true
+          path: dist/${{ github.ref_name }}
+      - name: Assemble, sign and verify against the configured public pin
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+          SIGNING_KEY: ${{ secrets.TOKTRAIL_RELEASE_PRIVATE_KEY }}
+          PUBLIC_PIN: ${{ vars.TOKTRAIL_RELEASE_PUBLIC_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SIGNING_KEY" || { echo 'Missing release signing key'; exit 1; }
+          test -n "$PUBLIC_PIN" || { echo 'Missing independent public-key pin'; exit 1; }
+          key_file=$(mktemp "$RUNNER_TEMP/toktrail-key.XXXXXX")
+          pin_file=$(mktemp "$RUNNER_TEMP/toktrail-pin.XXXXXX")
+          case "$key_file" in "$RUNNER_TEMP"/toktrail-key.*) ;; *) exit 1 ;; esac
+          case "$pin_file" in "$RUNNER_TEMP"/toktrail-pin.*) ;; *) exit 1 ;; esac
+          trap 'rm -f -- "$key_file" "$pin_file"' EXIT
+          chmod 600 "$key_file" "$pin_file"
+          printf '%s\n' "$SIGNING_KEY" > "$key_file"
+          printf '%s\n' "$PUBLIC_PIN" > "$pin_file"
+          unset SIGNING_KEY PUBLIC_PIN
+          sh scripts/release.sh assemble "$RELEASE_VERSION" --dist dist --key "$key_file"
+          go run ./cmd/toktrail-release verify \
+            -manifest "dist/$RELEASE_VERSION/manifest.json" \
+            -signature "dist/$RELEASE_VERSION/manifest.json.sig" \
+            -pubkey "$pin_file" -version "$RELEASE_VERSION" \
+            -dist-dir "dist/$RELEASE_VERSION"
+      - name: Create draft release for review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_VERSION" "dist/$RELEASE_VERSION/"* \
+            --verify-tag --draft --generate-notes --title "$RELEASE_VERSION"
