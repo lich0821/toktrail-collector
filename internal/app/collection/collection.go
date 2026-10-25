@@ -112,7 +112,13 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	defer lock.Close()
 
 	res := Result{}
-	enabledGrants, err := grants.New(stateDir).Enabled()
+	grantStore := grants.New(stateDir)
+	// Persist legacy grants only while holding the same lock as collection.
+	// Migration failures stop before scanning inputs or refreshing consent.
+	if err := grantStore.MigrateLegacy(); err != nil {
+		return res, fmt.Errorf("migrate source grants: %w", err)
+	}
+	enabledGrants, err := grantStore.Enabled()
 	if err != nil {
 		return res, err
 	}

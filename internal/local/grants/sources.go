@@ -15,12 +15,18 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"toktrail-collector/internal/source/registry"
 )
 
-const configFileName = "grants.json"
+const (
+	configFileName       = "grants.json"
+	legacyConfigFileName = "sources.json"
+)
+
+var linkFile = os.Link
 
 // Grant is one explicit local-read grant: a compiled-in adapter source and
 // an absolute local input path the user selected for scheduled collection.
@@ -44,6 +50,8 @@ type Store struct{ dir string }
 func New(dir string) Store { return Store{dir: strings.TrimSpace(dir)} }
 
 func (s Store) Path() string { return filepath.Join(s.dir, configFileName) }
+
+func (s Store) LegacyPath() string { return filepath.Join(s.dir, legacyConfigFileName) }
 
 // KnownSources lists the compiled-in adapter source ids. The set is fixed
 // at compile time (first version has no dynamic plugins).
@@ -93,20 +101,28 @@ func ValidateInput(input string) error {
 	return nil
 }
 
-func (s Store) Load() (Config, error) {
-	b, err := os.ReadFile(s.Path())
-	if errors.Is(err, os.ErrNotExist) {
-		return Config{Version: 1}, nil
+func isTrulyAbsent(path string) (bool, error) {
+	_, err := os.Lstat(path)
+	if err == nil {
+		return false, nil
 	}
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	return false, err
+}
+
+func (s Store) loadFile(path string) (Config, error) {
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return Config{}, err
 	}
 	var cfg Config
 	if err := json.Unmarshal(b, &cfg); err != nil {
-		return Config{}, fmt.Errorf("invalid source grant config %s: %w", s.Path(), err)
+		return Config{}, fmt.Errorf("invalid source grant config %s: %w", path, err)
 	}
 	if cfg.Version != 1 {
-		return Config{}, fmt.Errorf("unsupported source grant config version %d in %s", cfg.Version, s.Path())
+		return Config{}, fmt.Errorf("unsupported source grant config version %d in %s", cfg.Version, path)
 	}
 	for idx, grant := range cfg.Grants {
 		if err := ValidateGrant(grant.Source, grant.Input); err != nil {
@@ -114,6 +130,117 @@ func (s Store) Load() (Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// Load reads and parses the grant config. It is strictly read-only and never
+// creates or modifies files on disk. If grants.json is truly absent, it falls
+// back to validated legacy sources.json; an existing grants.json (even if
+// empty or disabled) always wins.
+func (s Store) Load() (Config, error) {
+	absent, err := isTrulyAbsent(s.Path())
+	if err != nil {
+		return Config{}, err
+	}
+	if !absent {
+		return s.loadFile(s.Path())
+	}
+	legacyAbsent, err := isTrulyAbsent(s.LegacyPath())
+	if err != nil {
+		return Config{}, err
+	}
+	if legacyAbsent {
+		return Config{Version: 1}, nil
+	}
+	return s.loadFile(s.LegacyPath())
+}
+
+// MigrateLegacy validates any legacy sources.json and atomically publishes a
+// complete private 0600 grants.json without replacing any existing current file.
+// Caller must hold the collector runlock. The legacy sources.json is retained
+// untouched on disk. If current grants.json already exists or appears
+// concurrently during publication, the authoritative current file is
+// loaded/validated instead and never clobbered.
+func (s Store) MigrateLegacy() error {
+	absent, err := isTrulyAbsent(s.Path())
+	if err != nil {
+		return err
+	}
+	if !absent {
+		_, err := s.loadFile(s.Path())
+		return err
+	}
+
+	legacyAbsent, err := isTrulyAbsent(s.LegacyPath())
+	if err != nil {
+		return err
+	}
+	if legacyAbsent {
+		return nil
+	}
+
+	cfg, err := s.loadFile(s.LegacyPath())
+	if err != nil {
+		return err
+	}
+	if cfg.Grants == nil {
+		cfg.Grants = []Grant{}
+	}
+
+	if err := os.MkdirAll(s.dir, 0o700); err != nil {
+		return err
+	}
+	cfg.Version = 1
+	b, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+
+	f, err := os.CreateTemp(s.dir, "grants.*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := f.Name()
+	defer func() {
+		if tmpName != "" {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		return err
+	}
+
+	err = linkFile(tmpName, s.Path())
+	if err == nil {
+		remErr := os.Remove(tmpName)
+		tmpName = ""
+		if remErr != nil {
+			return remErr
+		}
+		return nil
+	}
+
+	_ = os.Remove(tmpName)
+	tmpName = ""
+
+	if errors.Is(err, os.ErrExist) || errors.Is(err, syscall.EEXIST) {
+		_, loadErr := s.loadFile(s.Path())
+		return loadErr
+	}
+
+	return err
 }
 
 func (s Store) save(cfg Config) error {
@@ -125,11 +252,35 @@ func (s Store) save(cfg Config) error {
 	if err != nil {
 		return err
 	}
-	tmp := s.Path() + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o600); err != nil {
+	f, err := os.CreateTemp(s.dir, "grants.*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.Path())
+	tmpName := f.Name()
+	defer func() {
+		if tmpName != "" {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, s.Path()); err != nil {
+		return err
+	}
+	tmpName = ""
+	return nil
 }
 
 // Enable upserts a grant as enabled. It validates the grant and the input
@@ -139,6 +290,9 @@ func (s Store) Enable(source, input string) (Grant, error) {
 		return Grant{}, err
 	}
 	if err := ValidateInput(input); err != nil {
+		return Grant{}, err
+	}
+	if err := s.MigrateLegacy(); err != nil {
 		return Grant{}, err
 	}
 	cfg, err := s.Load()
@@ -153,18 +307,30 @@ func (s Store) Enable(source, input string) (Grant, error) {
 			cfg.Grants[idx].Enabled = true
 			cfg.Grants[idx].EditedAt = now
 			grant := cfg.Grants[idx]
-			return grant, s.save(cfg)
+			if err := s.save(cfg); err != nil {
+				return Grant{}, err
+			}
+			return grant, nil
 		}
 	}
 	grant := Grant{Source: source, Input: input, Enabled: true, AddedAt: now}
 	cfg.Grants = append(cfg.Grants, grant)
-	return grant, s.save(cfg)
+	if err := s.save(cfg); err != nil {
+		return Grant{}, err
+	}
+	return grant, nil
 }
 
 // Disable marks a grant disabled. The (source, input) pair stays recorded
 // so re-enabling is a single explicit step; disabled grants are never
 // collected by the periodic entry.
 func (s Store) Disable(source, input string) (Grant, bool, error) {
+	if err := ValidateGrant(source, input); err != nil {
+		return Grant{}, false, err
+	}
+	if err := s.MigrateLegacy(); err != nil {
+		return Grant{}, false, err
+	}
 	cfg, err := s.Load()
 	if err != nil {
 		return Grant{}, false, err
@@ -176,7 +342,10 @@ func (s Store) Disable(source, input string) (Grant, bool, error) {
 			cfg.Grants[idx].Enabled = false
 			cfg.Grants[idx].EditedAt = time.Now().UTC()
 			grant := cfg.Grants[idx]
-			return grant, true, s.save(cfg)
+			if err := s.save(cfg); err != nil {
+				return Grant{}, false, err
+			}
+			return grant, true, nil
 		}
 	}
 	return Grant{}, false, nil
