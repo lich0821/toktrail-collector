@@ -365,3 +365,66 @@ func (s Store) Enabled() ([]Grant, error) {
 	}
 	return out, nil
 }
+
+// ApplyConnectGrants updates grants for connect authorization.
+// Any active grant whose (source, input) is not present in authorized is disabled
+// so it will not continue being collected. Grants in authorized are validated,
+// and upserted as enabled.
+// Returns the currently enabled grants.
+func (s Store) ApplyConnectGrants(authorized []Grant) ([]Grant, error) {
+	for idx, g := range authorized {
+		if err := ValidateGrant(g.Source, g.Input); err != nil {
+			return nil, fmt.Errorf("authorized grant %d: %w", idx, err)
+		}
+		if err := ValidateInput(g.Input); err != nil {
+			return nil, fmt.Errorf("authorized grant %d: %w", idx, err)
+		}
+	}
+	if err := s.MigrateLegacy(); err != nil {
+		return nil, err
+	}
+	cfg, err := s.Load()
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	authKey := func(source, input string) string {
+		return strings.TrimSpace(source) + "\x00" + filepath.Clean(strings.TrimSpace(input))
+	}
+	authorizedSet := make(map[string]Grant, len(authorized))
+	for _, g := range authorized {
+		authorizedSet[authKey(g.Source, g.Input)] = g
+	}
+	seen := make(map[string]bool, len(authorized))
+	for idx := range cfg.Grants {
+		k := authKey(cfg.Grants[idx].Source, cfg.Grants[idx].Input)
+		if _, ok := authorizedSet[k]; ok {
+			seen[k] = true
+			if !cfg.Grants[idx].Enabled {
+				cfg.Grants[idx].Enabled = true
+				cfg.Grants[idx].EditedAt = now
+			}
+		} else {
+			if cfg.Grants[idx].Enabled {
+				cfg.Grants[idx].Enabled = false
+				cfg.Grants[idx].EditedAt = now
+			}
+		}
+	}
+	for _, g := range authorized {
+		k := authKey(g.Source, g.Input)
+		if !seen[k] {
+			cfg.Grants = append(cfg.Grants, Grant{
+				Source:   strings.TrimSpace(g.Source),
+				Input:    filepath.Clean(strings.TrimSpace(g.Input)),
+				Enabled:  true,
+				AddedAt:  now,
+				EditedAt: now,
+			})
+		}
+	}
+	if err := s.save(cfg); err != nil {
+		return nil, err
+	}
+	return s.Enabled()
+}

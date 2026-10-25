@@ -54,6 +54,11 @@ func (p *Pipeline) PrepareExport(opt adapter.Options) (PreparedExport, error) {
 			return PreparedExport{}, err
 		}
 	}
+	messageUpdates := loaded.MessageUpdates
+	records, messageUpdates, err = FilterHistoryCutoff(opt, records, messageUpdates)
+	if err != nil {
+		return PreparedExport{}, err
+	}
 	valid := make([]adapter.Record, 0, len(records))
 	for idx, record := range records {
 		if err := adapter.ValidateRecord(record); err != nil {
@@ -72,7 +77,7 @@ func (p *Pipeline) PrepareExport(opt adapter.Options) (PreparedExport, error) {
 	if err != nil {
 		return PreparedExport{}, err
 	}
-	return PreparedExport{BatchID: batchID, Output: opt.Output, Records: len(valid), Payload: append(payload, '\n'), MessageUpdates: loaded.MessageUpdates}, nil
+	return PreparedExport{BatchID: batchID, Output: opt.Output, Records: len(valid), Payload: append(payload, '\n'), MessageUpdates: messageUpdates}, nil
 }
 
 // SplitPreparedExport partitions a PreparedExport into chunks that each satisfy

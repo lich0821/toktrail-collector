@@ -12,26 +12,32 @@ import (
 const stateFileName = "device.json"
 
 type DeviceState struct {
-	ServerURL               string    `json:"serverUrl,omitempty"`
-	ApplicationID           string    `json:"applicationId,omitempty"`
-	ExternalSubjectID       string    `json:"externalSubjectId,omitempty"`
-	DeviceID                string    `json:"deviceId,omitempty"`
-	DeviceName              string    `json:"deviceName,omitempty"`
-	Platform                string    `json:"platform,omitempty"`
-	DeviceSecret            string    `json:"deviceSecret,omitempty"`
-	BindRequestID           string    `json:"bindRequestId,omitempty"`
-	ConsentRevision         int64     `json:"consentRevision,omitempty"`
-	BoundAt                 time.Time `json:"boundAt,omitempty"`
-	UploadAuthorized        bool      `json:"uploadAuthorized"`
-	PublicAuthorized        bool      `json:"publicAuthorized"`
-	Revoked                 bool      `json:"revoked"`
-	LastCheckedAt           time.Time `json:"lastCheckedAt,omitempty"`
-	LastSyncedAt            time.Time `json:"lastSyncedAt,omitempty"`
-	LastSyncBatchID         string    `json:"lastSyncBatchId,omitempty"`
-	LastSyncStatus          string    `json:"lastSyncStatus,omitempty"`
-	LastSyncAcceptedRecords int       `json:"lastSyncAcceptedRecords"`
-	LastSyncRejectedRecords int       `json:"lastSyncRejectedRecords"`
-	UpdatedAt               time.Time `json:"updatedAt,omitempty"`
+	ServerURL                 string     `json:"serverUrl,omitempty"`
+	ApplicationID             string     `json:"applicationId,omitempty"`
+	ExternalSubjectID         string     `json:"externalSubjectId,omitempty"`
+	DeviceID                  string     `json:"deviceId,omitempty"`
+	DeviceName                string     `json:"deviceName,omitempty"`
+	Platform                  string     `json:"platform,omitempty"`
+	DeviceSecret              string     `json:"deviceSecret,omitempty"`
+	BindRequestID             string     `json:"bindRequestId,omitempty"`
+	ConsentRevision           int64      `json:"consentRevision,omitempty"`
+	BoundAt                   time.Time  `json:"boundAt,omitempty"`
+	UploadAuthorized          bool       `json:"uploadAuthorized"`
+	PublicAuthorized          bool       `json:"publicAuthorized"`
+	Revoked                   bool       `json:"revoked"`
+	LastCheckedAt             time.Time  `json:"lastCheckedAt,omitempty"`
+	LastSyncedAt              time.Time  `json:"lastSyncedAt,omitempty"`
+	LastSyncBatchID           string     `json:"lastSyncBatchId,omitempty"`
+	LastSyncStatus            string     `json:"lastSyncStatus,omitempty"`
+	LastSyncAcceptedRecords   int        `json:"lastSyncAcceptedRecords"`
+	LastSyncRejectedRecords   int        `json:"lastSyncRejectedRecords"`
+	PendingBindFingerprint    string     `json:"pendingBindFingerprint,omitempty"`
+	LastBindFingerprint       string     `json:"lastBindFingerprint,omitempty"`
+	ConnectReceiptHash        string     `json:"connectReceiptHash,omitempty"`
+	PendingConnectReceiptHash string     `json:"pendingConnectReceiptHash,omitempty"`
+	HistoryFrom               *time.Time `json:"historyFrom,omitempty"`
+	HistoryDays               int        `json:"historyDays,omitempty"`
+	UpdatedAt                 time.Time  `json:"updatedAt,omitempty"`
 }
 
 type Store struct{ dir string }

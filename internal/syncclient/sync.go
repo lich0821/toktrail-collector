@@ -427,7 +427,14 @@ func preflightSelf(ctx context.Context, client *http.Client, serverURL string, s
 		if body.Device.Revoked || !body.Device.UploadAuthorized {
 			return SelfStatus{}, fmt.Errorf("%w: server reports device %s is no longer authorized to upload; sending stopped and the collector never re-binds automatically", ErrDeviceRevoked, body.Device.DeviceID)
 		}
-		return *body.Device, nil
+		dev := *body.Device
+		if st.HistoryFrom != nil && !st.HistoryFrom.IsZero() {
+			if dev.HistoryFrom == nil || dev.HistoryFrom.Before(*st.HistoryFrom) {
+				hf := *st.HistoryFrom
+				dev.HistoryFrom = &hf
+			}
+		}
+		return dev, nil
 	}
 	code, message := "", ""
 	if body.Error != nil {

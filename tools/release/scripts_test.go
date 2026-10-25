@@ -121,6 +121,22 @@ func TestScriptStaticInvariants(t *testing.T) {
 	if !strings.Contains(shStr, pubPEM) {
 		t.Errorf("POSIX install script missing pinned public key")
 	}
+	// 5. Must default BASE_URL to the official GitHub release download root.
+	wantDefaultBase := "https://github.com/lich0821/toktrail-collector/releases/download/" + m.Version
+	if !strings.Contains(shStr, wantDefaultBase) {
+		t.Errorf("POSIX install script missing default GitHub base URL %q", wantDefaultBase)
+	}
+	// 6. Must default INSTALL_DIR under $HOME/.toktrail/bin.
+	if !strings.Contains(shStr, "$HOME/.toktrail/bin") {
+		t.Errorf("POSIX install script missing default install dir $HOME/.toktrail/bin")
+	}
+	// 7. Must support --connect and reject unknown flags without evaluating the link.
+	if !strings.Contains(shStr, "--connect") {
+		t.Errorf("POSIX install script missing --connect support")
+	}
+	if strings.Contains(shStr, "eval") {
+		t.Errorf("POSIX install script must not eval the connect link")
+	}
 
 	ps1Content, err := os.ReadFile(ps1Path)
 	if err != nil {
@@ -140,6 +156,21 @@ func TestScriptStaticInvariants(t *testing.T) {
 	// 3. Must propagate installer and curl failure exit codes.
 	if !strings.Contains(ps1Str, "$LASTEXITCODE") {
 		t.Errorf("PowerShell install script missing $LASTEXITCODE propagation")
+	}
+	// 4. Must default -BaseUrl to the official GitHub release download root.
+	if !strings.Contains(ps1Str, wantDefaultBase) {
+		t.Errorf("PowerShell install script missing default GitHub base URL %q", wantDefaultBase)
+	}
+	// 5. Must default -InstallDir under .toktrail\bin.
+	if !strings.Contains(ps1Str, ".toktrail\\bin") {
+		t.Errorf("PowerShell install script missing default install dir under .toktrail\\bin")
+	}
+	// 6. Must support -ConnectUrl.
+	if !strings.Contains(ps1Str, "-ConnectUrl") && !strings.Contains(ps1Str, "$ConnectUrl") {
+		t.Errorf("PowerShell install script missing -ConnectUrl support")
+	}
+	if strings.Contains(ps1Str, "Invoke-Expression") {
+		t.Errorf("PowerShell install script must not Invoke-Expression the connect link")
 	}
 }
 
@@ -265,5 +296,204 @@ exit 0
 	recordedTmpFail := strings.TrimSpace(string(recBytesFail))
 	if _, err := os.Stat(recordedTmpFail); !os.IsNotExist(err) {
 		t.Errorf("TMP directory %s still exists after failed installer run; cleanup trap failed", recordedTmpFail)
+	}
+}
+
+// connectTestFixture renders the install.sh for a fake installer that places
+// a fake "toktrail" binary (a shell script) at the chosen install dir. The
+// fake toktrail records any "connect <url>" invocation and can be told to
+// fail via the CONNECT_FAIL env var, without ever using a real ticket/link.
+func connectTestFixture(t *testing.T) (installScript, baseURL, connectRecordFile string, workDir string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping POSIX shell execution test on Windows")
+	}
+
+	dir := t.TempDir()
+	serverDir := filepath.Join(dir, "dist")
+	if err := os.MkdirAll(serverDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	version := "v0.9.9"
+	_, pubPEM := generateTestPubKey(t)
+
+	var osName, archName string
+	switch runtime.GOOS {
+	case "darwin":
+		osName = "darwin"
+	case "linux":
+		osName = "linux"
+	default:
+		t.Skipf("unsupported test OS: %s", runtime.GOOS)
+	}
+	switch runtime.GOARCH {
+	case "arm64":
+		archName = "arm64"
+	case "amd64":
+		archName = "amd64"
+	default:
+		t.Skipf("unsupported test ARCH: %s", runtime.GOARCH)
+	}
+
+	toolFile := fmt.Sprintf("toktrail-release-%s-%s-%s", version, osName, archName)
+	fakeToolPath := filepath.Join(serverDir, toolFile)
+	connectRecordFile = filepath.Join(dir, "recorded_connect.txt")
+
+	// Fake installer: on "install ... -install-dir DIR" creates DIR and
+	// writes a fake toktrail binary there. The fake toktrail binary, when
+	// run as "connect <url>", records the url and exits with
+	// $CONNECT_FAIL (default 0).
+	fakeInstaller := fmt.Sprintf(`#!/bin/sh
+set -eu
+INSTALL_DIR=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-install-dir" ]; then
+    INSTALL_DIR="$arg"
+  fi
+  prev="$arg"
+done
+[ -n "$INSTALL_DIR" ] || { echo "fake installer: missing -install-dir" >&2; exit 1; }
+mkdir -p "$INSTALL_DIR"
+cat > "$INSTALL_DIR/toktrail" <<FAKEEOF
+#!/bin/sh
+set -eu
+if [ "\${1:-}" = "connect" ]; then
+  echo "\$2" > %q
+  exit "\${CONNECT_FAIL:-0}"
+fi
+echo "unsupported fake toktrail command: \$*" >&2
+exit 1
+FAKEEOF
+chmod 0755 "$INSTALL_DIR/toktrail"
+exit 0
+`, connectRecordFile)
+
+	if err := os.WriteFile(fakeToolPath, []byte(fakeInstaller), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h := sha256.Sum256([]byte(fakeInstaller))
+	toolHash := hex.EncodeToString(h[:])
+
+	m := testManifest(version)
+	for i := range m.Artifacts {
+		if m.Artifacts[i].OS == osName && m.Artifacts[i].Arch == archName {
+			m.Artifacts[i].InstallerBinarySha256 = toolHash
+		}
+	}
+
+	scriptPaths, err := EmitInstallScripts(serverDir, m, pubPEM)
+	if err != nil {
+		t.Fatalf("EmitInstallScripts: %v", err)
+	}
+	for _, p := range scriptPaths {
+		if strings.HasSuffix(p, ".sh") {
+			installScript = p
+			break
+		}
+	}
+	if installScript == "" {
+		t.Fatal("install.sh not emitted")
+	}
+	baseURL = "file://" + filepath.ToSlash(serverDir)
+	return installScript, baseURL, connectRecordFile, dir
+}
+
+// TestConnectFlagInvokesInstalledBinary verifies --connect runs the
+// just-installed toktrail binary's "connect" subcommand with the given
+// link, using an absolute path, after a successful install. No real
+// ticket/link value is used anywhere; a placeholder stands in for it.
+func TestConnectFlagInvokesInstalledBinary(t *testing.T) {
+	installScript, baseURL, connectRecordFile, dir := connectTestFixture(t)
+	installTarget := filepath.Join(dir, "install_target")
+	const placeholderLink = "TEST_TICKET_PLACEHOLDER"
+
+	cmd := exec.Command("/bin/sh", installScript, baseURL, installTarget, "--connect", placeholderLink)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install.sh --connect failed: %v\nOutput: %s", err, out)
+	}
+
+	recorded, err := os.ReadFile(connectRecordFile)
+	if err != nil {
+		t.Fatalf("connect was not invoked: %v", err)
+	}
+	if got := strings.TrimSpace(string(recorded)); got != placeholderLink {
+		t.Errorf("connect invoked with %q, want %q", got, placeholderLink)
+	}
+}
+
+// TestConnectFlagAfterLongOption verifies the --connect=LINK form works too.
+func TestConnectFlagEqualsForm(t *testing.T) {
+	installScript, baseURL, connectRecordFile, dir := connectTestFixture(t)
+	installTarget := filepath.Join(dir, "install_target")
+	const placeholderLink = "TEST_TICKET_PLACEHOLDER"
+
+	cmd := exec.Command("/bin/sh", installScript, baseURL, installTarget, "--connect="+placeholderLink)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install.sh --connect=LINK failed: %v\nOutput: %s", err, out)
+	}
+
+	recorded, err := os.ReadFile(connectRecordFile)
+	if err != nil {
+		t.Fatalf("connect was not invoked: %v", err)
+	}
+	if got := strings.TrimSpace(string(recorded)); got != placeholderLink {
+		t.Errorf("connect invoked with %q, want %q", got, placeholderLink)
+	}
+}
+
+// TestConnectFlagFailurePropagates verifies a failing "toktrail connect"
+// exit code propagates as the install script's own exit code, even though
+// the binary installation itself already succeeded.
+func TestConnectFlagFailurePropagates(t *testing.T) {
+	installScript, baseURL, _, dir := connectTestFixture(t)
+	installTarget := filepath.Join(dir, "install_target")
+	const placeholderLink = "TEST_TICKET_PLACEHOLDER"
+
+	cmd := exec.Command("/bin/sh", installScript, baseURL, installTarget, "--connect", placeholderLink)
+	cmd.Env = append(os.Environ(), "CONNECT_FAIL=13")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected install.sh to fail with exit 13, but succeeded. Output: %s", out)
+	}
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("unexpected error type: %v", err)
+	}
+	if exitErr.ExitCode() != 13 {
+		t.Errorf("exit code = %d, want 13", exitErr.ExitCode())
+	}
+	// The binary must still be installed; only connect failed.
+	if _, statErr := os.Stat(filepath.Join(installTarget, "toktrail")); statErr != nil {
+		t.Errorf("toktrail binary missing after connect failure: %v", statErr)
+	}
+}
+
+// TestConnectFlagValidation verifies strict validation of the --connect
+// flag and unknown arguments, without ever invoking the installer.
+func TestConnectFlagValidation(t *testing.T) {
+	installScript, baseURL, _, dir := connectTestFixture(t)
+	installTarget := filepath.Join(dir, "install_target")
+
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"missing connect value", []string{baseURL, installTarget, "--connect"}},
+		{"empty connect value via equals", []string{baseURL, installTarget, "--connect="}},
+		{"unknown flag", []string{baseURL, installTarget, "--bogus"}},
+		{"extra positional argument", []string{baseURL, installTarget, "unexpected-extra"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("/bin/sh", append([]string{installScript}, tc.args...)...)
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("expected install.sh to reject arguments, but succeeded. Output: %s", out)
+			}
+		})
 	}
 }

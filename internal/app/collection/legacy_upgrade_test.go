@@ -191,12 +191,12 @@ func fakeServerWithFlake(t *testing.T, requests *atomic.Int64, failUploadOnce *a
 
 // TestRunUpgradeFromLegacySourcesPreservesHistoricalProgressAndZeroReplay tests
 // the full upgrade lifecycle with real historical collection state:
-// 1. Initial collection.Run establishes actual batch, outbox, and progress files
-//    for both claude-code-jsonl (message baseline) and codex-jsonl (cursor/history).
-// 2. Simulate legacy snapshot by writing same grant content into sources.json and
-//    removing grants.json only within the verified temp path.
-// 3. Repeat collection.Run triggers migration, creates current grants.json, and
-//    proves zero new exports, zero new syncs/uploads, and no duplicate facts/progress.
+//  1. Initial collection.Run establishes actual batch, outbox, and progress files
+//     for both claude-code-jsonl (message baseline) and codex-jsonl (cursor/history).
+//  2. Simulate legacy snapshot by writing same grant content into sources.json and
+//     removing grants.json only within the verified temp path.
+//  3. Repeat collection.Run triggers migration, creates current grants.json, and
+//     proves zero new exports, zero new syncs/uploads, and no duplicate facts/progress.
 func TestRunUpgradeFromLegacySourcesPreservesHistoricalProgressAndZeroReplay(t *testing.T) {
 	stateDir := t.TempDir()
 	var requests atomic.Int64

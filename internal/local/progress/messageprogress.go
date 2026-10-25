@@ -216,6 +216,39 @@ func (s Store) ApplyMessagePending(source string, batchID string, updates []Mess
 	return s.saveMessageProgress(messages)
 }
 
+// EstablishConfirmedBaseline sets or updates the confirmed baseline for messages
+// without requiring an export batch. If a message has no confirmed baseline, it adopts
+// update.To so historical tokens are never replayed as deltas later.
+func (s Store) EstablishConfirmedBaseline(source string, updates []MessagePendingUpdate) error {
+	source = strings.TrimSpace(source)
+	if source == "" || len(updates) == 0 {
+		return nil
+	}
+	messages, _, err := s.LoadMessageProgress()
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	changed := false
+	for _, update := range updates {
+		if strings.TrimSpace(update.MessageID) == "" || update.To == nil {
+			continue
+		}
+		key := source + "\x00" + update.MessageID
+		entry := messages[key]
+		if entry.Confirmed == nil {
+			entry.Confirmed = update.To
+			entry.UpdatedAt = now
+			messages[key] = entry
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return s.saveMessageProgress(messages)
+}
+
 // ConfirmMessageBatch applies a batch receipt per message: accepted messages
 // advance Confirmed to their pending to-state and unfreeze; rejected messages
 // unfreeze but keep Confirmed and record the rejected interval key so it is

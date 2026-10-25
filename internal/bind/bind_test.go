@@ -2,8 +2,12 @@ package bind
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -141,6 +145,78 @@ func TestRunBindReturnsServerError(t *testing.T) {
 	_, err := Run(t.Context(), statedir.New(t.TempDir()), Options{ServerURL: server.URL, Ticket: "wrong", ExternalSubjectID: "user-1"})
 	if err == nil {
 		t.Fatal("expected bind error")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestLostBindResponsePersistsReplayIdentity(t *testing.T) {
+	store := statedir.New(t.TempDir())
+	var requests []bindRequest
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var request bindRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		requests = append(requests, request)
+		saved, err := store.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if saved.DeviceSecret != request.DeviceSecret || saved.BindRequestID != request.RequestID || saved.PendingBindFingerprint == "" {
+			t.Fatal("replay identity was not durable before network request")
+		}
+		if len(requests) == 1 {
+			return nil, errors.New("response lost after server accepted ticket")
+		}
+		body, _ := json.Marshal(map[string]any{"device": map[string]any{
+			"deviceId": "dev-1", "applicationId": request.ApplicationID,
+			"externalSubjectId": request.ExternalSubjectID, "replay": true,
+		}})
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(string(body))), Header: make(http.Header)}, nil
+	})}
+	opt := Options{Ticket: "ticket-one", ExternalSubjectID: "user-1", HTTPClient: client}
+	if _, err := Run(t.Context(), store, opt); err == nil {
+		t.Fatal("expected lost response")
+	}
+	result, err := Run(t.Context(), store, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests[0] != requests[1] || !result.Replay {
+		t.Fatal("retry changed bind payload")
+	}
+	if result.State.PendingBindFingerprint != "" {
+		t.Fatal("confirmed bind retained pending marker")
+	}
+	data, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "ticket-one") {
+		t.Fatal("plaintext ticket persisted")
+	}
+}
+
+func TestReplacementTicketGetsNewRequestAfterFailure(t *testing.T) {
+	store := statedir.New(t.TempDir())
+	var requests []bindRequest
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var request bindRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		requests = append(requests, request)
+		return nil, errors.New("network unavailable")
+	})}
+	opt := Options{Ticket: "ticket-one", ExternalSubjectID: "user-1", HTTPClient: client}
+	_, _ = Run(t.Context(), store, opt)
+	opt.Ticket = "ticket-two"
+	_, _ = Run(t.Context(), store, opt)
+	if len(requests) != 2 || requests[0].RequestID == requests[1].RequestID || requests[0].DeviceSecret != requests[1].DeviceSecret {
+		t.Fatal("replacement ticket did not get fresh request identity with existing device secret")
 	}
 }
 
