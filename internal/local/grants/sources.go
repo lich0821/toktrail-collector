@@ -303,7 +303,7 @@ func (s Store) Enable(source, input string) (Grant, error) {
 	input = filepath.Clean(strings.TrimSpace(input))
 	now := time.Now().UTC()
 	for idx := range cfg.Grants {
-		if cfg.Grants[idx].Source == source && cfg.Grants[idx].Input == input {
+		if cfg.Grants[idx].Source == source && filepath.Clean(cfg.Grants[idx].Input) == input {
 			cfg.Grants[idx].Enabled = true
 			cfg.Grants[idx].EditedAt = now
 			grant := cfg.Grants[idx]
@@ -338,7 +338,7 @@ func (s Store) Disable(source, input string) (Grant, bool, error) {
 	source = strings.TrimSpace(source)
 	input = filepath.Clean(strings.TrimSpace(input))
 	for idx := range cfg.Grants {
-		if cfg.Grants[idx].Source == source && cfg.Grants[idx].Input == input {
+		if cfg.Grants[idx].Source == source && filepath.Clean(cfg.Grants[idx].Input) == input {
 			cfg.Grants[idx].Enabled = false
 			cfg.Grants[idx].EditedAt = time.Now().UTC()
 			grant := cfg.Grants[idx]

@@ -1,6 +1,7 @@
 package grants
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -143,5 +144,163 @@ func TestEnabledSkipsDisabledGrants(t *testing.T) {
 	}
 	if len(grants) != 0 {
 		t.Fatalf("expected zero enabled grants, got %#v", grants)
+	}
+}
+
+func TestEnableDisableLegacyNoncanonicalInputRegression(t *testing.T) {
+	tests := []struct {
+		name        string
+		storedInput func(canonical string) string
+		windowsOnly bool
+	}{
+		{
+			name: "noncanonical dotdot",
+			storedInput: func(canonical string) string {
+				parent := filepath.Dir(canonical)
+				base := filepath.Base(canonical)
+				sep := string(filepath.Separator)
+				return parent + sep + "unused" + sep + ".." + sep + base
+			},
+		},
+		{
+			name: "windows slash-only",
+			storedInput: func(canonical string) string {
+				return filepath.ToSlash(canonical)
+			},
+			windowsOnly: true,
+		},
+		{
+			name: "windows slash-only dotdot",
+			storedInput: func(canonical string) string {
+				parent := filepath.Dir(canonical)
+				base := filepath.Base(canonical)
+				sep := string(filepath.Separator)
+				return filepath.ToSlash(parent + sep + "unused" + sep + ".." + sep + base)
+			},
+			windowsOnly: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.windowsOnly && runtime.GOOS != "windows" {
+				t.Skip("skipping Windows-only path format test")
+			}
+
+			t.Run("Enable", func(t *testing.T) {
+				dir := t.TempDir()
+				store := New(dir)
+				canonical := writeInputFile(t, dir, "a.json")
+				stored := tc.storedInput(canonical)
+
+				legacyCfg := Config{
+					Version: 1,
+					Grants: []Grant{
+						{
+							Source:  "usage-json",
+							Input:   stored,
+							Enabled: false,
+						},
+					},
+				}
+				legacyBytes, err := json.Marshal(legacyCfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeLegacyConfig(t, dir, legacyBytes)
+
+				grant, err := store.Enable("usage-json", canonical)
+				if err != nil {
+					t.Fatalf("Enable failed: %v", err)
+				}
+				if !grant.Enabled {
+					t.Fatalf("expected grant to be enabled, got %#v", grant)
+				}
+				if grant.Input != stored {
+					t.Fatalf("expected stored original input %q, got %q", stored, grant.Input)
+				}
+
+				cfg, err := store.Load()
+				if err != nil {
+					t.Fatalf("Load failed: %v", err)
+				}
+				if len(cfg.Grants) != 1 {
+					t.Fatalf("expected 1 grant without duplication, got %d: %#v", len(cfg.Grants), cfg.Grants)
+				}
+				if cfg.Grants[0].Input != stored {
+					t.Fatalf("expected stored original input %q in config, got %q", stored, cfg.Grants[0].Input)
+				}
+				if !cfg.Grants[0].Enabled {
+					t.Fatalf("expected grant enabled in config")
+				}
+
+				diskLegacy, err := os.ReadFile(store.LegacyPath())
+				if err != nil {
+					t.Fatalf("failed to read legacy config: %v", err)
+				}
+				if !bytes.Equal(diskLegacy, legacyBytes) {
+					t.Fatalf("legacy file bytes modified: before=%q after=%q", string(legacyBytes), string(diskLegacy))
+				}
+			})
+
+			t.Run("Disable", func(t *testing.T) {
+				dir := t.TempDir()
+				store := New(dir)
+				canonical := writeInputFile(t, dir, "a.json")
+				stored := tc.storedInput(canonical)
+
+				legacyCfg := Config{
+					Version: 1,
+					Grants: []Grant{
+						{
+							Source:  "usage-json",
+							Input:   stored,
+							Enabled: true,
+						},
+					},
+				}
+				legacyBytes, err := json.Marshal(legacyCfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeLegacyConfig(t, dir, legacyBytes)
+
+				grant, found, err := store.Disable("usage-json", canonical)
+				if err != nil {
+					t.Fatalf("Disable failed: %v", err)
+				}
+				if !found {
+					t.Fatalf("expected Disable to find grant with stored input %q using canonical %q", stored, canonical)
+				}
+				if grant.Enabled {
+					t.Fatalf("expected grant to be disabled, got %#v", grant)
+				}
+				if grant.Input != stored {
+					t.Fatalf("expected stored original input %q, got %q", stored, grant.Input)
+				}
+
+				cfg, err := store.Load()
+				if err != nil {
+					t.Fatalf("Load failed: %v", err)
+				}
+				if len(cfg.Grants) != 1 {
+					t.Fatalf("expected 1 grant without duplication, got %d: %#v", len(cfg.Grants), cfg.Grants)
+				}
+				if cfg.Grants[0].Input != stored {
+					t.Fatalf("expected stored original input %q in config, got %q", stored, cfg.Grants[0].Input)
+				}
+				if cfg.Grants[0].Enabled {
+					t.Fatalf("expected grant disabled in config")
+				}
+
+				diskLegacy, err := os.ReadFile(store.LegacyPath())
+				if err != nil {
+					t.Fatalf("failed to read legacy config: %v", err)
+				}
+				if !bytes.Equal(diskLegacy, legacyBytes) {
+					t.Fatalf("legacy file bytes modified: before=%q after=%q", string(legacyBytes), string(diskLegacy))
+				}
+			})
+		})
 	}
 }
