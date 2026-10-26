@@ -49,11 +49,12 @@ var (
 )
 
 type Options struct {
-	ServerURL  string
-	StateDir   string
-	BatchFile  string
-	BatchID    string
-	HTTPClient *http.Client
+	ServerURL    string
+	StateDir     string
+	BatchFile    string
+	BatchID      string
+	HTTPClient   *http.Client
+	ToolStatuses []ToolStatus
 }
 
 type Result struct {

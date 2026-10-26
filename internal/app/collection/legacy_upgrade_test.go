@@ -3,8 +3,6 @@ package collection
 import (
 	"encoding/json"
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -138,51 +136,13 @@ func safeRemoveTempFile(t *testing.T, targetPath, verifiedTempDir string) {
 
 // fakeServerWithFlake accepts normal preflight and batches, with an optional
 // one-shot failure on ingest batch upload.
-func fakeServerWithFlake(t *testing.T, requests *atomic.Int64, failUploadOnce *atomic.Bool) *httptest.Server {
+func fakeServerWithFlake(t *testing.T, failUploadOnce *atomic.Bool) *fakeCollectorServer {
 	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests.Add(1)
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/devices/self":
-			writeJSONForTest(w, http.StatusOK, map[string]any{"device": map[string]any{
-				"deviceId":          "dev-1",
-				"applicationId":     "app-1",
-				"externalSubjectId": "sub-1",
-				"deviceName":        "collector",
-				"platform":          "darwin",
-				"consentRevision":   7,
-				"uploadAuthorized":  true,
-				"publicAuthorized":  false,
-				"revoked":           false,
-				"checkedAt":         "2026-10-21T04:00:00Z",
-			}})
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/ingest/batches":
-			if failUploadOnce != nil && failUploadOnce.CompareAndSwap(true, false) {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			var body struct {
-				BatchID string           `json:"batchId"`
-				Records []map[string]any `json:"records"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				t.Errorf("invalid ingest body: %v", err)
-			}
-			writeJSONForTest(w, http.StatusAccepted, map[string]any{"batch": map[string]any{
-				"batchId":         body.BatchID,
-				"status":          "accepted",
-				"acceptedRecords": len(body.Records),
-				"rejectedRecords": 0,
-				"replay":          false,
-				"receivedAt":      "2026-10-21T04:01:00Z",
-			}})
-		default:
-			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	t.Cleanup(server.Close)
-	return server
+	s := fakeServer(t)
+	if failUploadOnce != nil {
+		s.failIngestOnce = failUploadOnce
+	}
+	return s
 }
 
 // ---------------------------------------------------------------------------
@@ -199,8 +159,7 @@ func fakeServerWithFlake(t *testing.T, requests *atomic.Int64, failUploadOnce *a
 //     proves zero new exports, zero new syncs/uploads, and no duplicate facts/progress.
 func TestRunUpgradeFromLegacySourcesPreservesHistoricalProgressAndZeroReplay(t *testing.T) {
 	stateDir := t.TempDir()
-	var requests atomic.Int64
-	server := fakeServer(t, &requests)
+	server := fakeServer(t)
 	bindDevice(t, stateDir, server.URL)
 
 	claudeDir := filepath.Join(t.TempDir(), "claude-sessions")
@@ -238,10 +197,11 @@ func TestRunUpgradeFromLegacySourcesPreservesHistoricalProgressAndZeroReplay(t *
 	if res1.PendingRemaining != 0 || res1.DrainStopped != "" {
 		t.Fatalf("expected fully drained outbox, got %#v", res1)
 	}
-	requestsAfterFirstRun := requests.Load()
+	requestsAfterFirstRun := server.totalRequests()
 	if requestsAfterFirstRun == 0 {
 		t.Fatal("expected server requests for first run preflight and uploads")
 	}
+	ingestAfterFirstRun := server.ingestRequests()
 
 	// Verify initial ledgers exist and take snapshot.
 	cursorLedgerBefore, err := progress.New(stateDir).Load()
@@ -349,11 +309,42 @@ func TestRunUpgradeFromLegacySourcesPreservesHistoricalProgressAndZeroReplay(t *
 		t.Fatalf("outbox must remain fully drained, got %#v", res2)
 	}
 
-	// Assert zero new server network requests.
-	requestsAfterSecondRun := requests.Load()
-	if requestsAfterSecondRun != requestsAfterFirstRun {
-		t.Fatalf("second collection.Run must not make network requests: before=%d, after=%d",
+	// Assert the second run only reports the empty-scan status: no ingest
+	// replay, one self preflight, and one deduplicated tool-status POST that
+	// covers both migrated tools.
+	requestsAfterSecondRun := server.totalRequests()
+	if requestsAfterSecondRun != requestsAfterFirstRun+2 {
+		t.Fatalf("second collection.Run must only add the empty-scan status report: before=%d, after=%d",
 			requestsAfterFirstRun, requestsAfterSecondRun)
+	}
+	if got := server.ingestRequests(); got != ingestAfterFirstRun {
+		t.Fatalf("second collection.Run must not replay any ingest upload: before=%d, after=%d",
+			ingestAfterFirstRun, got)
+	}
+	if got := server.toolStatusRequests(); got != 3 { // 2 synced receipts from run 1 + 1 empty-scan POST
+		t.Fatalf("second collection.Run must add exactly one tool-status POST, got %d total", got)
+	}
+	reports := server.lastToolStatusReports()
+	wantTools := map[string]bool{"Claude Code": false, "Codex": false}
+	for _, r := range reports {
+		if r.Status != "no_new_records" {
+			t.Fatalf("expected no_new_records for %s, got %#v", r.Tool, r)
+		}
+		if r.Detail != "no new records since last confirmed baseline" {
+			t.Fatalf("expected the baseline detail for %s, got %#v", r.Tool, r)
+		}
+		if _, known := wantTools[r.Tool]; !known {
+			t.Fatalf("unexpected tool %q in status report", r.Tool)
+		}
+		wantTools[r.Tool] = true
+	}
+	for tool, seen := range wantTools {
+		if !seen {
+			t.Fatalf("tool %q missing from the status report: %#v", tool, reports)
+		}
+	}
+	if len(reports) != 2 {
+		t.Fatalf("expected both tools in one deduplicated POST, got %#v", reports)
 	}
 
 	// Assert no duplicate facts or progress regressions.
@@ -425,10 +416,9 @@ func TestRunUpgradeFromLegacySourcesPreservesHistoricalProgressAndZeroReplay(t *
 // exactly once, and a subsequent unchanged run produces zero replay and zero network calls.
 func TestRunUpgradeLegacyWithPendingOutboxDrainsAndConfirmsOnce(t *testing.T) {
 	stateDir := t.TempDir()
-	var requests atomic.Int64
 	failUploadOnce := &atomic.Bool{}
 	failUploadOnce.Store(true)
-	server := fakeServerWithFlake(t, &requests, failUploadOnce)
+	server := fakeServerWithFlake(t, failUploadOnce)
 	bindDevice(t, stateDir, server.URL)
 
 	claudeDir := filepath.Join(t.TempDir(), "claude-sessions")
@@ -525,9 +515,11 @@ func TestRunUpgradeLegacyWithPendingOutboxDrainsAndConfirmsOnce(t *testing.T) {
 		}
 	}
 
-	reqsAfterRun2 := requests.Load()
+	reqsAfterRun2 := server.totalRequests()
+	ingestAfterRun2 := server.ingestRequests()
 
-	// Run 3: unchanged run must not re-export, re-upload, or contact the server.
+	// Run 3: unchanged run must not re-export or replay any upload; its only
+	// traffic is the empty-scan status report for both tools.
 	res3, err := Run(t.Context(), Options{StateDir: stateDir})
 	if err != nil {
 		t.Fatalf("Run 3 failed: %v", err)
@@ -535,8 +527,11 @@ func TestRunUpgradeLegacyWithPendingOutboxDrainsAndConfirmsOnce(t *testing.T) {
 	if res3.ExportedBatches != 0 || res3.SyncedBatches != 0 {
 		t.Fatalf("Run 3 must be a zero-work no-op, got %#v", res3)
 	}
-	if n := requests.Load(); n != reqsAfterRun2 {
-		t.Fatalf("Run 3 must not make network requests: before=%d, after=%d", reqsAfterRun2, n)
+	if got := server.ingestRequests(); got != ingestAfterRun2 {
+		t.Fatalf("Run 3 must not replay any ingest upload: before=%d, after=%d", ingestAfterRun2, got)
+	}
+	if n := server.totalRequests(); n != reqsAfterRun2+2 {
+		t.Fatalf("Run 3 must only add the empty-scan status report: before=%d, after=%d", reqsAfterRun2, n)
 	}
 }
 
@@ -545,8 +540,7 @@ func TestRunUpgradeLegacyWithPendingOutboxDrainsAndConfirmsOnce(t *testing.T) {
 // new delta records that are exported and synced exactly once without replaying historical records.
 func TestRunUpgradeAppendNewUsageAfterMigrationSyncsOnlyDelta(t *testing.T) {
 	stateDir := t.TempDir()
-	var requests atomic.Int64
-	server := fakeServer(t, &requests)
+	server := fakeServer(t)
 	bindDevice(t, stateDir, server.URL)
 
 	claudeDir := filepath.Join(t.TempDir(), "claude-sessions")
@@ -609,9 +603,11 @@ func TestRunUpgradeAppendNewUsageAfterMigrationSyncsOnlyDelta(t *testing.T) {
 		t.Fatalf("expected 0 pending batches after Run 2, got %d", res2.PendingRemaining)
 	}
 
-	reqsAfterRun2 := requests.Load()
+	reqsAfterRun2 := server.totalRequests()
+	ingestAfterRun2 := server.ingestRequests()
 
-	// Run 3: unchanged input produces zero new exports and zero network calls.
+	// Run 3: unchanged input produces zero new exports, no ingest replay, and
+	// only the empty-scan status report for both tools.
 	res3, err := Run(t.Context(), Options{StateDir: stateDir})
 	if err != nil {
 		t.Fatalf("Run 3 failed: %v", err)
@@ -619,8 +615,11 @@ func TestRunUpgradeAppendNewUsageAfterMigrationSyncsOnlyDelta(t *testing.T) {
 	if res3.ExportedBatches != 0 || res3.SyncedBatches != 0 {
 		t.Fatalf("Run 3 should be no-op, got %#v", res3)
 	}
-	if n := requests.Load(); n != reqsAfterRun2 {
-		t.Fatalf("Run 3 must not make network requests: before=%d, after=%d", reqsAfterRun2, n)
+	if got := server.ingestRequests(); got != ingestAfterRun2 {
+		t.Fatalf("Run 3 must not replay any ingest upload: before=%d, after=%d", ingestAfterRun2, got)
+	}
+	if n := server.totalRequests(); n != reqsAfterRun2+2 {
+		t.Fatalf("Run 3 must only add the empty-scan status report: before=%d, after=%d", reqsAfterRun2, n)
 	}
 }
 
@@ -628,8 +627,7 @@ func TestRunUpgradeAppendNewUsageAfterMigrationSyncsOnlyDelta(t *testing.T) {
 // only legacy sources.json exists without prior runs or grants.json.
 func TestRunUpgradeFromLegacySourcesColdStart(t *testing.T) {
 	stateDir := t.TempDir()
-	var requests atomic.Int64
-	server := fakeServer(t, &requests)
+	server := fakeServer(t)
 	bindDevice(t, stateDir, server.URL)
 
 	claudeDir := filepath.Join(t.TempDir(), "claude-sessions")
@@ -667,12 +665,14 @@ func TestRunUpgradeFromLegacySourcesColdStart(t *testing.T) {
 	if res1.ExportedBatches != 2 || res1.SyncedBatches != 2 {
 		t.Fatalf("expected 2 exported and synced batches on cold start, got %#v", res1)
 	}
-	reqsAfterFirst := requests.Load()
+	reqsAfterFirst := server.totalRequests()
+	ingestAfterFirst := server.ingestRequests()
 	if reqsAfterFirst == 0 {
 		t.Fatal("expected network calls for preflight and sync on cold start")
 	}
 
-	// Second run must be an idle no-op with zero network requests.
+	// Second run must be an idle no-op: no new exports, no ingest replay, and
+	// only the empty-scan status report for both migrated tools.
 	res2, err := Run(t.Context(), Options{StateDir: stateDir})
 	if err != nil {
 		t.Fatalf("second collection.Run failed: %v", err)
@@ -680,8 +680,17 @@ func TestRunUpgradeFromLegacySourcesColdStart(t *testing.T) {
 	if res2.ExportedBatches != 0 || res2.SyncedBatches != 0 {
 		t.Fatalf("second run must be no-op, got %#v", res2)
 	}
-	if n := requests.Load(); n != reqsAfterFirst {
-		t.Fatalf("second run must not make network requests: before=%d, after=%d", reqsAfterFirst, n)
+	if got := server.ingestRequests(); got != ingestAfterFirst {
+		t.Fatalf("second run must not replay any ingest upload: before=%d, after=%d", ingestAfterFirst, got)
+	}
+	if n := server.totalRequests(); n != reqsAfterFirst+2 {
+		t.Fatalf("second run must only add the empty-scan status report: before=%d, after=%d", reqsAfterFirst, n)
+	}
+	if got := server.selfRequests(); got != 5 { // 2 drain + 2 receipt preflights in run 1, 1 status preflight in run 2
+		t.Fatalf("expected 5 total self preflights, got %d", got)
+	}
+	if got := server.toolStatusRequests(); got != 3 { // 2 synced receipts + 1 empty-scan POST
+		t.Fatalf("expected 3 total tool-status POSTs, got %d", got)
 	}
 }
 
@@ -690,8 +699,7 @@ func TestRunUpgradeFromLegacySourcesColdStart(t *testing.T) {
 // any input scanning or network traffic.
 func TestRunUpgradeDisabledLegacyGrantsDoNotScanOrNetwork(t *testing.T) {
 	stateDir := t.TempDir()
-	var requests atomic.Int64
-	server := fakeServer(t, &requests)
+	server := fakeServer(t)
 	bindDevice(t, stateDir, server.URL)
 
 	claudeDir := filepath.Join(t.TempDir(), "claude-sessions")
@@ -722,7 +730,7 @@ func TestRunUpgradeDisabledLegacyGrantsDoNotScanOrNetwork(t *testing.T) {
 	if res.ExportedBatches != 0 || res.SyncedBatches != 0 {
 		t.Fatalf("expected 0 exported and 0 synced batches, got %#v", res)
 	}
-	if n := requests.Load(); n != 0 {
+	if n := server.totalRequests(); n != 0 {
 		t.Fatalf("disabled legacy grants must not touch the network, got %d requests", n)
 	}
 
@@ -770,8 +778,7 @@ func TestRunUpgradeMalformedLegacySourcesYieldsErrorAndZeroNetwork(t *testing.T)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			stateDir := t.TempDir()
-			var requests atomic.Int64
-			server := fakeServer(t, &requests)
+			server := fakeServer(t)
 			bindDevice(t, stateDir, server.URL)
 
 			writeLegacySourcesRaw(t, stateDir, []byte(tc.payload))
@@ -780,7 +787,7 @@ func TestRunUpgradeMalformedLegacySourcesYieldsErrorAndZeroNetwork(t *testing.T)
 			if err == nil {
 				t.Fatalf("expected error for malformed legacy config %s, got nil", tc.name)
 			}
-			if n := requests.Load(); n != 0 {
+			if n := server.totalRequests(); n != 0 {
 				t.Fatalf("malformed legacy must not touch network, got %d requests", n)
 			}
 			if res.ExportedBatches != 0 || res.SyncedBatches != 0 {
@@ -805,8 +812,7 @@ func TestRunUpgradeMalformedLegacySourcesYieldsErrorAndZeroNetwork(t *testing.T)
 // sources.json and is never overwritten or backfilled by legacy grants.
 func TestRunUpgradeExplicitEmptyCurrentConfigWinsOverEnabledLegacy(t *testing.T) {
 	stateDir := t.TempDir()
-	var requests atomic.Int64
-	server := fakeServer(t, &requests)
+	server := fakeServer(t)
 	bindDevice(t, stateDir, server.URL)
 
 	claudeDir := filepath.Join(t.TempDir(), "claude-sessions")
@@ -836,7 +842,7 @@ func TestRunUpgradeExplicitEmptyCurrentConfigWinsOverEnabledLegacy(t *testing.T)
 	if res.ExportedBatches != 0 || res.SyncedBatches != 0 {
 		t.Fatalf("expected 0 exports and syncs, got %#v", res)
 	}
-	if n := requests.Load(); n != 0 {
+	if n := server.totalRequests(); n != 0 {
 		t.Fatalf("run with empty current config must not touch network, got %d requests", n)
 	}
 
@@ -855,8 +861,7 @@ func TestRunUpgradeExplicitEmptyCurrentConfigWinsOverEnabledLegacy(t *testing.T)
 // without performing legacy migration or writing grants.json.
 func TestRunUpgradeLockBusyPreventsMigrationWrites(t *testing.T) {
 	stateDir := t.TempDir()
-	var requests atomic.Int64
-	server := fakeServer(t, &requests)
+	server := fakeServer(t)
 	bindDevice(t, stateDir, server.URL)
 
 	claudeDir := filepath.Join(t.TempDir(), "claude-sessions")
@@ -890,7 +895,7 @@ func TestRunUpgradeLockBusyPreventsMigrationWrites(t *testing.T) {
 		_ = lock.Close()
 		t.Fatalf("grants.json must not be created when lock is busy: %v", err)
 	}
-	if n := requests.Load(); n != 0 {
+	if n := server.totalRequests(); n != 0 {
 		_ = lock.Close()
 		t.Fatalf("locked run must not make network requests, got %d", n)
 	}

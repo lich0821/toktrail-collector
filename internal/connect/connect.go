@@ -18,15 +18,18 @@ import (
 	"toktrail-collector/internal/local/statedir"
 	"toktrail-collector/internal/scheduler"
 	"toktrail-collector/internal/source/registry"
+	"toktrail-collector/internal/syncclient"
 )
 
 // Run coordinates the full connect orchestration:
 // 1. Fetching server configuration via one-time ticket over HTTPS / loopback HTTP.
 // 2. Binding device credentials (or skipping if already bound for this ticket/url receipt).
-// 3. Probing locally available sources based on server-specified tool list and local disk existence.
-// 4. Configuring local source grants (disabling previously active grants not in the new set).
-// 5. Installing the scheduled background service.
-// 6. Performing an initial collection run (without nested state locks).
+//  3. Probing locally available sources based on server-specified tool list and local disk existence.
+//  4. Configuring local source grants (disabling previously active grants not in the new set).
+//  5. Installing the scheduled background service.
+//  6. Reporting probe-only tool statuses to the server (unsupported tools, missing default
+//     directories); activated tools are reported by the collection flow (synced / no_new_records).
+//  7. Performing an initial collection run (without nested state locks).
 func Run(ctx context.Context, opt Options) (Result, error) {
 	out := opt.Out
 	if out == nil {
@@ -133,14 +136,8 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 				st.PendingConnectReceiptHash = ""
 				needSave = true
 			}
-			if isNewReceipt || st.HistoryFrom == nil {
-				if cutoff != nil {
-					st.HistoryFrom = cutoff
-					st.HistoryDays = cfg.Days
-				} else {
-					st.HistoryFrom = nil
-					st.HistoryDays = 0
-				}
+			if isNewReceipt || st.HistoryFrom == nil || st.HistoryFrom.IsZero() {
+				applyHistoryCutoff(&st, cutoff, cfg.Days)
 				needSave = true
 			}
 			if needSave {
@@ -177,31 +174,48 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 			}
 			st.ConnectReceiptHash = fingerprint
 			st.PendingConnectReceiptHash = ""
-			if cutoff != nil {
-				st.HistoryFrom = cutoff
-				st.HistoryDays = cfg.Days
-			} else {
-				st.HistoryFrom = nil
-				st.HistoryDays = 0
-			}
+			applyHistoryCutoff(&st, cutoff, cfg.Days)
 			if err := store.Save(st); err != nil {
 				return fmt.Errorf("save bound state: %w", err)
 			}
 			fmt.Fprintf(out, "bound device %s (consentRevision=%d)\n", deviceID, consentRev)
 		}
 
-		// Tool probing
+		// Tool probing. Tools that could not be activated are reported to
+		// the server with probe-only statuses (unsupported /
+		// not_detected); activated tools are reported by the collection
+		// flow with synced / no_new_records and are intentionally absent
+		// here. Duplicate entries in cfg.Tools are collapsed by tool name
+		// so the report stays within the tool-status contract.
 		var grantsToApply []grants.Grant
+		var probeStatuses []syncclient.ToolStatus
+		reportedProbe := map[string]bool{}
 		for _, toolName := range cfg.Tools {
 			spec, ok := registry.LookupTool(toolName)
 			if !ok {
 				fmt.Fprintf(out, "tool %q: unsupported tool; skipped\n", toolName)
+				if !reportedProbe[toolName] {
+					reportedProbe[toolName] = true
+					probeStatuses = append(probeStatuses, syncclient.ToolStatus{
+						Tool:   toolName,
+						Status: "unsupported",
+						Detail: "unsupported tool",
+					})
+				}
 				continue
 			}
 			targetDir := spec.ResolveDefaultInput(homeDir)
 			stat, err := os.Stat(targetDir)
 			if err != nil || !stat.IsDir() {
 				fmt.Fprintf(out, "tool %q: directory %s not found; skipped\n", spec.Tool, targetDir)
+				if !reportedProbe[spec.Tool] {
+					reportedProbe[spec.Tool] = true
+					probeStatuses = append(probeStatuses, syncclient.ToolStatus{
+						Tool:   spec.Tool,
+						Status: "not_detected",
+						Detail: "default directory not found",
+					})
+				}
 				continue
 			}
 			fmt.Fprintf(out, "tool %q: detected directory %s; authorized\n", spec.Tool, targetDir)
@@ -239,6 +253,22 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		}
 		serviceIdentity = plan.TaskName
 		fmt.Fprintf(out, "installed service %s (interval=%s)\n", plan.TaskName, interval)
+
+		// 6. Report probe-only tool statuses to the server. Older servers
+		// that have not deployed the tool-status endpoint answer 404/405,
+		// which ReportToolStatuses tolerates. Any other failure surfaces:
+		// the connect run fails rather than silently dropping the report.
+		if len(probeStatuses) > 0 {
+			_, err := syncclient.ReportToolStatuses(ctx, store, syncclient.Options{
+				StateDir:     stateDir,
+				ServerURL:    cfg.ServerURL,
+				HTTPClient:   opt.HTTPClient,
+				ToolStatuses: probeStatuses,
+			})
+			if err != nil {
+				return fmt.Errorf("report tool statuses failed: %w", sanitizeError(err, ticket))
+			}
+		}
 		return nil
 	}
 
@@ -248,7 +278,7 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		return Result{}, err
 	}
 
-	// 6. Initial collection run (collection.Run acquires its own state lock)
+	// 7. Initial collection run (collection.Run acquires its own state lock)
 	fmt.Fprintf(out, "running initial collection...\n")
 	periodicResult, err := collection.Run(ctx, collection.Options{
 		StateDir:   stateDir,
@@ -289,4 +319,30 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		InstalledService: serviceIdentity,
 		PeriodicResult:   periodicResult,
 	}, nil
+}
+
+// applyHistoryCutoff pins the consented history window without ever
+// shrinking it. Bind and rebind must not orphan records an earlier consent
+// already authorized: narrowing HistoryFrom would move already-collected
+// records before the cutoff, where the pipeline quarantines them as
+// before_history_from. A cutoff is applied only when it widens the window
+// (no current cutoff, or an earlier date); HistoryDays keeps the widest
+// window ever granted. A nil cutoff means unlimited history — the widest
+// window — so it clears any pinned cutoff. Baselines, the outbox, and
+// collection progress live in separate stores and are never rewritten by
+// bind or rebind.
+func applyHistoryCutoff(st *statedir.DeviceState, cutoff *time.Time, days int) {
+	if cutoff == nil {
+		st.HistoryFrom = nil
+		st.HistoryDays = 0
+		return
+	}
+	if st.HistoryFrom == nil || st.HistoryFrom.IsZero() || cutoff.Before(*st.HistoryFrom) {
+		st.HistoryFrom = cutoff
+		st.HistoryDays = days
+		return
+	}
+	if days > st.HistoryDays {
+		st.HistoryDays = days
+	}
 }

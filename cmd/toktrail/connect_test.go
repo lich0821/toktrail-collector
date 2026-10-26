@@ -90,13 +90,16 @@ func TestRunConnectCLIIntegration(t *testing.T) {
 				},
 			})
 		case "/v1/devices/self":
+			// preflightSelf expects the device envelope under "device".
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"deviceId":         "dev-cli-1",
-				"consentRevision":  1,
-				"uploadAuthorized": true,
-				"publicAuthorized": true,
-				"revoked":          false,
+				"device": map[string]any{
+					"deviceId":         "dev-cli-1",
+					"consentRevision":  1,
+					"uploadAuthorized": true,
+					"publicAuthorized": true,
+					"revoked":          false,
+				},
 			})
 		default:
 			w.WriteHeader(http.StatusOK)

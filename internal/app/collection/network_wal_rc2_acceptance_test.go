@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,8 +26,7 @@ func TestRC2_NetworkDisconnectionAndRetry_Acceptance(t *testing.T) {
 	stateDir := t.TempDir()
 
 	// 1. Setup a test server that can be shut down to simulate network drop
-	var requests atomic.Int64
-	server := fakeServer(t, &requests)
+	server := fakeServer(t)
 	serverURL := server.URL
 
 	bindDevice(t, stateDir, serverURL)
@@ -89,8 +87,7 @@ func TestRC2_NetworkDisconnectionAndRetry_Acceptance(t *testing.T) {
 	}
 
 	// 2. Restore network: start a new test server on a new URL, update device state
-	requests.Store(0)
-	restoredServer := fakeServer(t, &requests)
+	restoredServer := fakeServer(t)
 	defer restoredServer.Close()
 
 	// Update device state server URL to restored server
@@ -131,6 +128,14 @@ func TestRC2_NetworkDisconnectionAndRetry_Acceptance(t *testing.T) {
 		t.Fatalf("drain should not have stopped early, got: %s", res2.DrainStopped)
 	}
 
+	if restoredServer.ingestRequests() != 1 || restoredServer.toolStatusRequests() != 1 {
+		t.Fatalf("restored endpoint counts: ingest=%d status=%d", restoredServer.ingestRequests(), restoredServer.toolStatusRequests())
+	}
+	reports := restoredServer.toolStatusReports()
+	if len(reports) != 1 || reports[0].Status != "synced" {
+		t.Fatalf("restored source receipts: %#v", reports)
+	}
+
 	// Verify outbox status updated to synced
 	ob2, err := ledger.Load()
 	if err != nil {
@@ -164,8 +169,7 @@ func TestRC2_NetworkDisconnectionAndRetry_Acceptance(t *testing.T) {
 func TestRC2_InterruptedExportWAL_CrashedRunRecoveredOnIdlePeriodic_Acceptance(t *testing.T) {
 	stateDir := t.TempDir()
 
-	var requests atomic.Int64
-	server := fakeServer(t, &requests)
+	server := fakeServer(t)
 	defer server.Close()
 
 	bindDevice(t, stateDir, server.URL)
@@ -238,6 +242,14 @@ func TestRC2_InterruptedExportWAL_CrashedRunRecoveredOnIdlePeriodic_Acceptance(t
 	}
 	if res.PendingRemaining != 0 {
 		t.Fatalf("expected 0 pending remaining, got %d", res.PendingRemaining)
+	}
+
+	if server.ingestRequests() != 1 || server.toolStatusRequests() != 1 {
+		t.Fatalf("recovery endpoint counts: ingest=%d status=%d", server.ingestRequests(), server.toolStatusRequests())
+	}
+	reports := server.toolStatusReports()
+	if len(reports) != 1 || reports[0].Status != "no_new_records" {
+		t.Fatalf("idle recovery source receipt: %#v", reports)
 	}
 
 	// Verify journal was deleted after recovery

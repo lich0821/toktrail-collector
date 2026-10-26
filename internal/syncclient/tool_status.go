@@ -1,0 +1,125 @@
+package syncclient
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"toktrail-collector/internal/local/outbox"
+	"toktrail-collector/internal/local/statedir"
+)
+
+// ToolStatus is a source observation, independent of usage batches and cursors.
+type ToolStatus struct {
+	Tool   string `json:"tool"`
+	Status string `json:"status"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// ReportToolStatuses never changes usage ACKs, baselines, or progress.
+func ReportToolStatuses(ctx context.Context, store statedir.Store, opt Options) (Result, error) {
+	if len(opt.ToolStatuses) == 0 || len(opt.ToolStatuses) > 32 {
+		return Result{}, errors.New("tool status count must be between 1 and 32")
+	}
+	seen := map[string]bool{}
+	for _, item := range opt.ToolStatuses {
+		if strings.TrimSpace(item.Tool) == "" || len(item.Tool) > 64 || seen[item.Tool] {
+			return Result{}, errors.New("invalid or duplicate tool status")
+		}
+		seen[item.Tool] = true
+		switch item.Status {
+		case "synced", "no_new_records", "unsupported", "not_detected":
+		default:
+			return Result{}, errors.New("invalid tool status")
+		}
+		switch item.Detail {
+		case "", "no new records since last confirmed baseline", "unsupported tool", "default directory not found":
+		default:
+			return Result{}, errors.New("invalid tool status detail")
+		}
+	}
+	st, err := store.Load()
+	if err != nil {
+		return Result{}, err
+	}
+	if st.DeviceID == "" || st.DeviceSecret == "" {
+		return Result{}, errors.New("device is not bound; run toktrail bind first")
+	}
+	serverURL := strings.TrimSpace(opt.ServerURL)
+	if serverURL == "" {
+		serverURL = st.ServerURL
+	}
+	if serverURL == "" {
+		return Result{}, errors.New("server URL is required")
+	}
+	client := opt.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	if strings.TrimSpace(opt.StateDir) != "" {
+		if _, err := outbox.New(opt.StateDir).RecordPreflightAttempt(time.Now().UTC()); err != nil {
+			return Result{}, err
+		}
+	}
+	self, err := preflightSelf(ctx, client, serverURL, st)
+	if err != nil {
+		return Result{}, err
+	}
+	if len(self.AllowedTools) > 0 {
+		for _, item := range opt.ToolStatuses {
+			allowed := false
+			for _, tool := range self.AllowedTools {
+				if tool == item.Tool {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				return Result{}, ErrOutsideScope
+			}
+		}
+	}
+	endpoint, err := joinURL(serverURL, "/v1/devices/tool-status")
+	if err != nil {
+		return Result{}, err
+	}
+	payload, err := json.Marshal(struct {
+		Statuses []ToolStatus `json:"statuses"`
+	}{opt.ToolStatuses})
+	if err != nil {
+		return Result{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return Result{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+st.DeviceID+"."+st.DeviceSecret)
+	req.Header.Set("X-Consent-Revision", strconv.FormatInt(self.ConsentRevision, 10))
+	resp, err := client.Do(req)
+	if err != nil {
+		return Result{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+			return Result{State: st, Self: self, Status: resp.StatusCode}, nil
+		}
+		var body ingestResponse
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			return Result{}, fmt.Errorf("tool status response HTTP %d", resp.StatusCode)
+		}
+		code, message := "", ""
+		if body.Error != nil {
+			code, message = body.Error.Code, body.Error.Message
+		}
+		return Result{}, classifyIngestError(resp.StatusCode, code, message)
+	}
+	return Result{State: st, Self: self, Status: resp.StatusCode}, nil
+}

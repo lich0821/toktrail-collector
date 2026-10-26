@@ -36,6 +36,7 @@ import (
 	"toktrail-collector/internal/local/statedir"
 	"toktrail-collector/internal/source/adapter"
 	"toktrail-collector/internal/source/pipeline"
+	"toktrail-collector/internal/source/registry"
 	synccmd "toktrail-collector/internal/syncclient"
 )
 
@@ -82,6 +83,7 @@ type Result struct {
 
 	SyncedBatches int
 	SyncedRecords int
+	syncedTools   map[string]bool
 	// Recovered counts quarantine records re-pended during the drain.
 	Recovered int
 	// Quarantined counts records currently in the quarantine store after
@@ -216,7 +218,44 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	if err := drain(ctx, &res, opt); err != nil {
 		return res, err
 	}
+	// Only successful empty scans qualify. Failed reads and undrained usage
+	// must not be presented as a completed empty scan.
+	if res.PendingRemaining == 0 {
+		statuses := []synccmd.ToolStatus{}
+		seen := map[string]bool{}
+		blocked := map[string]bool{}
+		for _, outcome := range res.GrantOutcomes {
+			if outcome.Skipped != "no new records since the last confirmed baselines" {
+				blocked[toolForSource(outcome.Source)] = true
+			}
+		}
+		for _, outcome := range res.GrantOutcomes {
+			if outcome.Skipped != "no new records since the last confirmed baselines" {
+				continue
+			}
+			tool := toolForSource(outcome.Source)
+			if tool == "" || seen[tool] || blocked[tool] || res.syncedTools[tool] {
+				continue
+			}
+			seen[tool] = true
+			statuses = append(statuses, synccmd.ToolStatus{Tool: tool, Status: "no_new_records", Detail: "no new records since last confirmed baseline"})
+		}
+		if len(statuses) > 0 {
+			if _, err := synccmd.ReportToolStatuses(ctx, statedir.New(stateDir), synccmd.Options{StateDir: stateDir, ServerURL: opt.ServerURL, HTTPClient: opt.HTTPClient, ToolStatuses: statuses}); err != nil {
+				return res, err
+			}
+		}
+	}
 	return res, nil
+}
+
+func toolForSource(source string) string {
+	for _, tool := range registry.SupportedTools() {
+		if tool.Source == source {
+			return tool.Tool
+		}
+	}
+	return ""
 }
 
 func drain(ctx context.Context, res *Result, opt Options) error {
@@ -265,6 +304,21 @@ func drain(ctx context.Context, res *Result, opt Options) error {
 		if syncResult.Receipt.BatchID != "" {
 			res.SyncedBatches++
 			res.SyncedRecords += syncResult.Receipt.AcceptedRecords
+			if tool := toolForSource(entry.Source); tool != "" && syncResult.Receipt.AcceptedRecords > 0 {
+				if res.syncedTools == nil {
+					res.syncedTools = map[string]bool{}
+				}
+				res.syncedTools[tool] = true
+				if _, err := synccmd.ReportToolStatuses(ctx, statedir.New(stateDir), synccmd.Options{StateDir: stateDir, ServerURL: opt.ServerURL, HTTPClient: opt.HTTPClient, ToolStatuses: []synccmd.ToolStatus{{Tool: tool, Status: "synced"}}}); err != nil {
+					remaining, countErr := countPending(ledger)
+					if countErr != nil {
+						return countErr
+					}
+					res.PendingRemaining = remaining
+					res.DrainStopped = fmt.Sprintf("source status report failed: %v", err)
+					return err
+				}
+			}
 		}
 	}
 	remaining, err := countPending(ledger)
