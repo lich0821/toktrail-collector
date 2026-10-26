@@ -35,6 +35,11 @@ func main() {
 	switch cmd {
 	case "version":
 		fmt.Println("toktrail", version)
+	case "connect":
+		if err := runConnect(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "connect failed: %v\n", err)
+			os.Exit(1)
+		}
 	case "bind":
 		if err := runBind(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "bind failed: %v\n", err)
@@ -877,6 +882,10 @@ func printHelp() {
 
 Commands:
   version                    print collector version
+  connect '<URL>'            one-step device setup via connect URL/ticket: fetches
+                             server configuration, binds device, probes local tools,
+                             configures source grants, installs scheduled service,
+                             and runs initial collection
   bind                       bind this device to toktrail-server using explicit upload authorization
   status                     check bound device authorization from toktrail-server
   scan [--source usage-json|codex-jsonl|claude-code-jsonl] --input <path>

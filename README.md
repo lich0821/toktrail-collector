@@ -53,6 +53,7 @@ internal/source/
 internal/local/         Local state, grants, outbox, commit, progress, lock, and quarantine
 internal/app/           Application workflows: collection, diagnostics, and status
 internal/bind/          Device binding
+internal/connect/       One-step connect orchestration
 internal/syncclient/    Server sync, ACK handling, reorganization, and recovery
 internal/distribution/  Manifest, version, signature, hash and naming protocol
 internal/installer/     Download, verification, extraction and safe binary replacement
@@ -68,6 +69,7 @@ Common commands:
 
 - `toktrail version` prints the collector version.
 - `toktrail help` prints the available command surface.
+- `toktrail connect '<URL>'` one-step device setup via connect URL/ticket: fetches server configuration, binds device, probes local tools, configures source grants, installs scheduled service, and runs initial collection.
 - `toktrail scan` summarizes local records without account or network access.
 - `toktrail preview` validates and previews local records.
 - `toktrail export` writes a server ingest batch and registers it in the local outbox.

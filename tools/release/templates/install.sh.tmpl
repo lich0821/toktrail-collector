@@ -14,20 +14,65 @@
 #     scheduler/launch agent, and never contacts the toktrail upload
 #     (sync) server. BASE_URL below is the release DOWNLOAD/update
 #     endpoint, which must be a separate origin from any upload endpoint.
+#   * EXCEPTION: when --connect LINK is given, this script runs the
+#     freshly installed 'toktrail connect LINK' once the install above
+#     succeeds. That is the only case where this script's own actions
+#     lead to a call beyond the signed release download; the connect
+#     call itself is made by the installed collector binary under its
+#     own command surface, not by this script reaching into the network.
 #
-# Usage: install-{{.Version}}.sh BASE_URL [INSTALL_DIR]
+# Usage: install-{{.Version}}.sh [BASE_URL [INSTALL_DIR]] [--connect LINK]
 #   BASE_URL      release download root that serves manifest.json et al.
-#                 (also via TOKTRAIL_DOWNLOAD_BASE)
-#   INSTALL_DIR   default $HOME/.local/bin (also via TOKTRAIL_INSTALL_DIR)
+#                 (also via TOKTRAIL_DOWNLOAD_BASE); defaults to the
+#                 official GitHub release download root for {{.Version}}
+#   INSTALL_DIR   default $HOME/.toktrail/bin (also via TOKTRAIL_INSTALL_DIR)
+#   --connect LINK
+#                 optional one-time connect link; after a successful
+#                 install, runs 'toktrail connect LINK' using the
+#                 absolute path of the binary just installed
 set -eu
 
 VERSION='{{.Version}}'
-BASE_URL="${1:-${TOKTRAIL_DOWNLOAD_BASE:-}}"
-INSTALL_DIR="${2:-${TOKTRAIL_INSTALL_DIR:-$HOME/.local/bin}}"
+DEFAULT_BASE_URL='https://github.com/lich0821/toktrail-collector/releases/download/{{.Version}}'
 
 fail() { echo "install: $*" >&2; exit 1; }
 
-[ -n "$BASE_URL" ] || fail "usage: $0 BASE_URL [INSTALL_DIR]"
+BASE_URL_ARG=""
+INSTALL_DIR_ARG=""
+CONNECT_URL=""
+POSITIONAL=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --connect)
+      [ $# -ge 2 ] || fail "--connect requires a URL argument"
+      CONNECT_URL="$2"
+      [ -n "$CONNECT_URL" ] || fail "--connect requires a non-empty URL argument"
+      shift 2
+      ;;
+    --connect=*)
+      CONNECT_URL="${1#--connect=}"
+      [ -n "$CONNECT_URL" ] || fail "--connect requires a non-empty URL argument"
+      shift
+      ;;
+    --*)
+      fail "unknown argument: $1"
+      ;;
+    *)
+      case "$POSITIONAL" in
+        0) BASE_URL_ARG="$1" ;;
+        1) INSTALL_DIR_ARG="$1" ;;
+        *) fail "unexpected extra argument: $1" ;;
+      esac
+      POSITIONAL=$((POSITIONAL + 1))
+      shift
+      ;;
+  esac
+done
+
+BASE_URL="${BASE_URL_ARG:-${TOKTRAIL_DOWNLOAD_BASE:-$DEFAULT_BASE_URL}}"
+INSTALL_DIR="${INSTALL_DIR_ARG:-${TOKTRAIL_INSTALL_DIR:-$HOME/.toktrail/bin}}"
+
+[ -n "$BASE_URL" ] || fail "usage: $0 [BASE_URL [INSTALL_DIR]] [--connect LINK]"
 
 case "$(uname -s)/$(uname -m)" in
 {{- range .UnixPins}}
@@ -81,3 +126,12 @@ echo "==> verifying release {{.Version}} and installing to $INSTALL_DIR"
   -version "$VERSION" \
   -pubkey "$TMP/pub.pem" \
   -install-dir "$INSTALL_DIR"
+
+if [ -n "$CONNECT_URL" ]; then
+  case "$INSTALL_DIR" in
+    /*) ABS_INSTALL_DIR="$INSTALL_DIR" ;;
+    *) ABS_INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd)" || fail "cannot resolve install directory $INSTALL_DIR" ;;
+  esac
+  echo "==> connecting with the provided link"
+  "$ABS_INSTALL_DIR/toktrail" connect "$CONNECT_URL"
+fi

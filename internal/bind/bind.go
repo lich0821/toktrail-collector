@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -76,16 +77,17 @@ func Run(ctx context.Context, store statedir.Store, opt Options) (Result, error)
 			return Result{}, err
 		}
 	}
-	// Reuse the idempotency request ID only while the first bind is still
-	// unconfirmed. Once a device receipt has been persisted, a later setup run
-	// uses a fresh single-use ticket and therefore a different payload; reusing
-	// the old request ID would correctly trip the server's idempotency conflict.
-	if st.BindRequestID == "" || st.DeviceID != "" {
+	// Persist the replay identity before sending a single-use ticket. Hash the
+	// request scope so a replacement ticket cannot inherit an old request ID.
+	fingerprint := Fingerprint(opt.ServerURL, opt.Ticket, opt.ApplicationID, opt.ExternalSubjectID, opt.DeviceName, opt.Platform)
+	legacyPending := st.PendingBindFingerprint == "" && st.DeviceID == "" && st.BindRequestID != ""
+	if st.BindRequestID == "" || (!legacyPending && st.PendingBindFingerprint != fingerprint) {
 		st.BindRequestID, err = randomHex(16)
 		if err != nil {
 			return Result{}, err
 		}
 	}
+	st.PendingBindFingerprint = fingerprint
 	request := bindRequest{
 		RequestID:         st.BindRequestID,
 		Ticket:            opt.Ticket,
@@ -108,6 +110,9 @@ func Run(ctx context.Context, store statedir.Store, opt Options) (Result, error)
 		return Result{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if err := store.Save(st); err != nil {
+		return Result{}, err
+	}
 	client := opt.HTTPClient
 	resp, err := client.Do(req)
 	if err != nil {
@@ -127,6 +132,15 @@ func Run(ctx context.Context, store statedir.Store, opt Options) (Result, error)
 	}
 	if body.Device.DeviceID == "" {
 		return Result{}, errors.New("bind response missing deviceId")
+	}
+	if body.Device.ApplicationID != opt.ApplicationID || body.Device.ExternalSubjectID != opt.ExternalSubjectID {
+		return Result{}, errors.New("bind response identity does not match request")
+	}
+	st.PendingBindFingerprint = ""
+	st.LastBindFingerprint = fingerprint
+	if st.PendingConnectReceiptHash != "" {
+		st.ConnectReceiptHash = st.PendingConnectReceiptHash
+		st.PendingConnectReceiptHash = ""
 	}
 	st.ServerURL = strings.TrimRight(opt.ServerURL, "/")
 	st.ApplicationID = body.Device.ApplicationID
@@ -188,6 +202,12 @@ func joinURL(base string, path string) (string, error) {
 	}
 	u.Path = strings.TrimRight(u.Path, "/") + path
 	return u.String(), nil
+}
+
+// Fingerprint computes the deterministic bind fingerprint for a request scope.
+func Fingerprint(serverURL, ticket, appID, subjectID, deviceName, platform string) string {
+	payload, _ := json.Marshal([]string{serverURL, ticket, appID, subjectID, deviceName, platform})
+	return fmt.Sprintf("%x", sha256.Sum256(payload))
 }
 
 func randomHex(n int) (string, error) {

@@ -53,6 +53,7 @@ internal/source/
 internal/local/         本地状态、授权、outbox、commit、进度、锁与隔离区
 internal/app/           应用工作流：采集、诊断与状态
 internal/bind/          设备绑定
+internal/connect/       一键连接编排流程
 internal/syncclient/    服务端同步、ACK、重组与恢复
 internal/distribution/  manifest、版本、签名、哈希与命名协议
 internal/installer/     下载、验签、解包与安全替换二进制
@@ -66,6 +67,7 @@ docs/                   架构、发布与调度设计说明
 
 - `toktrail version` 输出 Collector 版本。
 - `toktrail help` 输出可用命令。
+- `toktrail connect '<URL>'` 通过一键连接 URL/ticket 接入设备：获取服务端配置、绑定设备凭证、探测本地工具、配置授权、安装定时服务并执行首次采集。
 - `toktrail scan` 离线汇总本地记录。
 - `toktrail preview` 校验并预览本地记录。
 - `toktrail export` 写出 server ingest batch，并登记到本地 outbox。

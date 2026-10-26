@@ -112,6 +112,22 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	defer lock.Close()
 
 	res := Result{}
+
+	// Batch payloads land in <stateDir>/batches; ensure the directory exists
+	// before recovering any pending export transaction or committing new batches.
+	batchesDir := filepath.Join(stateDir, "batches")
+	if err := os.MkdirAll(batchesDir, 0o700); err != nil {
+		return res, fmt.Errorf("prepare batches dir: %w", err)
+	}
+
+	// Finish any pending export transaction left behind by an earlier crash
+	// before validating grants or draining outbox, so the uncommitted batch
+	// is materialized, registered as pending in outbox, and drained even if
+	// all configured grants are currently idle.
+	if _, err := exportcommit.Recover(stateDir); err != nil {
+		return res, fmt.Errorf("recover pending export transaction: %w", err)
+	}
+
 	grantStore := grants.New(stateDir)
 	// Persist legacy grants only while holding the same lock as collection.
 	// Migration failures stop before scanning inputs or refreshing consent.
@@ -134,11 +150,9 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		now = time.Now
 	}
 
-	// Batch payloads land in <stateDir>/batches; the manual export command
-	// takes an explicit --out so this is the periodic entry's responsibility.
-	batchesDir := filepath.Join(stateDir, "batches")
-	if err := os.MkdirAll(batchesDir, 0o700); err != nil {
-		return res, fmt.Errorf("prepare batches dir: %w", err)
+	var historyFrom *time.Time
+	if devState, err := statedir.New(stateDir).Load(); err == nil && devState.HistoryFrom != nil && !devState.HistoryFrom.IsZero() {
+		historyFrom = devState.HistoryFrom
 	}
 
 	for idx, grant := range enabledGrants {
@@ -157,11 +171,12 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		}
 		output := filepath.Join(stateDir, "batches", batchID+".json")
 		prepared, err := pipeline.PrepareExport(adapter.Options{
-			Source:   grant.Source,
-			Input:    grant.Input,
-			Output:   output,
-			BatchID:  batchID,
-			StateDir: stateDir,
+			Source:      grant.Source,
+			Input:       grant.Input,
+			Output:      output,
+			BatchID:     batchID,
+			StateDir:    stateDir,
+			HistoryFrom: historyFrom,
 		})
 		if err != nil {
 			outcome.Skipped = fmt.Sprintf("export preparation failed: %v", err)

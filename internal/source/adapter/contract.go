@@ -1,6 +1,8 @@
 package adapter
 
 import (
+	"time"
+
 	"toktrail-collector/internal/local/progress"
 )
 
@@ -22,6 +24,9 @@ type Options struct {
 	// claude-code-jsonl adapter then reports the full current usage per
 	// message without interval state (updates are discarded).
 	StateDir string
+	// HistoryFrom is the optional cutoff timestamp. Records with occurredAt
+	// strictly before this timestamp are filtered out of exports.
+	HistoryFrom *time.Time
 }
 
 // LoadResult is the raw output of one source loader.

@@ -13,15 +13,35 @@
 #     task or service, and never contacts the toktrail upload (sync)
 #     server. -BaseUrl below is the release DOWNLOAD/update endpoint,
 #     which must be a separate origin from any upload endpoint.
+#   * EXCEPTION: when -ConnectUrl is given, this script runs the freshly
+#     installed 'toktrail.exe connect <ConnectUrl>' once the install
+#     above succeeds. That is the only case where this script's own
+#     actions lead to a call beyond the signed release download; the
+#     connect call itself is made by the installed collector binary
+#     under its own command surface, not by this script reaching into
+#     the network.
 #
 # Usage:
-#   powershell -ExecutionPolicy Bypass -File install-{{.Version}}.ps1 -BaseUrl <root> [-InstallDir <dir>]
+#   powershell -ExecutionPolicy Bypass -File install-{{.Version}}.ps1 [-BaseUrl <root>] [-InstallDir <dir>] [-ConnectUrl <link>]
+#   -BaseUrl     release download root that serves manifest.json et al.;
+#                defaults to the official GitHub release download root
+#                for {{.Version}}
+#   -InstallDir  default $env:USERPROFILE\.toktrail\bin
+#   -ConnectUrl  optional one-time connect link; after a successful
+#                install, runs 'toktrail.exe connect <ConnectUrl>' using
+#                the absolute path of the binary just installed
 param(
-  [Parameter(Mandatory = $true)][string]$BaseUrl,
-  [string]$InstallDir = "$env:LOCALAPPDATA\Programs\toktrail"
+  [string]$BaseUrl = "https://github.com/lich0821/toktrail-collector/releases/download/{{.Version}}",
+  [string]$InstallDir = "$env:USERPROFILE\.toktrail\bin",
+  [string]$ConnectUrl = ""
 )
 $ErrorActionPreference = 'Stop'
 $version = '{{.Version}}'
+
+if (-not $BaseUrl) {
+  Write-Error "BaseUrl must not be empty"
+  exit 1
+}
 
 switch ($env:PROCESSOR_ARCHITECTURE) {
 {{- range .WinPins}}
@@ -62,6 +82,15 @@ try {
   & $tool install -base-url $BaseUrl -version $version -pubkey $pub -install-dir $InstallDir
   if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
+  }
+
+  if ($ConnectUrl) {
+    $installedExe = Join-Path (Resolve-Path $InstallDir) 'toktrail.exe'
+    Write-Host "==> connecting with the provided link"
+    & $installedExe connect $ConnectUrl
+    if ($LASTEXITCODE -ne 0) {
+      exit $LASTEXITCODE
+    }
   }
 }
 finally {
