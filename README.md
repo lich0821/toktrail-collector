@@ -13,6 +13,7 @@ Supported sources in the current implementation:
 - Codex session JSONL (`codex-jsonl`).
 - Claude Code session JSONL (`claude-code-jsonl`).
 - DeepSeek Harness session JSONL (`deepseek-harness`).
+- WorkBuddy AI session JSONL (`workbuddy-jsonl`): passive JSONL only; model names are always reported as `unknown`.
 - Synthetic/free-form `usage-json` fixtures for integration and compatibility testing.
 
 The collector uploads token usage counters and stable privacy-safe record identifiers. It must not upload prompts, message bodies, raw session IDs, raw message IDs, absolute local paths, or private model route names.
@@ -50,6 +51,7 @@ internal/source/
   codexjsonl/            Codex parser, replay filtering, and tests
   claudecodejsonl/       Claude Code parser, interval integrity, and tests
   deepseekharness/       DeepSeek Harness parser and tests
+  workbuddyjsonl/        WorkBuddy JSONL parser and tests
   registry/             Explicit compiled-in adapter registry
   pipeline/             Scan, preview, export, and batch splitting
 internal/local/         Local state, grants, outbox, commit, progress, lock, and quarantine
@@ -113,6 +115,21 @@ go run ./cmd/toktrail scan --source deepseek-harness --input ~/.dsh/sessions
 go run ./cmd/toktrail export --source deepseek-harness --input ~/.dsh/sessions --out ./deepseek-batch.json --batch deepseek-demo-1
 ```
 
+Scan and export WorkBuddy usage from a local directory:
+
+```sh
+go run ./cmd/toktrail scan --source workbuddy-jsonl --input ~/.workbuddy-ai/projects
+go run ./cmd/toktrail export --source workbuddy-jsonl --input ~/.workbuddy-ai/projects --out ./workbuddy-batch.json --batch workbuddy-demo-1
+```
+
+WorkBuddy specifics:
+
+- The source is passive JSONL only: it reads the session JSONL files WorkBuddy appends to and never writes to them.
+- It does not cover the WorkBuddy SQLite history database; usage recorded only there is not collected.
+- For privacy, model identifiers recorded by WorkBuddy are not uploaded; `model` is always reported as `unknown`.
+- The default directory is `~/.workbuddy-ai/projects` (current WorkBuddy AI versions). Older WorkBuddy versions used `~/.workbuddy/projects`; there is no automatic fallback for the old layout, so grant it explicitly, for example `toktrail sources enable --source workbuddy-jsonl --input ~/.workbuddy/projects`.
+- `connect` reapplies the server-authorized grants and disables manually enabled grants that are not part of them. Add the old-layout `~/.workbuddy/projects` grant after running `connect`, and re-check it after every reconnect.
+
 Bind and sync against a local development server:
 
 ```sh
@@ -139,6 +156,7 @@ go run ./cmd/toktrail service install \
   --grant codex-jsonl=$HOME/.codex/sessions \
   --grant claude-code-jsonl=$HOME/.claude/projects \
   --grant deepseek-harness=$HOME/.dsh/sessions \
+  --grant workbuddy-jsonl=$HOME/.workbuddy-ai/projects \
   --interval 30m
 ```
 

@@ -1,6 +1,7 @@
 package quarantine
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -112,19 +113,116 @@ func TestAppendConflictingRecordFails(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "conflicts with an already-quarantined entry") {
 		t.Fatalf("expected the conflict error, got %v", err)
 	}
-	// Same key, different origin batch: fatal too.
-	conflict = entryFor("record-a", "batch-2", rawRecord("record-a", "other-tool"))
-	err = store.Append([]Entry{conflict})
-	if err == nil || !strings.Contains(err.Error(), "origin batch-1 vs batch-2") {
-		t.Fatalf("expected the origin conflict error, got %v", err)
+	// Same key, different origin batch but identical record content: a
+	// replay of the same quarantine identity, merged (see
+	// TestAppendSameRecordDifferentOriginMerges), never a hard error that
+	// would stop collection.
+	replayed := entryFor("record-a", "batch-2", rawRecord("record-a", "other-tool"))
+	if err := store.Append([]Entry{replayed}); err != nil {
+		t.Fatalf("expected the same record under a different origin to merge, got %v", err)
 	}
-	// The store is unchanged after the failed appends.
+	// The store is unchanged in count and keeps the original provenance.
 	entries, loadErr := New(dir).Load()
 	if loadErr != nil {
 		t.Fatal(loadErr)
 	}
 	if len(entries) != 1 || entries[0].OriginBatchID != "batch-1" {
-		t.Fatalf("expected the original entry untouched: %#v", entries)
+		t.Fatalf("expected a single entry with the original origin: %#v", entries)
+	}
+}
+
+// TestAppendSameRecordDifferentOriginMerges covers the multi-origin replay:
+// the same record quarantined again from a later batch must not error (the
+// rc.3 field failure), must stay a single entry, must keep the original
+// origin provenance, must refresh a strictly newer consent revision (so
+// recovery keeps requiring a newer revision and cannot loop), and must fill
+// in message provenance only when the stored entry lacks it.
+func TestAppendSameRecordDifferentOriginMerges(t *testing.T) {
+	dir := t.TempDir()
+	store := New(dir)
+	original := entryFor("record-a", "batch-1", rawRecord("record-a", "other-tool"))
+	if err := store.Append([]Entry{original}); err != nil {
+		t.Fatal(err)
+	}
+	rebatched := entryFor("record-a", "batch-2", rawRecord("record-a", "other-tool"))
+	rebatched.Reason = ReasonBeforeHistoryFrom
+	rebatched.ConsentRevision = original.ConsentRevision + 1
+	rebatched.MessageID = "msg-a"
+	rebatched.FromState = &progress.MessageUsageState{Input: u64ptr(3)}
+	rebatched.ToState = &progress.MessageUsageState{Input: u64ptr(7)}
+	if err := store.Append([]Entry{rebatched}); err != nil {
+		t.Fatalf("expected the multi-origin replay to merge, got %v", err)
+	}
+	entries, err := New(dir).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected a single merged entry, got %#v", entries)
+	}
+	got := entries[0]
+	if got.OriginBatchID != "batch-1" {
+		t.Fatalf("expected the original origin to be preserved, got %s", got.OriginBatchID)
+	}
+	if got.ConsentRevision != original.ConsentRevision+1 || got.Reason != ReasonBeforeHistoryFrom {
+		t.Fatalf("expected the newer revision and reason to win, got revision %d reason %s", got.ConsentRevision, got.Reason)
+	}
+	if got.MessageID != "msg-a" || got.FromState == nil || got.ToState == nil {
+		t.Fatalf("expected the missing message provenance to be filled in, got %#v", got)
+	}
+	// A replay carrying an older revision must not roll anything back, and
+	// message provenance already present is never overwritten.
+	older := entryFor("record-a", "batch-3", rawRecord("record-a", "other-tool"))
+	older.ConsentRevision = original.ConsentRevision
+	older.MessageID = "msg-a"
+	older.FromState = &progress.MessageUsageState{Input: u64ptr(3)}
+	older.ToState = &progress.MessageUsageState{Input: u64ptr(7)}
+	if err := store.Append([]Entry{older}); err != nil {
+		t.Fatalf("expected the older-revision replay to be a no-op, got %v", err)
+	}
+	entries, err = New(dir).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].MessageID != "msg-a" || entries[0].ConsentRevision != original.ConsentRevision+1 {
+		t.Fatalf("expected the stored metadata to be untouched by the older replay: %#v", entries)
+	}
+	// Conflicting message provenance across origins is rejected, never
+	// silently resolved, and never drops the stored original entry.
+	before, readErr := os.ReadFile(store.Path())
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	wrongMessage := entryFor("record-a", "batch-4", rawRecord("record-a", "other-tool"))
+	wrongMessage.ConsentRevision = original.ConsentRevision + 2
+	wrongMessage.MessageID = "msg-other"
+	wrongMessage.FromState = &progress.MessageUsageState{Input: u64ptr(3)}
+	err = store.Append([]Entry{wrongMessage})
+	if err == nil || !strings.Contains(err.Error(), "message msg-a vs msg-other") {
+		t.Fatalf("expected the message provenance conflict error, got %v", err)
+	}
+	wrongState := entryFor("record-a", "batch-5", rawRecord("record-a", "other-tool"))
+	wrongState.ConsentRevision = original.ConsentRevision + 2
+	wrongState.MessageID = "msg-a"
+	wrongState.FromState = &progress.MessageUsageState{Input: u64ptr(999)}
+	wrongState.ToState = &progress.MessageUsageState{Input: u64ptr(7)}
+	err = store.Append([]Entry{wrongState})
+	if err == nil || !strings.Contains(err.Error(), "interval state differs") {
+		t.Fatalf("expected the interval state conflict error, got %v", err)
+	}
+	after, readErr := os.ReadFile(store.Path())
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("a rejected metadata conflict must not modify the stored entry")
+	}
+	// Genuinely different content under any origin stays fatal.
+	conflict := entryFor("record-a", "batch-6", rawRecord("record-a", "yet-another-tool"))
+	conflict.ConsentRevision = original.ConsentRevision + 5
+	err = store.Append([]Entry{conflict})
+	if err == nil || !strings.Contains(err.Error(), "conflicts with an already-quarantined entry") {
+		t.Fatalf("expected the content conflict error, got %v", err)
 	}
 }
 

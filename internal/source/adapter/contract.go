@@ -11,6 +11,7 @@ const (
 	CodexJSONLSource      = "codex-jsonl"
 	ClaudeCodeJSONLSource = "claude-code-jsonl"
 	DeepSeekHarnessSource = "deepseek-harness"
+	WorkBuddyJSONLSource  = "workbuddy-jsonl"
 )
 
 type Options struct {

@@ -34,6 +34,12 @@ var supportedTools = []ToolSpec{
 		Source:         adapter.DeepSeekHarnessSource,
 		DefaultSubpath: []string{".dsh", "sessions"},
 	},
+	{
+		Tool:           "WorkBuddy",
+		Aliases:        []string{"workbuddy", "workbuddy-ai"},
+		Source:         adapter.WorkBuddyJSONLSource,
+		DefaultSubpath: []string{".workbuddy-ai", "projects"},
+	},
 }
 
 // SupportedTools returns the registered tool specifications.

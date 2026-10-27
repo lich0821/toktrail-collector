@@ -25,6 +25,12 @@ func TestLookupTool(t *testing.T) {
 		{"deepseekharness", "DeepSeek Harness", "deepseek-harness", true},
 		{"dsh", "DeepSeek Harness", "deepseek-harness", true},
 		{"  DeepSeek Harness  ", "DeepSeek Harness", "deepseek-harness", true},
+		{"WorkBuddy", "WorkBuddy", "workbuddy-jsonl", true},
+		{"workbuddy", "WorkBuddy", "workbuddy-jsonl", true},
+		{"Work Buddy", "WorkBuddy", "workbuddy-jsonl", true},
+		{"work-buddy", "WorkBuddy", "workbuddy-jsonl", true},
+		{"workbuddy-ai", "WorkBuddy", "workbuddy-jsonl", true},
+		{"  WorkBuddy  ", "WorkBuddy", "workbuddy-jsonl", true},
 		{"Unknown", "", "", false},
 		{"", "", "", false},
 		{"Cursor", "", "", false},
@@ -73,6 +79,16 @@ func TestResolveDefaultInput(t *testing.T) {
 	}
 	resolved = spec.ResolveDefaultInput(home)
 	expected = filepath.Join("test", "home", ".dsh", "sessions")
+	if resolved != expected {
+		t.Errorf("expected %q, got %q", expected, resolved)
+	}
+
+	spec, found = LookupTool("WorkBuddy")
+	if !found {
+		t.Fatal("WorkBuddy not found")
+	}
+	resolved = spec.ResolveDefaultInput(home)
+	expected = filepath.Join("test", "home", ".workbuddy-ai", "projects")
 	if resolved != expected {
 		t.Errorf("expected %q, got %q", expected, resolved)
 	}

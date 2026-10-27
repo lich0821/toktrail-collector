@@ -13,6 +13,7 @@ Collector 的设计目标是：即使没有账号，本地检查仍然可用。`
 - Codex session JSONL（`codex-jsonl`）。
 - Claude Code session JSONL（`claude-code-jsonl`）。
 - DeepSeek Harness session JSONL（`deepseek-harness`）。
+- WorkBuddy AI session JSONL（`workbuddy-jsonl`）：仅被动读取 JSONL；模型名一律上报为 `unknown`。
 - 用于集成与兼容测试的合成/自由格式 `usage-json`。
 
 Collector 上传 Token 使用计数和稳定的隐私安全记录标识。它不得上传 prompt、消息正文、原始 session ID、原始 message ID、本地绝对路径或私有模型路由名。
@@ -50,6 +51,7 @@ internal/source/
   codexjsonl/            Codex parser、重放过滤与测试
   claudecodejsonl/       Claude Code parser、区间完整性与测试
   deepseekharness/       DeepSeek Harness parser 与测试
+  workbuddyjsonl/        WorkBuddy JSONL parser 与测试
   registry/             显式编译期 adapter 注册表
   pipeline/             扫描、预览、导出与批次拆分
 internal/local/         本地状态、授权、outbox、commit、进度、锁与隔离区
@@ -111,6 +113,21 @@ go run ./cmd/toktrail scan --source deepseek-harness --input ~/.dsh/sessions
 go run ./cmd/toktrail export --source deepseek-harness --input ~/.dsh/sessions --out ./deepseek-batch.json --batch deepseek-demo-1
 ```
 
+扫描并导出 WorkBuddy 使用数据：
+
+```sh
+go run ./cmd/toktrail scan --source workbuddy-jsonl --input ~/.workbuddy-ai/projects
+go run ./cmd/toktrail export --source workbuddy-jsonl --input ~/.workbuddy-ai/projects --out ./workbuddy-batch.json --batch workbuddy-demo-1
+```
+
+WorkBuddy 说明：
+
+- 该 source 仅被动读取 JSONL：只读 WorkBuddy 追加写入的 session JSONL 文件，绝不写入。
+- 不覆盖 WorkBuddy 的 SQLite 历史库；只存在于 SQLite 中的用量不会被采集。
+- 出于隐私考虑，本适配器不上传 WorkBuddy 记录中的模型标识，`model` 一律上报为 `unknown`。
+- 默认目录是 `~/.workbuddy-ai/projects`（新版 WorkBuddy AI）。旧版 WorkBuddy 使用 `~/.workbuddy/projects`；旧目录没有自动回退，需显式授权，例如 `toktrail sources enable --source workbuddy-jsonl --input ~/.workbuddy/projects`。
+- `connect` 会按服务端授权列表重新应用 grants，并禁用不在列表中的手动授权。旧目录 `~/.workbuddy/projects` 的显式授权需在 `connect` 之后（重新）添加，且每次重新 connect 后需重新检查。
+
 绑定并同步到本地开发服务：
 
 ```sh
@@ -137,6 +154,7 @@ go run ./cmd/toktrail service install \
   --grant codex-jsonl=$HOME/.codex/sessions \
   --grant claude-code-jsonl=$HOME/.claude/projects \
   --grant deepseek-harness=$HOME/.dsh/sessions \
+  --grant workbuddy-jsonl=$HOME/.workbuddy-ai/projects \
   --interval 30m
 ```
 

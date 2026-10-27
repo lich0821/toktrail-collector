@@ -118,9 +118,16 @@ func identityOf(source, recordKey string) string {
 
 // Append adds entries, deduplicating by compound identity (source + record
 // key). An entry whose identity is already quarantined is a replay: it is
-// accepted only when the origin batch and raw record are identical;
-// anything else is an error (never silently overwrite a quarantined record
-// with different content). The same record key under a different source is
+// accepted only when the raw record is canonically identical — anything else
+// is an error (never silently overwrite a quarantined record with different
+// content). A replay under a different origin batch is NOT a conflict: the
+// same record can legitimately appear in a later batch after the original
+// quarantine (scope-recovery re-batching, adapter re-emit, or a second
+// out-of-scope batch), and the server's record-key dedup makes the duplicate
+// upload harmless. Such a replay keeps exactly one entry with the original
+// origin provenance, refreshing only metadata that must not go stale (see
+// the replay branch below); conflicting message-interval provenance across
+// origins is still rejected. The same record key under a different source is
 // a distinct quarantine identity and coexists.
 func (s Store) Append(entries []Entry) error {
 	if len(entries) == 0 {
@@ -143,8 +150,59 @@ func (s Store) Append(entries []Entry) error {
 			entry.QuarantinedAt = time.Now().UTC()
 		}
 		if prev, ok := existing[identityOf(entry.Source, entry.RecordKey)]; ok {
-			if prev.OriginBatchID != entry.OriginBatchID || !sameRecordJSON(prev.Record, entry.Record) {
+			if !sameRecordJSON(prev.Record, entry.Record) {
 				return fmt.Errorf("quarantine entry for record %s conflicts with an already-quarantined entry (origin %s vs %s)", entry.RecordKey, prev.OriginBatchID, entry.OriginBatchID)
+			}
+			// Identical content under a different origin batch: the same
+			// record was re-batched or re-emitted after the original
+			// quarantine. Treat it as a replay of the same identity and keep
+			// exactly one entry (Remove and recovery assume one entry per
+			// identity; stacking duplicates would strand entries). The
+			// original origin provenance is preserved, and only metadata
+			// that must not go stale is refreshed: a re-quarantine under a
+			// strictly newer consent revision keeps requiring a strictly
+			// newer revision for recovery (a stale stored revision could
+			// let quarantine/recovery loop within one revision), and
+			// message-interval provenance is filled in only when the stored
+			// entry lacks it — if the filled-in state no longer matches the
+			// progress store, recovery fails closed and leaves the record
+			// quarantined.
+			merged := prev
+			// Conflicting message provenance across origins is fatal: the
+			// MessageID and interval endpoints decide how recovery restores
+			// the pending interval, and silently picking one side could
+			// mis-restore or strand the message. Unknown-never-equals-known
+			// applies too (a nil state on one side cannot be silently
+			// upgraded to the other side's known state). Returning here
+			// leaves the stored entry untouched.
+			if entry.MessageID != "" && merged.MessageID != "" {
+				if entry.MessageID != merged.MessageID {
+					return fmt.Errorf("quarantine entry for record %s conflicts with an already-quarantined entry (message %s vs %s)", entry.RecordKey, merged.MessageID, entry.MessageID)
+				}
+				if !merged.FromState.Equal(entry.FromState) || !merged.ToState.Equal(entry.ToState) {
+					return fmt.Errorf("quarantine entry for record %s conflicts with an already-quarantined entry (message %s interval state differs)", entry.RecordKey, merged.MessageID)
+				}
+			}
+			updated := false
+			if entry.ConsentRevision > merged.ConsentRevision {
+				merged.ConsentRevision = entry.ConsentRevision
+				merged.Reason = entry.Reason
+				merged.QuarantinedAt = entry.QuarantinedAt
+				updated = true
+			}
+			if merged.MessageID == "" && entry.MessageID != "" {
+				merged.MessageID = entry.MessageID
+				merged.FromState = entry.FromState
+				merged.ToState = entry.ToState
+				updated = true
+			}
+			if merged.Input == "" && entry.Input != "" {
+				merged.Input = entry.Input
+				updated = true
+			}
+			if updated {
+				existing[identityOf(entry.Source, entry.RecordKey)] = merged
+				changed = true
 			}
 			continue
 		}

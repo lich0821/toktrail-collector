@@ -567,7 +567,7 @@ func runSourcesList(args []string) error {
 func runSourcesEnable(args []string) error {
 	fs := flag.NewFlagSet("sources enable", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	source := fs.String("source", "", "adapter source (usage-json, codex-jsonl, claude-code-jsonl, deepseek-harness)")
+	source := fs.String("source", "", "adapter source (usage-json, codex-jsonl, claude-code-jsonl, deepseek-harness, workbuddy-jsonl)")
 	input := fs.String("input", "", "absolute local input path")
 	stateDir := fs.String("state-dir", env("TOKTRAIL_HOME", ""), "local TokTrail state directory")
 	if err := fs.Parse(args); err != nil {
@@ -929,11 +929,11 @@ Commands:
                              and runs initial collection
   bind                       bind this device to toktrail-server using explicit upload authorization
   status                     check bound device authorization from toktrail-server
-  scan [--source usage-json|codex-jsonl|claude-code-jsonl|deepseek-harness] --input <path>
+  scan [--source usage-json|codex-jsonl|claude-code-jsonl|deepseek-harness|workbuddy-jsonl] --input <path>
                               locally scan usage records without network/account access
-  preview [--source usage-json|codex-jsonl|claude-code-jsonl|deepseek-harness] --input <path>
+  preview [--source usage-json|codex-jsonl|claude-code-jsonl|deepseek-harness|workbuddy-jsonl] --input <path>
                               preview local usage records
-  export [--source usage-json|codex-jsonl|claude-code-jsonl|deepseek-harness] --input <path> --out <batch.json>
+  export [--source usage-json|codex-jsonl|claude-code-jsonl|deepseek-harness|workbuddy-jsonl] --input <path> --out <batch.json>
                               export local records and add a pending outbox batch
   sync [--file <batch.json>]  preflight device authorization, then upload a local batch
                               (or the oldest pending outbox batch) with the current
