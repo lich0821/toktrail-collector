@@ -19,6 +19,12 @@ func TestLookupTool(t *testing.T) {
 		{"claude code", "Claude Code", "claude-code-jsonl", true},
 		{"claude-code", "Claude Code", "claude-code-jsonl", true},
 		{"claudecode", "Claude Code", "claude-code-jsonl", true},
+		{"DeepSeek Harness", "DeepSeek Harness", "deepseek-harness", true},
+		{"deepseek harness", "DeepSeek Harness", "deepseek-harness", true},
+		{"deepseek-harness", "DeepSeek Harness", "deepseek-harness", true},
+		{"deepseekharness", "DeepSeek Harness", "deepseek-harness", true},
+		{"dsh", "DeepSeek Harness", "deepseek-harness", true},
+		{"  DeepSeek Harness  ", "DeepSeek Harness", "deepseek-harness", true},
 		{"Unknown", "", "", false},
 		{"", "", "", false},
 		{"Cursor", "", "", false},
@@ -57,6 +63,16 @@ func TestResolveDefaultInput(t *testing.T) {
 	}
 	resolved = spec.ResolveDefaultInput(home)
 	expected = filepath.Join("test", "home", ".claude", "projects")
+	if resolved != expected {
+		t.Errorf("expected %q, got %q", expected, resolved)
+	}
+
+	spec, found = LookupTool("DeepSeek Harness")
+	if !found {
+		t.Fatal("DeepSeek Harness not found")
+	}
+	resolved = spec.ResolveDefaultInput(home)
+	expected = filepath.Join("test", "home", ".dsh", "sessions")
 	if resolved != expected {
 		t.Errorf("expected %q, got %q", expected, resolved)
 	}

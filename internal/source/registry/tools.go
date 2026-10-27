@@ -28,6 +28,12 @@ var supportedTools = []ToolSpec{
 		Source:         adapter.ClaudeCodeJSONLSource,
 		DefaultSubpath: []string{".claude", "projects"},
 	},
+	{
+		Tool:           "DeepSeek Harness",
+		Aliases:        []string{"deepseek harness", "deepseek-harness", "deepseekharness", "dsh"},
+		Source:         adapter.DeepSeekHarnessSource,
+		DefaultSubpath: []string{".dsh", "sessions"},
+	},
 }
 
 // SupportedTools returns the registered tool specifications.

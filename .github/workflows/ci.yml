@@ -8,8 +8,8 @@
 #
 # Design notes:
 # - Run go vet and go test on Linux, macOS, and Windows.
-# - This module currently has no third-party dependencies and no go.sum, so the
-#   workflow runs with GOPROXY=off to validate offline buildability.
+# - Vendored dependencies allow the workflow to run with GOPROXY=off and
+#   validate offline buildability.
 # - The release end-to-end test is gated by TOKTRAIL_RELEASE_E2E=1 and runs only
 #   on Linux. It generates a temporary TEST signing key and builds all platform
 #   artifacts without reading any production signing secret.
@@ -49,7 +49,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.24'
-          cache: false # No go.sum exists because there are no module dependencies.
+          cache: false # Vendored dependencies do not require the module cache.
 
       - name: go vet
         run: go vet ./...

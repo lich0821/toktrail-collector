@@ -12,6 +12,7 @@ Collector 的设计目标是：即使没有账号，本地检查仍然可用。`
 
 - Codex session JSONL（`codex-jsonl`）。
 - Claude Code session JSONL（`claude-code-jsonl`）。
+- DeepSeek Harness session JSONL（`deepseek-harness`）。
 - 用于集成与兼容测试的合成/自由格式 `usage-json`。
 
 Collector 上传 Token 使用计数和稳定的隐私安全记录标识。它不得上传 prompt、消息正文、原始 session ID、原始 message ID、本地绝对路径或私有模型路由名。
@@ -48,6 +49,7 @@ internal/source/
   usagejson/            usage-json parser 与测试
   codexjsonl/            Codex parser、重放过滤与测试
   claudecodejsonl/       Claude Code parser、区间完整性与测试
+  deepseekharness/       DeepSeek Harness parser 与测试
   registry/             显式编译期 adapter 注册表
   pipeline/             扫描、预览、导出与批次拆分
 internal/local/         本地状态、授权、outbox、commit、进度、锁与隔离区
@@ -102,6 +104,13 @@ go run ./cmd/toktrail scan --source claude-code-jsonl --input ~/.claude/projects
 go run ./cmd/toktrail export --source claude-code-jsonl --input ~/.claude/projects --out ./claude-batch.json --batch claude-demo-1
 ```
 
+扫描并导出 DeepSeek Harness 使用数据：
+
+```sh
+go run ./cmd/toktrail scan --source deepseek-harness --input ~/.dsh/sessions
+go run ./cmd/toktrail export --source deepseek-harness --input ~/.dsh/sessions --out ./deepseek-batch.json --batch deepseek-demo-1
+```
+
 绑定并同步到本地开发服务：
 
 ```sh
@@ -127,6 +136,7 @@ go run ./cmd/toktrail sync --server http://127.0.0.1:3211
 go run ./cmd/toktrail service install \
   --grant codex-jsonl=$HOME/.codex/sessions \
   --grant claude-code-jsonl=$HOME/.claude/projects \
+  --grant deepseek-harness=$HOME/.dsh/sessions \
   --interval 30m
 ```
 

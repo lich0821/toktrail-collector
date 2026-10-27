@@ -12,6 +12,7 @@ Supported sources in the current implementation:
 
 - Codex session JSONL (`codex-jsonl`).
 - Claude Code session JSONL (`claude-code-jsonl`).
+- DeepSeek Harness session JSONL (`deepseek-harness`).
 - Synthetic/free-form `usage-json` fixtures for integration and compatibility testing.
 
 The collector uploads token usage counters and stable privacy-safe record identifiers. It must not upload prompts, message bodies, raw session IDs, raw message IDs, absolute local paths, or private model route names.
@@ -48,6 +49,7 @@ internal/source/
   usagejson/            usage-json parser and tests
   codexjsonl/            Codex parser, replay filtering, and tests
   claudecodejsonl/       Claude Code parser, interval integrity, and tests
+  deepseekharness/       DeepSeek Harness parser and tests
   registry/             Explicit compiled-in adapter registry
   pipeline/             Scan, preview, export, and batch splitting
 internal/local/         Local state, grants, outbox, commit, progress, lock, and quarantine
@@ -104,6 +106,13 @@ go run ./cmd/toktrail scan --source claude-code-jsonl --input ~/.claude/projects
 go run ./cmd/toktrail export --source claude-code-jsonl --input ~/.claude/projects --out ./claude-batch.json --batch claude-demo-1
 ```
 
+Scan and export DeepSeek Harness usage from a local directory:
+
+```sh
+go run ./cmd/toktrail scan --source deepseek-harness --input ~/.dsh/sessions
+go run ./cmd/toktrail export --source deepseek-harness --input ~/.dsh/sessions --out ./deepseek-batch.json --batch deepseek-demo-1
+```
+
 Bind and sync against a local development server:
 
 ```sh
@@ -129,6 +138,7 @@ Scheduled collection is opt-in. Enable explicit source grants before installing 
 go run ./cmd/toktrail service install \
   --grant codex-jsonl=$HOME/.codex/sessions \
   --grant claude-code-jsonl=$HOME/.claude/projects \
+  --grant deepseek-harness=$HOME/.dsh/sessions \
   --interval 30m
 ```
 
