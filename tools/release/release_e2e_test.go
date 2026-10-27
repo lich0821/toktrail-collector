@@ -10,12 +10,14 @@ import (
 
 	"toktrail-collector/internal/distribution"
 	"toktrail-collector/internal/installer"
+	"toktrail-collector/internal/source/registry"
 )
 
 // TestEndToEndRelease exercises the full pipeline against real go builds:
 // keygen -> build all 6 platforms via scripts/release.sh -> verify the whole dist
-// -> install via the generated bootstrap script (file:// base URL) -> run the
-// installed collector. It is slow (12 cross-compiles) and therefore gated behind
+// (manifest, artifacts, and the signed capabilities metadata) -> install via
+// the generated bootstrap script (file:// base URL) -> run the installed
+// collector. It is slow (12 cross-compiles) and therefore gated behind
 // TOKTRAIL_RELEASE_E2E=1.
 func TestEndToEndRelease(t *testing.T) {
 	if os.Getenv("TOKTRAIL_RELEASE_E2E") != "1" {
@@ -77,6 +79,43 @@ func TestEndToEndRelease(t *testing.T) {
 	}
 	if len(m.Artifacts) != len(distribution.ReleasePlatforms) {
 		t.Fatalf("built %d artifacts, want %d", len(m.Artifacts), len(distribution.ReleasePlatforms))
+	}
+
+	// 3b. Verify the signed capabilities metadata shipped with the release:
+	// content matches the registry compiled into this same source tree, the
+	// raw 64-byte Ed25519 signature verifies against the pinned key, and the
+	// document is bound to the release version. This is the same check the
+	// release workflow performs via "go run ./tools/release verify-capabilities".
+	capsPath := filepath.Join(distDir, CapabilitiesFileName)
+	capsSigPath := filepath.Join(distDir, CapabilitiesSignatureFileName)
+	caps, err := VerifyCapabilities(VerifyCapabilitiesOptions{
+		CapabilitiesPath: capsPath,
+		SignaturePath:    capsSigPath,
+		PubKeyPath:       pinPath,
+		ExpectedVersion:  version,
+	})
+	if err != nil {
+		t.Fatalf("VerifyCapabilities: %v", err)
+	}
+	specs := registry.SupportedTools()
+	if len(caps.Tools) != len(specs) {
+		t.Fatalf("capabilities tools length = %d, want %d", len(caps.Tools), len(specs))
+	}
+	for i, spec := range specs {
+		if caps.Tools[i] != spec.Tool {
+			t.Errorf("capabilities tools[%d] = %q, want %q", i, caps.Tools[i], spec.Tool)
+		}
+	}
+	// Exercise the CLI subcommand used by the release workflow end to end.
+	verifyCmd := exec.Command("go", "run", "./tools/release", "verify-capabilities",
+		"-capabilities", capsPath,
+		"-signature", capsSigPath,
+		"-pubkey", pinPath,
+		"-version", version)
+	verifyCmd.Dir = repoRoot
+	verifyCmd.Env = append(os.Environ(), "GOPROXY=off", "GOCACHE="+filepath.Join(repoRoot, ".gocache"))
+	if out, err := verifyCmd.CombinedOutput(); err != nil {
+		t.Fatalf("tools/release verify-capabilities failed: %v\n%s", err, out)
 	}
 
 	// 4. Install via the generated bootstrap script with a file:// base URL.

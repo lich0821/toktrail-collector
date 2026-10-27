@@ -69,10 +69,21 @@ type GrantSync struct {
 //   - a revision that keeps advancing during the sync stops the run rather
 //     than reading under a stale revision.
 //
-// The ack is sent only after the view is durably applied, the managed
-// grant merge completed, and no tool is restricted (pending); the server
-// must echo the same revision. Ack failures are non-fatal and retried on
-// the next run.
+// The ack is sent only after the view is durably applied and the managed
+// grant merge completed; fully applied revisions ack as
+// applyState=applied, restricted ones (unknown tool, missing default
+// directory, manually disabled grant) ack as applyState=pending so the
+// server UI never keeps claiming a full application that no longer holds.
+// The ack also carries the collector's capability report — the registered
+// supportedTools list and one closed-code pendingReason per restricted
+// tool (names and codes only, never local paths). An older server that
+// rejects those unknown fields is re-acked once with the legacy payload;
+// that fallback is recorded as "capabilities NOT reported" so it is never
+// claimed as delivered and is retried on the next run. The same revision
+// is re-acked whenever the applied state, collector version, or the
+// capability/reason payload changes; an old revision's ack never stands
+// in for a newer one. Ack failures are non-fatal and retried on the next
+// run.
 func syncGrants(ctx context.Context, opt Options, stateDir string, grantStore grants.Store, now func() time.Time) (GrantSync, managedconsent.Policy, error) {
 	info := GrantSync{}
 	store := statedir.New(stateDir)
@@ -94,6 +105,13 @@ func syncGrants(ctx context.Context, opt Options, stateDir string, grantStore gr
 		info.Note = "device is not bound; server grant sync skipped"
 		return info, managedconsent.Policy{}, nil
 	}
+
+	// The capability list reported with every ack: the tool names actually
+	// registered in this collector build (canonical registry names only,
+	// sorted, never local paths). Computed once per run — the compiled-in
+	// registry cannot change mid-run — and used both on the wire and as
+	// part of the ack cache key.
+	supportedTools := ackSupportedTools()
 
 	var lastOverlay managedconsent.Overlay
 	for cycle := 0; cycle < maxGrantSyncCycles; cycle++ {
@@ -213,15 +231,35 @@ func syncGrants(ctx context.Context, opt Options, stateDir string, grantStore gr
 		if len(pending) > 0 {
 			applyState = "pending"
 		}
+		// The capability payload reported with the ack: the registered
+		// supported-tools list plus one closed-code reason per restricted
+		// tool (names and codes only, never local paths). It is part of
+		// the ack cache key below, so a changed capability or reason
+		// payload re-acks the SAME revision. A restriction whose reason
+		// maps to no closed code is never given a fabricated one: the
+		// whole pendingReasons field is then omitted (the server reads
+		// "reasons unknown") while supportedTools still travels.
+		pendingReasons, unmappedReasons := ackPendingReasons(pending)
+		reasonsIncomplete := len(unmappedReasons) > 0
 		note := ""
 		if omittedManaged {
 			note = "server did not state deviceGrantManaged; treating the device as unmanaged (no automatic grants)"
 		}
+		if reasonsIncomplete {
+			unmappedNote := fmt.Sprintf("pending reason for %s has no closed grant-ack code and was not reported to the server", strings.Join(unmappedReasons, ", "))
+			if note == "" {
+				note = unmappedNote
+			} else {
+				note = note + "; " + unmappedNote
+			}
+		}
 		ackUpToDate := false
-		if seen && prev.AckedRevision == view.ConsentRevision &&
-			prev.AckedApplyState == applyState && prev.AckedCollectorVersion == effectiveVersion {
+		if seen && ackedPayloadCurrent(prev, view.ConsentRevision, applyState, effectiveVersion, supportedTools, pendingReasons, reasonsIncomplete) {
 			overlay.AckedRevision, overlay.AckedAt, overlay.AckedCollectorVersion, overlay.AckedApplyState =
 				prev.AckedRevision, prev.AckedAt, prev.AckedCollectorVersion, prev.AckedApplyState
+			overlay.AckedSupportedTools = prev.AckedSupportedTools
+			overlay.AckedPendingReasons = prev.AckedPendingReasons
+			overlay.AckedReasonsIncomplete = prev.AckedReasonsIncomplete
 			ackUpToDate = true
 		}
 		if err := mcStore.Save(overlay); err != nil {
@@ -245,15 +283,37 @@ func syncGrants(ctx context.Context, opt Options, stateDir string, grantStore gr
 		// restricted ones (unknown tool, missing default directory,
 		// manually disabled grant) ack as applyState=pending so the server
 		// UI never keeps claiming a full application that no longer holds.
-		// The same revision is re-acked when the applied state or the
-		// collector version changed; an old revision's ack never stands in
-		// for a newer one.
+		// The ack carries the capability report (supportedTools plus
+		// pendingReasons; [] explicitly when nothing is restricted). The
+		// same revision is re-acked when the applied state, the collector
+		// version, or the capability/reason payload changed; an old
+		// revision's ack never stands in for a newer one.
 		if !ackUpToDate {
-			ackReq := synccmd.GrantAckRequest{ConsentRevision: view.ConsentRevision, ApplyState: applyState}
-			if effectiveVersion != "" {
-				ackReq.CollectorVersion = effectiveVersion
-			}
+			ackReq := ackRequestFor(view.ConsentRevision, applyState, effectiveVersion, supportedTools, pendingReasons, reasonsIncomplete)
 			ack, ackErr := synccmd.ReportGrantAck(ctx, store, synccmd.Options{StateDir: stateDir, ServerURL: opt.ServerURL, HTTPClient: opt.HTTPClient}, ackReq)
+			capabilitiesConfirmed := ackErr == nil
+			legacyFallback := false
+			if ackErr != nil && errors.Is(ackErr, synccmd.ErrAckUnknownFields) {
+				// The server rejected the payload while it carried the
+				// optional capability fields — an older server refusing
+				// unknown JSON fields. Retry ONCE with the legacy payload
+				// shape (byte-identical to the pre-capability protocol).
+				// Only a SUCCESSFUL legacy retry counts as a downgrade:
+				// the capability report is then explicitly NOT recorded as
+				// delivered (never faked) and is retried on the next run.
+				// If the legacy payload fails too, the error below
+				// surfaces it like any ordinary ack failure.
+				legacyReq := ackReq
+				legacyReq.SupportedTools, legacyReq.PendingReasons = nil, nil
+				ack, ackErr = synccmd.ReportGrantAck(ctx, store, synccmd.Options{StateDir: stateDir, ServerURL: opt.ServerURL, HTTPClient: opt.HTTPClient}, legacyReq)
+				capabilitiesConfirmed = false
+				legacyFallback = ackErr == nil
+				if ackErr != nil {
+					// Keep the original capability-fields rejection
+					// visible when the legacy retry fails too.
+					ackErr = fmt.Errorf("legacy grant-ack retry after the capability-fields rejection failed as well: %w", ackErr)
+				}
+			}
 			if ackErr != nil {
 				if errors.Is(ackErr, synccmd.ErrAckRevisionAdvanced) {
 					// The server moved past the applied revision: never
@@ -284,12 +344,39 @@ func syncGrants(ctx context.Context, opt Options, stateDir string, grantStore gr
 			overlay.AckedRevision = view.ConsentRevision
 			overlay.AckedApplyState = applyState
 			overlay.AckedCollectorVersion = effectiveVersion
+			// The cached ack records the capability payload that was
+			// actually confirmed: the full lists when the capability
+			// request succeeded, nothing after a legacy fallback (or for
+			// pre-capability collectors) so the report is never claimed
+			// as delivered and the next run re-attempts it. An
+			// incomplete reason report is cached as such — the wire
+			// omitted pendingReasons — never as a complete receipt.
+			overlay.AckedSupportedTools = nil
+			overlay.AckedPendingReasons = nil
+			overlay.AckedReasonsIncomplete = false
+			if capabilitiesConfirmed {
+				overlay.AckedSupportedTools = supportedTools
+				overlay.AckedReasonsIncomplete = reasonsIncomplete
+				if !reasonsIncomplete {
+					overlay.AckedPendingReasons = pendingReasons
+				}
+			}
 			overlay.AckedAt = &ackedAt
 			if err := mcStore.Save(overlay); err != nil {
 				return info, managedconsent.Policy{}, fmt.Errorf("persist grant ack: %w", err)
 			}
 			lastOverlay = overlay
 			info.Acked = true
+			if legacyFallback {
+				// The revision receipt is confirmed, but the capability
+				// report was not delivered — surface it, never silently.
+				downgradeNote := "server rejected the grant-ack supportedTools/pendingReasons fields (older server); acknowledged with the legacy payload and the capability report will be retried on the next run"
+				if info.Note == "" {
+					info.Note = downgradeNote
+				} else {
+					info.Note = info.Note + "; " + downgradeNote
+				}
+			}
 			if ack.CurrentConsentRevision > view.ConsentRevision {
 				// The server moved on: never read under the stale
 				// revision. Re-fetch and re-apply once more.
@@ -486,9 +573,13 @@ func sortStrings(s []string) {
 
 // pendingToolStatuses maps the grant sync's per-tool restriction reasons
 // onto the tool-status vocabulary so the server sees why a revision is not
-// currently fully applied: unknown tools are unsupported, a missing
-// default directory is not detected, and a user-disabled default grant is
-// reported as disabled.
+// currently fully applied. Matching is by fixed reason PREFIX (the exact
+// texts mergeManagedGrants produces), never substring: the
+// missing-directory reason embeds the default path, and a directory named
+// e.g. "unknown tool" must not flip a missing input into "unsupported".
+// A reason that matches no known format is omitted entirely — the closed
+// tool-status vocabulary has no "unknown" value, and fabricating a
+// specific path-related reason would misreport the user's device state.
 func pendingToolStatuses(pending map[string]string) []synccmd.ToolStatus {
 	tools := make([]string, 0, len(pending))
 	for tool := range pending {
@@ -500,17 +591,152 @@ func pendingToolStatuses(pending map[string]string) []synccmd.ToolStatus {
 		reason := pending[tool]
 		status := synccmd.ToolStatus{Tool: tool}
 		switch {
-		case strings.Contains(reason, "unknown tool"):
+		case strings.HasPrefix(reason, "unknown tool:"):
 			status.Status = "unsupported"
 			status.Detail = "unsupported tool"
-		case strings.Contains(reason, "manually disabled"):
+		case strings.HasPrefix(reason, "default-directory grant is manually disabled"):
 			status.Status = "not_detected"
 			status.Detail = "default directory grant disabled"
-		default:
+		case strings.HasPrefix(reason, "default directory not found:"):
 			status.Status = "not_detected"
 			status.Detail = "default directory not found"
+		default:
+			// Unknown reason: report nothing rather than guess.
+			continue
 		}
 		statuses = append(statuses, status)
 	}
 	return statuses
+}
+
+// ackSupportedTools returns the tool names actually registered in this
+// collector build, sorted and deduplicated by construction of the
+// registry. Only canonical names travel — never aliases, adapter source
+// ids, or local paths.
+func ackSupportedTools() []string {
+	specs := registry.SupportedTools()
+	names := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		names = append(names, spec.Tool)
+	}
+	sortStrings(names)
+	return names
+}
+
+// ackPendingReasons maps the grant sync's per-tool restriction reasons
+// onto the closed grant-ack reason codes. Matching is by fixed reason
+// PREFIX (the exact texts mergeManagedGrants produces), never substring:
+// the missing-directory reason embeds the default path, and a directory
+// named e.g. "unknown tool" must not turn a missing_input into an
+// unsupported_tool. A reason that matches no known format gets NO
+// fabricated code — the tool is left out of the wire reasons and
+// returned as unmapped so the run can surface it.
+func ackPendingReasons(pending map[string]string) (map[string]string, []string) {
+	if len(pending) == 0 {
+		return nil, nil
+	}
+	reasons := make(map[string]string, len(pending))
+	var unmapped []string
+	for tool, reason := range pending {
+		switch {
+		case strings.HasPrefix(reason, "unknown tool:"):
+			reasons[tool] = synccmd.PendingReasonUnsupportedTool
+		case strings.HasPrefix(reason, "default-directory grant is manually disabled"):
+			reasons[tool] = synccmd.PendingReasonDisabled
+		case strings.HasPrefix(reason, "default directory not found:"):
+			reasons[tool] = synccmd.PendingReasonMissingInput
+		default:
+			unmapped = append(unmapped, tool)
+		}
+	}
+	sortStrings(unmapped)
+	if len(reasons) == 0 {
+		reasons = nil
+	}
+	return reasons, unmapped
+}
+
+// ackRequestFor builds the grant-ack request for one applied view. A
+// complete reason mapping attaches pendingReasons (as [] when nothing is
+// restricted); any unmapped reason omits the field entirely — the server
+// reads "reasons unknown" — while the supported-tools report still
+// travels.
+func ackRequestFor(revision int64, applyState, collectorVersion string, supportedTools []string, pendingReasons map[string]string, reasonsIncomplete bool) synccmd.GrantAckRequest {
+	req := synccmd.GrantAckRequest{ConsentRevision: revision, ApplyState: applyState, SupportedTools: supportedTools}
+	if !reasonsIncomplete {
+		req.PendingReasons = wireAckPendingReasons(pendingReasons)
+	}
+	if collectorVersion != "" {
+		req.CollectorVersion = collectorVersion
+	}
+	return req
+}
+
+// ackedPayloadCurrent reports whether a previously confirmed ack already
+// covers exactly the payload this run would send: the same revision,
+// applied state, collector version, supported-tools list, and reason-code
+// COMPLETENESS — and, for complete reports, the same per-tool codes. An
+// incomplete report omits pendingReasons on the wire, so while it stays
+// incomplete the mapped subset is not compared: the wire payload cannot
+// change without one of the other key parts changing.
+func ackedPayloadCurrent(prev managedconsent.Overlay, revision int64, applyState, collectorVersion string, supportedTools []string, pendingReasons map[string]string, reasonsIncomplete bool) bool {
+	if prev.AckedRevision != revision || prev.AckedApplyState != applyState || prev.AckedCollectorVersion != collectorVersion {
+		return false
+	}
+	if !sameAckedTools(prev.AckedSupportedTools, supportedTools) {
+		return false
+	}
+	if prev.AckedReasonsIncomplete != reasonsIncomplete {
+		return false
+	}
+	if reasonsIncomplete {
+		return true
+	}
+	return sameAckedPendingReasons(prev.AckedPendingReasons, pendingReasons)
+}
+
+// wireAckPendingReasons renders the pending-reason codes in the ack's
+// wire shape, sorted by tool for a deterministic payload. The result is
+// always a non-nil complete report: an empty restriction set serializes
+// as the explicit [] "no reasons" array. The caller attaches it only
+// when every restriction mapped to a closed code.
+func wireAckPendingReasons(reasons map[string]string) *[]synccmd.GrantAckPendingReason {
+	out := make([]synccmd.GrantAckPendingReason, 0, len(reasons))
+	tools := make([]string, 0, len(reasons))
+	for tool := range reasons {
+		tools = append(tools, tool)
+	}
+	sortStrings(tools)
+	for _, tool := range tools {
+		out = append(out, synccmd.GrantAckPendingReason{Tool: tool, Code: reasons[tool]})
+	}
+	return &out
+}
+
+// sameAckedTools compares two cached acked supported-tools lists. Both
+// nil and empty compare equal (nothing reported).
+func sameAckedTools(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// sameAckedPendingReasons compares two cached acked pending-reason maps.
+// Both nil and empty compare equal (no restricted tool).
+func sameAckedPendingReasons(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for tool, code := range a {
+		if b[tool] != code {
+			return false
+		}
+	}
+	return true
 }

@@ -8,6 +8,7 @@ import (
 
 	"toktrail-collector/internal/distribution"
 	"toktrail-collector/internal/installer"
+	"toktrail-collector/internal/source/registry"
 )
 
 func createFakePlatformBinaries(t *testing.T, dir, version string, platforms []distribution.Platform) {
@@ -57,6 +58,8 @@ func TestAssembleRefusesStaleOutputsBeforeWriting(t *testing.T) {
 		distribution.CollectorArchiveName(ver, "darwin", "amd64"),
 		"install-" + ver + ".sh",
 		"install-" + ver + ".ps1",
+		CapabilitiesFileName,
+		CapabilitiesSignatureFileName,
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -132,6 +135,58 @@ func TestSigningFailureCannotSilentlyYieldValidLookingRelease(t *testing.T) {
 	if _, err := os.Stat(sigPath); err == nil {
 		t.Fatal("manifest.json.sig must not exist after signing failure")
 	}
+	// The capabilities document and its signature must not exist either.
+	for _, name := range []string{CapabilitiesFileName, CapabilitiesSignatureFileName} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+			t.Fatalf("%s must not exist after signing failure", name)
+		}
+	}
+}
+
+// TestAssembleUnsignedEmitsCapabilitiesWithoutSignature verifies the
+// unsigned assembly path still emits a parseable, registry-accurate
+// capabilities.json (for local inspection) but no signature.
+func TestAssembleUnsignedEmitsCapabilitiesWithoutSignature(t *testing.T) {
+	dir := t.TempDir()
+	ver := "v0.9.0"
+	createFakePlatformBinaries(t, dir, ver, distribution.ReleasePlatforms)
+
+	if err := runAssemble([]string{"-version", ver, "-dist-dir", dir}); err != nil {
+		t.Fatalf("assemble: %v", err)
+	}
+
+	capsPath := filepath.Join(dir, CapabilitiesFileName)
+	doc, err := os.ReadFile(capsPath)
+	if err != nil {
+		t.Fatalf("capabilities.json not emitted by unsigned assemble: %v", err)
+	}
+	c, err := ParseCapabilities(doc)
+	if err != nil {
+		t.Fatalf("ParseCapabilities: %v", err)
+	}
+	if c.Version != ver {
+		t.Errorf("capabilities version = %q, want %q", c.Version, ver)
+	}
+	assertCapabilitiesMatchRegistry(t, c)
+
+	if _, err := os.Stat(filepath.Join(dir, CapabilitiesSignatureFileName)); err == nil {
+		t.Fatal("capabilities.json.sig must not exist without a signing key")
+	}
+}
+
+// assertCapabilitiesMatchRegistry fails the test unless c carries exactly
+// the canonical tool names of the single registry, in registry order.
+func assertCapabilitiesMatchRegistry(t *testing.T, c *Capabilities) {
+	t.Helper()
+	specs := registry.SupportedTools()
+	if len(c.Tools) != len(specs) {
+		t.Fatalf("capabilities tools length = %d, want %d (registry size)", len(c.Tools), len(specs))
+	}
+	for i, spec := range specs {
+		if c.Tools[i] != spec.Tool {
+			t.Errorf("capabilities tools[%d] = %q, want registry canonical name %q", i, c.Tools[i], spec.Tool)
+		}
+	}
 }
 
 func TestAssembleAndVerifyHappyPath(t *testing.T) {
@@ -187,6 +242,23 @@ func TestAssembleAndVerifyHappyPath(t *testing.T) {
 	if _, err := os.Stat(ps1Path); err != nil {
 		t.Errorf("missing powershell install script: %v", err)
 	}
+
+	// Signed assembly must also ship a verified capabilities pair. Check
+	// content (registry accuracy), signature (against the pinned public
+	// key) and version binding through the same verifier the workflow uses.
+	caps, err := VerifyCapabilities(VerifyCapabilitiesOptions{
+		CapabilitiesPath: filepath.Join(dir, CapabilitiesFileName),
+		SignaturePath:    filepath.Join(dir, CapabilitiesSignatureFileName),
+		PubKeyPath:       pubPath,
+		ExpectedVersion:  ver,
+	})
+	if err != nil {
+		t.Fatalf("VerifyCapabilities: %v", err)
+	}
+	if caps.Version != ver {
+		t.Errorf("capabilities version = %q, want %q", caps.Version, ver)
+	}
+	assertCapabilitiesMatchRegistry(t, caps)
 }
 
 func TestValidateVersion(t *testing.T) {

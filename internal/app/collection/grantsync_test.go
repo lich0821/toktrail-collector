@@ -3,6 +3,7 @@ package collection
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -23,11 +24,25 @@ import (
 // grant-protocol fake server
 // ---------------------------------------------------------------------------
 
+// grantAckPendingReasonBody mirrors one pendingReasons grant-ack entry.
+type grantAckPendingReasonBody struct {
+	Tool string `json:"tool"`
+	Code string `json:"code"`
+}
+
 // grantAckBody mirrors the POST /v1/devices/grant-ack body.
 type grantAckBody struct {
-	ConsentRevision  int64  `json:"consentRevision"`
-	ApplyState       string `json:"applyState"`
-	CollectorVersion string `json:"collectorVersion"`
+	ConsentRevision  int64                       `json:"consentRevision"`
+	ApplyState       string                      `json:"applyState"`
+	CollectorVersion string                      `json:"collectorVersion"`
+	SupportedTools   []string                    `json:"supportedTools"`
+	PendingReasons   []grantAckPendingReasonBody `json:"pendingReasons"`
+}
+
+// grantAckBody.carriesCapabilities reports whether the decoded body
+// included the optional capability fields.
+func (b grantAckBody) carriesCapabilities() bool {
+	return len(b.SupportedTools) > 0 || len(b.PendingReasons) > 0
 }
 
 // grantView is one served device grant view.
@@ -59,6 +74,10 @@ type grantProtocolServer struct {
 	failSelfWith       *int       // non-nil: self GET responds with this status and an empty JSON object
 	garbageSelf        bool       // self GET responds 200 with an undecodable body
 	dropProtocol       bool       // self GET omits grantProtocolVersion
+	// rejectAckCapabilities emulates an old server that validates the
+	// grant-ack body against a closed schema: any ack carrying the
+	// optional supportedTools/pendingReasons fields is rejected with 400.
+	rejectAckCapabilities bool
 
 	total   atomic.Int64
 	self    atomic.Int64
@@ -68,6 +87,7 @@ type grantProtocolServer struct {
 
 	authSeen    []string
 	ackBodies   []grantAckBody
+	ackRaw      []string
 	toolReports []toolStatusReport
 }
 
@@ -127,14 +147,22 @@ func grantProtocolServerStart(t *testing.T) *grantProtocolServer {
 			writeJSONForTest(w, http.StatusOK, map[string]any{"device": device})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/devices/grant-ack":
 			s.ack.Add(1)
+			raw, rerr := io.ReadAll(r.Body)
+			if rerr != nil {
+				t.Errorf("cannot read grant-ack body: %v", rerr)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
 			var body grantAckBody
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			if err := json.Unmarshal(raw, &body); err != nil {
 				t.Errorf("invalid grant-ack body: %v", err)
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
 			s.mu.Lock()
 			s.ackBodies = append(s.ackBodies, body)
+			s.ackRaw = append(s.ackRaw, string(raw))
+			rejectCapabilities := s.rejectAckCapabilities
 			status, echoOffset, bump, advancing, advance := s.ackStatus, s.ackEchoOffset, s.ackCurrentBump, s.alwaysAdvancing, s.advanceOnAck
 			s.ackCurrentBump = 0
 			if advance != nil {
@@ -142,8 +170,33 @@ func grantProtocolServerStart(t *testing.T) *grantProtocolServer {
 				s.advanceOnAck = nil
 			}
 			s.mu.Unlock()
+			if rejectCapabilities {
+				// Strict closed-schema validation like an old server:
+				// the unknown KEYS are rejected whatever their value,
+				// including an explicit empty pendingReasons array.
+				var keys map[string]json.RawMessage
+				if err := json.Unmarshal(raw, &keys); err == nil {
+					if _, ok := keys["supportedTools"]; ok {
+						writeJSONForTest(w, http.StatusBadRequest, map[string]any{"error": map[string]any{
+							"code": "invalid_request", "message": "unknown field supportedTools",
+						}})
+						return
+					}
+					if _, ok := keys["pendingReasons"]; ok {
+						writeJSONForTest(w, http.StatusBadRequest, map[string]any{"error": map[string]any{
+							"code": "invalid_request", "message": "unknown field pendingReasons",
+						}})
+						return
+					}
+				}
+			}
 			if status != http.StatusOK && status != http.StatusAccepted {
-				w.WriteHeader(status)
+				// Real servers pair non-2xx statuses with a JSON error
+				// body; the collector's classification reads it.
+				writeJSONForTest(w, status, map[string]any{"error": map[string]any{
+					"code":    "invalid_request",
+					"message": "simulated grant-ack failure",
+				}})
 				return
 			}
 			current := body.ConsentRevision
@@ -221,6 +274,25 @@ func (s *grantProtocolServer) lastAckBody() grantAckBody {
 		return grantAckBody{}
 	}
 	return s.ackBodies[len(s.ackBodies)-1]
+}
+
+// allAckBodies returns every received grant-ack body, including those
+// the (legacy-fake) server rejected.
+func (s *grantProtocolServer) allAckBodies() []grantAckBody {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]grantAckBody, len(s.ackBodies))
+	copy(out, s.ackBodies)
+	return out
+}
+
+// allAckRawBodies returns every received grant-ack body as raw JSON.
+func (s *grantProtocolServer) allAckRawBodies() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.ackRaw))
+	copy(out, s.ackRaw)
+	return out
 }
 
 func (s *grantProtocolServer) toolStatusReports() []toolStatusReport {

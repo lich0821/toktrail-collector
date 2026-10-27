@@ -1,6 +1,8 @@
 // Command release provides maintainer-side release tools: validating version
-// strings, assembling release artifacts into signed distribution packages,
-// and generating pinned bootstrap install scripts.
+// strings, assembling release artifacts into signed distribution packages
+// (including the version-bound, signed capabilities metadata), verifying the
+// signed capabilities document, and generating pinned bootstrap install
+// scripts.
 package main
 
 import (
@@ -9,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"toktrail-collector/internal/distribution"
@@ -16,7 +19,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <assemble|validate-version> [flags]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s <assemble|validate-version|verify-capabilities> [flags]\n", os.Args[0])
 		os.Exit(2)
 	}
 
@@ -26,6 +29,8 @@ func main() {
 		err = runAssemble(os.Args[2:])
 	case "validate-version":
 		err = runValidateVersion(os.Args[2:])
+	case "verify-capabilities":
+		err = runVerifyCapabilities(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
 		os.Exit(2)
@@ -54,6 +59,35 @@ func runValidateVersion(args []string) error {
 	return nil
 }
 
+// runVerifyCapabilities checks a signed capabilities document against an
+// explicitly pinned public key. It is read-only and fails closed on any
+// signature, content, or version mismatch.
+func runVerifyCapabilities(args []string) error {
+	fs := flag.NewFlagSet("verify-capabilities", flag.ContinueOnError)
+	capsPath := fs.String("capabilities", "", "capabilities.json (required)")
+	sigPath := fs.String("signature", "", "capabilities.json.sig (required)")
+	pubkey := fs.String("pubkey", "", "pinned public key PEM (required; may contain several PUBLIC KEY blocks for rotation)")
+	ver := fs.String("version", "", "require this exact version")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *capsPath == "" || *sigPath == "" || *pubkey == "" {
+		return fmt.Errorf("-capabilities, -signature and -pubkey are required")
+	}
+	c, err := VerifyCapabilities(VerifyCapabilitiesOptions{
+		CapabilitiesPath: *capsPath,
+		SignaturePath:    *sigPath,
+		PubKeyPath:       *pubkey,
+		ExpectedVersion:  *ver,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("OK: capabilities %s %s, %d tool(s): %s\n",
+		c.Product, c.Version, len(c.Tools), strings.Join(c.Tools, ", "))
+	return nil
+}
+
 func runAssemble(args []string) error {
 	fs := flag.NewFlagSet("assemble", flag.ContinueOnError)
 	ver := fs.String("version", "", "release version, e.g. v0.1.0 (required)")
@@ -78,7 +112,8 @@ func runAssemble(args []string) error {
 
 	manifestPath := filepath.Join(absDistDir, distribution.ManifestFileName)
 	sigPath := filepath.Join(absDistDir, distribution.ManifestSignatureFileName)
-	outputs := []string{manifestPath, sigPath,
+	capsPath, capsSigPath := capabilitiesPaths(absDistDir)
+	outputs := []string{manifestPath, sigPath, capsPath, capsSigPath,
 		filepath.Join(absDistDir, "install-"+*ver+".sh"),
 		filepath.Join(absDistDir, "install-"+*ver+".ps1")}
 	for _, p := range distribution.ReleasePlatforms {
@@ -218,6 +253,29 @@ func runAssemble(args []string) error {
 		sigBytes = sig
 	}
 
+	// Build and marshal the capabilities document (and its signature) before
+	// writing any metadata file, so a failure here cannot leave a partially
+	// assembled release behind. The document is derived from the single
+	// canonical tool registry and bound to this release version.
+	caps, err := BuildCapabilities(*ver)
+	if err != nil {
+		return fmt.Errorf("build capabilities: %w", err)
+	}
+	capsBytes, err := caps.Marshal()
+	if err != nil {
+		return fmt.Errorf("marshal capabilities: %w", err)
+	}
+	var capsSig []byte
+	if priv != nil {
+		// Same key, same raw 64-byte detached Ed25519 format as the
+		// manifest signature.
+		sig, err := distribution.SignDetached(priv, capsBytes)
+		if err != nil {
+			return fmt.Errorf("sign capabilities: %w", err)
+		}
+		capsSig = sig
+	}
+
 	// Write manifest.json atomically with O_EXCL.
 	mf, err := os.OpenFile(manifestPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
@@ -244,13 +302,32 @@ func runAssemble(args []string) error {
 		if err := sf.Close(); err != nil {
 			return fmt.Errorf("close signature file: %w", err)
 		}
+	}
 
-		// Emit bootstrap install scripts.
+	// Write the capabilities document, and its signature when signed. Both
+	// use O_EXCL; the pre-flight outputs check above already refused an
+	// existing document, so a collision here means a concurrent writer.
+	if err := writeNewFile(capsPath, capsBytes); err != nil {
+		return fmt.Errorf("write capabilities: %w", err)
+	}
+	if len(capsSig) > 0 {
+		if err := writeNewFile(capsSigPath, capsSig); err != nil {
+			return fmt.Errorf("write capabilities signature: %w", err)
+		}
+	}
+
+	// Emit bootstrap install scripts.
+	if len(sigBytes) > 0 {
 		if _, err := EmitInstallScripts(absDistDir, m, pubPEM); err != nil {
 			return fmt.Errorf("emit install scripts: %w", err)
 		}
 	}
 
-	fmt.Printf("Assembled release %s for %d platforms at %s\n", *ver, len(artifacts), absDistDir)
+	signed := "unsigned"
+	if priv != nil {
+		signed = "signed"
+	}
+	fmt.Printf("Assembled %s release %s for %d platforms with %d capability tool(s) at %s\n",
+		signed, *ver, len(artifacts), len(caps.Tools), absDistDir)
 	return nil
 }

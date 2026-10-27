@@ -109,6 +109,15 @@ jobs:
             -signature "dist/$RELEASE_VERSION/manifest.json.sig" \
             -pubkey "$pin_file" -version "$RELEASE_VERSION" \
             -dist-dir "dist/$RELEASE_VERSION"
+          # The release also ships version-bound capabilities metadata
+          # (capabilities.json + raw 64-byte Ed25519 capabilities.json.sig,
+          # signed with the same key). Verify it against the same pin before
+          # publishing; gh release create below uploads every file in the
+          # dist directory, so both files become release assets.
+          go run ./tools/release verify-capabilities \
+            -capabilities "dist/$RELEASE_VERSION/capabilities.json" \
+            -signature "dist/$RELEASE_VERSION/capabilities.json.sig" \
+            -pubkey "$pin_file" -version "$RELEASE_VERSION"
       - name: Create draft release for review
         env:
           GH_TOKEN: ${{ github.token }}

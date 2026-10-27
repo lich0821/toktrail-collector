@@ -73,6 +73,26 @@ type Overlay struct {
 	AckedApplyState       string     `json:"ackedApplyState,omitempty"`
 	AckedCollectorVersion string     `json:"ackedCollectorVersion,omitempty"`
 	AckedAt               *time.Time `json:"ackedAt,omitempty"`
+	// AckedSupportedTools is the supported-tools list that was confirmed
+	// together with the recorded ack. It is empty exactly when the ack was
+	// confirmed WITHOUT the capability fields (legacy-server fallback or a
+	// pre-capability collector): the capability report is then never
+	// claimed as delivered and is re-attempted on later runs. Overlays
+	// written before the capability fields existed simply lack the field.
+	AckedSupportedTools []string `json:"ackedSupportedTools,omitempty"`
+	// AckedPendingReasons caches the per-tool closed reason codes
+	// confirmed with the ack (unsupported_tool, missing_input, disabled);
+	// it is nil unless the confirmed report was COMPLETE (the wire sent
+	// pendingReasons as [] or entries). Both nil and empty compare equal
+	// when checking whether the cached ack is still current.
+	AckedPendingReasons map[string]string `json:"ackedPendingReasons,omitempty"`
+	// AckedReasonsIncomplete records that the confirmed ack OMITTED the
+	// pendingReasons field because at least one restricted tool's reason
+	// had no closed code: the report is explicitly incomplete ("reasons
+	// unknown"), never a complete "no reasons" receipt. Completeness is
+	// part of the ack cache key — a change in either direction re-acks
+	// the same revision.
+	AckedReasonsIncomplete bool `json:"ackedReasonsIncomplete,omitempty"`
 }
 
 // View is a validated server grant view to apply. The caller has already
