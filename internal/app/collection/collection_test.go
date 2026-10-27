@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -702,6 +703,9 @@ func TestRunSyncedToolSuppressesNoNewRecordsFromSameToolGrants(t *testing.T) {
 // the export preparation locally: the run reports the read failure as a skip
 // and never touches the network for it.
 func TestRunSkipsUnreadableGrantedInputWithoutNetwork(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod 000 does not reliably make files unreadable to the current user on Windows")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("running as root bypasses permission-based unreadable inputs")
 	}
