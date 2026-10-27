@@ -61,3 +61,25 @@ func TestLegacyBuildRequiresCheckout(t *testing.T) {
 		t.Fatalf("expected a clear checkout requirement, got %v", err)
 	}
 }
+
+func TestCmdUpgradeValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"no flags", nil, "-base-url or -dist-dir"},
+		{"no version", []string{"-dist-dir", "/nonexistent-dist"}, "-version is required"},
+		{"latest", []string{"-dist-dir", "/nonexistent-dist", "-version", "latest"}, "-version"},
+	}
+	for _, tc := range cases {
+		if err := cmdUpgrade(tc.args); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: got %v", tc.name, err)
+		}
+	}
+	// A missing existing installation must fail closed with a hint.
+	if err := cmdUpgrade([]string{"-dist-dir", "/nonexistent-dist", "-version", "v0.2.0", "-install-dir", t.TempDir()}); err == nil ||
+		!strings.Contains(err.Error(), "no existing") {
+		t.Errorf("expected missing-installation refusal, got %v", err)
+	}
+}

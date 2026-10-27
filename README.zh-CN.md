@@ -150,7 +150,7 @@ go run ./cmd/toktrail service install \
 
 ## 签名发布与安装
 
-GitHub Actions 和 `scripts/release.sh` 编排六平台构建；维护者工具负责归档与签名；独立安装器负责验签、SHA-256 校验和安全替换。Tag workflow 生成 GitHub Release 草稿供审阅。详见 [Release and installation](docs/RELEASE.md)。
+GitHub Actions 和 `scripts/release.sh` 编排六平台构建；维护者工具负责归档与签名；独立安装器负责验签、SHA-256 校验和安全替换。Tag workflow 生成 GitHub Release 草稿供审阅。安装器与 bootstrap 脚本另支持显式原位 `upgrade`：复用原安装路径、默认保留旧版二进制为 `<binary>.previous`，不触碰 state/grants/outbox、设备绑定与调度注册，也不重新接入。详见 [Release and installation](docs/RELEASE.md)。
 
 生产运营方需要自行提供发布签名密钥、可信公钥分发渠道、下载托管，以及所需的平台公证或代码签名。
 

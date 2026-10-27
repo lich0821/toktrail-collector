@@ -110,4 +110,64 @@ func TestEndToEndRelease(t *testing.T) {
 	).CombinedOutput(); err == nil {
 		t.Fatalf("second install with -no-replace succeeded\n%s", out)
 	}
+
+	// 7. In-place upgrade, same version: must fail closed without
+	//    -allow-downgrade, leaving the binary untouched.
+	upEnv := append(os.Environ(), "PATH="+installDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	upgRefuse := exec.Command(toolPath, "upgrade",
+		"-base-url", "file://"+distDir,
+		"-version", version,
+		"-pubkey", pinPath,
+	)
+	upgRefuse.Env = upEnv
+	if out, err := upgRefuse.CombinedOutput(); err == nil {
+		t.Fatalf("same-version upgrade without -allow-downgrade succeeded\n%s", out)
+	} else if !strings.Contains(string(out), "already at") {
+		t.Fatalf("same-version upgrade should explain the refusal, got: %s", out)
+	}
+
+	// 8. In-place upgrade with -allow-downgrade reinstalls at the original
+	//    path (PATH discovery), keeps .previous, and the binary still runs.
+	upgRun := exec.Command(toolPath, "upgrade",
+		"-base-url", "file://"+distDir,
+		"-version", version,
+		"-pubkey", pinPath,
+		"-allow-downgrade",
+	)
+	upgRun.Env = upEnv
+	if out, err := upgRun.CombinedOutput(); err != nil {
+		t.Fatalf("upgrade with -allow-downgrade failed: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(installed + ".previous"); err != nil {
+		t.Fatalf("expected the previous binary to be kept: %v", err)
+	}
+	out, err = exec.Command(installed, "version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("upgraded toktrail failed: %v\n%s", err, out)
+	}
+	if strings.TrimSpace(string(out)) != "toktrail "+version {
+		t.Errorf("upgraded toktrail reports %q, want %q", strings.TrimSpace(string(out)), "toktrail "+version)
+	}
+	prev, err := exec.Command(installed+".previous", "version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("kept .previous binary failed: %v\n%s", err, prev)
+	}
+	if strings.TrimSpace(string(prev)) != "toktrail "+version {
+		t.Errorf("kept .previous reports %q, want %q", strings.TrimSpace(string(prev)), "toktrail "+version)
+	}
+
+	// 9. Bootstrap script --upgrade also fails closed on the same version
+	//    and must leave the installed binary untouched.
+	scriptUpg := exec.Command("sh", scriptPath, "file://"+distDir, "--upgrade")
+	scriptUpg.Env = upEnv
+	if out, err := scriptUpg.CombinedOutput(); err == nil {
+		t.Fatalf("bootstrap --upgrade on the same version succeeded\n%s", out)
+	}
+	out, err = exec.Command(installed, "version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("toktrail failed after refused script upgrade: %v\n%s", err, out)
+	}
+	if strings.TrimSpace(string(out)) != "toktrail "+version {
+		t.Errorf("toktrail reports %q after refused script upgrade, want %q", strings.TrimSpace(string(out)), "toktrail "+version)
+	}
 }

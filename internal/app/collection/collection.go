@@ -6,11 +6,15 @@
 // Guarantees:
 //   - One process lock (internal/local/runlock) covers the entire run; a second
 //     concurrent run fails fast with runlock.ErrBusy and performs no work.
-//   - No network happens before the lock is held and the local source/input
-//     grants are validated. With no enabled grants the run is a no-op that
-//     never touches the network.
-//   - Collection only reads inputs explicitly granted by the user
-//     (internal/local/grants config); there is no default scanning.
+//   - The server-driven grant sync runs before any local scanning, inside the
+//     same lock: a bound device fetches its authoritative grant view with its
+//     own credentials (so the server can pause, narrow, widen or re-enable
+//     tools), applies managed default-directory grants for newly confirmed
+//     tools, and fails closed when a previously active grant protocol cannot
+//     be refreshed. An unbound device performs no network at all.
+//   - Collection only reads inputs explicitly granted by the user or added as
+//     managed built-in default-directory grants by the grant sync; there is no
+//     other default scanning.
 //   - The device is never implicitly (re)bound: draining requires an
 //     existing bound device, exactly like explicit `toktrail sync`, and the
 //     server preflight re-checks fresh consent before every batch.
@@ -50,6 +54,13 @@ type Options struct {
 	ServerURL  string
 	MaxBatches int
 	HTTPClient *http.Client
+	// HomeDir overrides the user home directory used to resolve built-in
+	// tool default directories during the grant sync (tests).
+	HomeDir string
+	// CollectorVersion is the build-injected release version. It is
+	// forwarded to the grant ack only when it is a strict SemVer release
+	// string; "dev" and unknown values are omitted, never faked.
+	CollectorVersion string
 	// Now is injectable for deterministic batch ids in tests.
 	Now func() time.Time
 }
@@ -72,11 +83,16 @@ type Result struct {
 	// GrantOutcomes mirrors the enabled grants in config order.
 	GrantOutcomes []GrantOutcome
 	// NoGrants is true when the run found no enabled grants; nothing was
-	// collected and no network was used.
+	// collected and no upload was attempted (the grant-protocol self
+	// fetch still happens for a bound device so the server can enable
+	// tools again).
 	NoGrants bool
-	// Skipped carries the reason the run was a no-op (no grants, or lock
-	// content). Empty when work was attempted.
+	// Skipped carries the reason the run was a no-op (no grants, server
+	// pause, or lock content). Empty when work was attempted.
 	Skipped string
+	// GrantSync reports the server-driven grant authorization sync that
+	// ran before any local scanning.
+	GrantSync GrantSync
 
 	ExportedBatches int
 	ExportedRecords int
@@ -136,6 +152,48 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	if err := grantStore.MigrateLegacy(); err != nil {
 		return res, fmt.Errorf("migrate source grants: %w", err)
 	}
+
+	now := opt.Now
+	if now == nil {
+		now = time.Now
+	}
+
+	// Server-driven grant sync: refresh the authoritative device grant view
+	// with the device's own credentials BEFORE any local scanning, inside
+	// the same runlock. It applies managed default-directory grants for
+	// newly confirmed tools, enforces pause/narrowing for this run's reads,
+	// and fails closed when a previously active grant protocol cannot be
+	// refreshed. It never re-runs connect or bind and never touches device
+	// identity, progress, or the outbox.
+	grantSync, policy, err := syncGrants(ctx, opt, stateDir, grantStore, now)
+	if err != nil {
+		return res, err
+	}
+	res.GrantSync = grantSync
+
+	// Report per-tool restriction states through the existing tool-status
+	// channel so the server's device view can distinguish "last confirmed"
+	// from "currently applied": a tool whose default directory vanished or
+	// whose grant the user disabled must not silently ride an old ack.
+	// Best-effort: a failure here never blocks collection.
+	if len(grantSync.Pending) > 0 && !grantSync.Paused {
+		if statuses := pendingToolStatuses(grantSync.Pending); len(statuses) > 0 {
+			if _, err := synccmd.ReportToolStatuses(ctx, statedir.New(stateDir), synccmd.Options{StateDir: stateDir, ServerURL: opt.ServerURL, HTTPClient: opt.HTTPClient, ToolStatuses: statuses}); err != nil {
+				if !errors.Is(err, synccmd.ErrDevicePaused) && grantSync.Note == "" {
+					grantSync.Note = fmt.Sprintf("restricted-tool status report failed: %v", err)
+					res.GrantSync = grantSync
+				}
+			}
+		}
+	}
+
+	if policy.Paused {
+		res.Skipped = fmt.Sprintf("server reports collection paused for this device (consent revision %d); no local reading or uploads this run", grantSync.ConsentRevision)
+		return res, nil
+	}
+
+	// (Re)load grants after the sync: newly confirmed tools may have gained
+	// managed default-directory grants that this run must already collect.
 	enabledGrants, err := grantStore.Enabled()
 	if err != nil {
 		return res, err
@@ -147,18 +205,22 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		return res, nil
 	}
 
-	now := opt.Now
-	if now == nil {
-		now = time.Now
-	}
-
 	var historyFrom *time.Time
-	if devState, err := statedir.New(stateDir).Load(); err == nil && devState.HistoryFrom != nil && !devState.HistoryFrom.IsZero() {
+	if policy.Active {
+		// The server-confirmed effective cutoff governs (it may widen or
+		// narrow); the bind-time cutoff must not permanently cap it.
+		historyFrom = policy.HistoryFrom
+	} else if devState, err := statedir.New(stateDir).Load(); err == nil && devState.HistoryFrom != nil && !devState.HistoryFrom.IsZero() {
 		historyFrom = devState.HistoryFrom
 	}
 
 	for idx, grant := range enabledGrants {
 		outcome := GrantOutcome{Source: grant.Source, Input: grant.Input}
+		if !policy.SourceAllowed(grant.Source) {
+			outcome.Skipped = "source not allowed by the server grant scope for this device"
+			res.GrantOutcomes = append(res.GrantOutcomes, outcome)
+			continue
+		}
 		// Re-validate the granted input before reading it: the filesystem
 		// may have changed since the grant was recorded. A missing input
 		// skips that grant without failing the whole run.
@@ -242,6 +304,11 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		}
 		if len(statuses) > 0 {
 			if _, err := synccmd.ReportToolStatuses(ctx, statedir.New(stateDir), synccmd.Options{StateDir: stateDir, ServerURL: opt.ServerURL, HTTPClient: opt.HTTPClient, ToolStatuses: statuses}); err != nil {
+				// A paused device sends no status metadata either; that is
+				// a state, not a failure of the run.
+				if errors.Is(err, synccmd.ErrDevicePaused) {
+					return res, nil
+				}
 				return res, err
 			}
 		}
@@ -284,6 +351,18 @@ func drain(ctx context.Context, res *Result, opt Options) error {
 		res.Recovered += syncResult.Recovered
 		res.Quarantined = syncResult.Quarantined
 		if err != nil {
+			if errors.Is(err, synccmd.ErrDevicePaused) {
+				// The server paused the device mid-run (between the grant
+				// sync and this upload): stop sending, keep every pending
+				// batch queued — pause is temporary, never a quarantine.
+				remaining, countErr := countPending(ledger)
+				if countErr != nil {
+					return countErr
+				}
+				res.PendingRemaining = remaining
+				res.DrainStopped = fmt.Sprintf("server reports collection paused; %d batch(es) stay queued for the next run", remaining)
+				return nil
+			}
 			if errors.Is(err, synccmd.ErrOutsideScope) {
 				complete, checkErr := synccmd.ScopeReorganizationComplete(stateDir, entry.BatchID)
 				if checkErr != nil {

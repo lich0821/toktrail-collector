@@ -21,6 +21,9 @@ Usage:
   toktrail-installer install -base-url <download-root> -version <v> -pubkey <pub.pem> -install-dir <dir>
                              [-allow-downgrade] [-no-replace] [-keep-old] [-skip-self-check]
                              (or: -dist-dir <dir> instead of -base-url, for local files)
+  toktrail-installer upgrade -base-url <download-root> -version <v> -pubkey <pub.pem>
+                             [-install-dir <dir>] [-allow-downgrade] [-keep-old=true] [-skip-self-check]
+                             (or: -dist-dir <dir> instead of -base-url, for local files)
   toktrail-installer verify  -manifest <manifest.json> -signature <manifest.json.sig> -pubkey <pub.pem>
                              [-dist-dir <dir>] [-version <v>] [-platform <os>/<arch>]
   toktrail-installer version
@@ -30,7 +33,20 @@ Trust model: verification always requires an explicitly pinned public key
 hash/size mismatch, unsupported platform, or version mismatch all abort
 before anything is installed. The installer only places the binary: it
 never changes upload consent, collector state, or scheduler registration,
-and never contacts the upload (sync) endpoint.`
+and never contacts the upload (sync) endpoint.
+
+upgrade replaces only an existing toktrail binary, in place, at its
+original path: the directory given with -install-dir, or the first match
+on PATH when omitted. It refuses a missing, non-regular or unidentifiable
+existing binary, refuses same-version and downgrade targets unless
+-allow-downgrade is set, and keeps the previous binary as <binary>.previous
+by default (disable with -keep-old=false). There is no "latest" channel:
+-version is always an exact version from trusted release notes. There is
+no automatic rollback: .previous is an unverified snapshot, and a verified
+rollback means stopping scheduled runs and reinstalling the previous signed
+release with install -allow-downgrade. When the target is found via PATH,
+only that path was upgraded - if a scheduler invokes a different path,
+rerun with -install-dir pointing at the scheduler's directory.`
 
 func main() {
 	if len(os.Args) < 2 {
@@ -51,6 +67,8 @@ func main() {
 	switch cmd {
 	case "install":
 		err = runInstall(args)
+	case "upgrade":
+		err = runUpgrade(args)
 	case "verify":
 		err = runVerify(args)
 	case "version":
@@ -107,6 +125,45 @@ func runInstall(args []string) error {
 		fmt.Printf("previous binary kept at %s\n", res.KeptOldPath)
 	}
 	fmt.Println("note: nothing else was changed - no state, no upload consent, no scheduler registration")
+	return nil
+}
+
+func runUpgrade(args []string) error {
+	fs := flag.NewFlagSet("upgrade", flag.ContinueOnError)
+	baseURL := fs.String("base-url", "", "release download/update endpoint root (http/https/file)")
+	distDir := fs.String("dist-dir", "", "upgrade from a local dist directory instead of a URL")
+	ver := fs.String("version", "", "exact version to upgrade to (required; there is no \"latest\" channel)")
+	pubkey := fs.String("pubkey", "", "pinned public key PEM (required trust root)")
+	installDir := fs.String("install-dir", "", "directory holding the existing binary (default: discover it on PATH)")
+	allowDowngrade := fs.Bool("allow-downgrade", false, "allow upgrading to an older or equal version (reinstall)")
+	keepOld := fs.Bool("keep-old", true, "keep the previous binary as <binary>.previous (overwritten on each upgrade)")
+	skipSelfCheck := fs.Bool("skip-self-check", false, "skip check that this tool matches the signed manifest (only for locally compiled tools)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	res, err := installer.Upgrade(installer.UpgradeOptions{
+		BaseURL:        *baseURL,
+		DistDir:        *distDir,
+		Version:        *ver,
+		PubKeyPath:     *pubkey,
+		InstallDir:     *installDir,
+		AllowDowngrade: *allowDowngrade,
+		KeepOld:        *keepOld,
+		SkipSelfCheck:  *skipSelfCheck,
+	})
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("upgraded toktrail %s -> %s (%s) at %s\n", res.FromVersion, res.Version, res.Platform, res.BinaryPath)
+	if res.KeptOldPath != "" {
+		fmt.Printf("previous binary kept at %s (unverified copy; to roll back, stop scheduled runs and restore it, or reinstall the previous signed release with install -allow-downgrade)\n", res.KeptOldPath)
+	}
+	if res.DiscoveredViaPATH {
+		fmt.Printf("note: the target was found via PATH; only %s was upgraded - if a scheduler invokes a different path, rerun with -install-dir pointing at the scheduler's directory\n", res.BinaryPath)
+	}
+	fmt.Println("note: nothing else was changed - no state, grants or outbox, no upload consent, no connect, no scheduler registration")
 	return nil
 }
 

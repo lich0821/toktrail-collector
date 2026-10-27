@@ -30,12 +30,23 @@ var linkFile = os.Link
 
 // Grant is one explicit local-read grant: a compiled-in adapter source and
 // an absolute local input path the user selected for scheduled collection.
+// Managed marks grants that were added by the server-driven grant sync for
+// a tool's built-in default directory (origin tracking for controlled
+// merge updates). It is additive metadata: absent means user-authored, and
+// the sync never modifies or disables an existing entry.
 type Grant struct {
-	Source   string    `json:"source"`
-	Input    string    `json:"input"`
-	Enabled  bool      `json:"enabled"`
-	AddedAt  time.Time `json:"addedAt,omitempty"`
-	EditedAt time.Time `json:"editedAt,omitempty"`
+	Source  string `json:"source"`
+	Input   string `json:"input"`
+	Enabled bool   `json:"enabled"`
+	Managed bool   `json:"managed,omitempty"`
+	// SystemDisabled marks a managed grant the grant sync itself disabled
+	// (device identity change). Unlike a user's manual disable, a
+	// system-disabled grant may be restored the moment the new device
+	// explicitly authorizes the same tool; user-disabled entries are never
+	// restarted by the sync.
+	SystemDisabled bool      `json:"systemDisabled,omitempty"`
+	AddedAt        time.Time `json:"addedAt,omitempty"`
+	EditedAt       time.Time `json:"editedAt,omitempty"`
 }
 
 // Config is the on-disk grant store.
@@ -305,6 +316,7 @@ func (s Store) Enable(source, input string) (Grant, error) {
 	for idx := range cfg.Grants {
 		if cfg.Grants[idx].Source == source && filepath.Clean(cfg.Grants[idx].Input) == input {
 			cfg.Grants[idx].Enabled = true
+			cfg.Grants[idx].SystemDisabled = false
 			cfg.Grants[idx].EditedAt = now
 			grant := cfg.Grants[idx]
 			if err := s.save(cfg); err != nil {
@@ -340,6 +352,7 @@ func (s Store) Disable(source, input string) (Grant, bool, error) {
 	for idx := range cfg.Grants {
 		if cfg.Grants[idx].Source == source && filepath.Clean(cfg.Grants[idx].Input) == input {
 			cfg.Grants[idx].Enabled = false
+			cfg.Grants[idx].SystemDisabled = false
 			cfg.Grants[idx].EditedAt = time.Now().UTC()
 			grant := cfg.Grants[idx]
 			if err := s.save(cfg); err != nil {
@@ -364,6 +377,109 @@ func (s Store) Enabled() ([]Grant, error) {
 		}
 	}
 	return out, nil
+}
+
+// AddManagedGrant adds an enabled managed grant for (source, input) when no
+// grant — enabled or disabled, user-authored or managed — exists for that
+// exact pair. It is the controlled merge primitive of the server-driven
+// grant sync: a previously user-disabled grant is never silently restarted,
+// no existing entry is ever modified or disabled, and user-authored custom
+// grants are untouched. The input must be an accessible absolute path.
+// It reports whether a new grant was added.
+func (s Store) AddManagedGrant(source, input string) (Grant, bool, error) {
+	if err := ValidateGrant(source, input); err != nil {
+		return Grant{}, false, err
+	}
+	if err := ValidateInput(input); err != nil {
+		return Grant{}, false, err
+	}
+	if err := s.MigrateLegacy(); err != nil {
+		return Grant{}, false, err
+	}
+	cfg, err := s.Load()
+	if err != nil {
+		return Grant{}, false, err
+	}
+	source = strings.TrimSpace(source)
+	input = filepath.Clean(strings.TrimSpace(input))
+	for idx := range cfg.Grants {
+		if cfg.Grants[idx].Source == source && filepath.Clean(cfg.Grants[idx].Input) == input {
+			return cfg.Grants[idx], false, nil
+		}
+	}
+	grant := Grant{
+		Source:  source,
+		Input:   input,
+		Enabled: true,
+		Managed: true,
+		AddedAt: time.Now().UTC(),
+	}
+	cfg.Grants = append(cfg.Grants, grant)
+	if err := s.save(cfg); err != nil {
+		return Grant{}, false, err
+	}
+	return grant, true, nil
+}
+
+// DisableManaged disables every enabled managed grant and reports how many
+// were disabled. User-authored grants are never touched. It is the
+// cross-device protection of the grant sync: when the bound device
+// identity changes, grants the previous device's server view added stop
+// being collected until the new device explicitly confirms them again.
+func (s Store) DisableManaged() (int, error) {
+	cfg, err := s.Load()
+	if err != nil {
+		return 0, err
+	}
+	disabled := 0
+	now := time.Now().UTC()
+	for idx := range cfg.Grants {
+		if cfg.Grants[idx].Managed && cfg.Grants[idx].Enabled {
+			cfg.Grants[idx].Enabled = false
+			cfg.Grants[idx].SystemDisabled = true
+			cfg.Grants[idx].EditedAt = now
+			disabled++
+		}
+	}
+	if disabled == 0 {
+		return 0, nil
+	}
+	if err := s.save(cfg); err != nil {
+		return 0, err
+	}
+	return disabled, nil
+}
+
+// EnableManagedGrant restores one system-disabled managed grant for the
+// exact (source, input) pair. It refuses — returning false — when the pair
+// is absent, already enabled, not managed, or was disabled by the user (no
+// SystemDisabled marker): only the sync's own disable is reversible by the
+// sync, and only under the new device's explicit authorization.
+func (s Store) EnableManagedGrant(source, input string) (bool, error) {
+	if err := ValidateGrant(source, input); err != nil {
+		return false, err
+	}
+	cfg, err := s.Load()
+	if err != nil {
+		return false, err
+	}
+	source = strings.TrimSpace(source)
+	input = filepath.Clean(strings.TrimSpace(input))
+	for idx := range cfg.Grants {
+		if cfg.Grants[idx].Source == source && filepath.Clean(cfg.Grants[idx].Input) == input {
+			if !cfg.Grants[idx].Managed || !cfg.Grants[idx].SystemDisabled || cfg.Grants[idx].Enabled {
+				return false, nil
+			}
+			cfg.Grants[idx].Enabled = true
+			cfg.Grants[idx].SystemDisabled = false
+			cfg.Grants[idx].EditedAt = time.Now().UTC()
+			if err := s.save(cfg); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // ApplyConnectGrants updates grants for connect authorization.

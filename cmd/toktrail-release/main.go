@@ -33,6 +33,9 @@ Usage:
   toktrail-release install -base-url <download-root> -version <v> -pubkey <pub.pem> -install-dir <dir>
                           [-allow-downgrade] [-no-replace] [-keep-old] [-skip-self-check]
                           (or: -dist-dir <dir> instead of -base-url, for local files)
+  toktrail-release upgrade -base-url <download-root> -version <v> -pubkey <pub.pem>
+                          [-install-dir <dir>] [-allow-downgrade] [-keep-old=true] [-skip-self-check]
+                          (or: -dist-dir <dir> instead of -base-url, for local files)
   toktrail-release version
 
 Trust model: verification always requires an explicitly pinned public key
@@ -41,7 +44,13 @@ hash/size mismatch, unsupported platform, or version mismatch all abort
 before anything is installed. The installer only places the binary: it
 never changes upload consent, collector state, or scheduler registration,
 and never contacts the upload (sync) endpoint - -base-url is the separate
-download/update endpoint.`
+download/update endpoint.
+
+upgrade replaces only an existing toktrail binary in place (discovered on
+PATH or in -install-dir), keeps the previous binary as <binary>.previous
+by default, never re-runs connect, and never inspects or rewrites
+scheduler registration. There is no automatic rollback and no "latest"
+channel; see docs/RELEASE.md for the manual, verified rollback procedure.`
 
 func main() {
 	if len(os.Args) < 2 {
@@ -60,6 +69,8 @@ func main() {
 		err = cmdVerify(os.Args[2:])
 	case "install":
 		err = cmdInstall(os.Args[2:])
+	case "upgrade":
+		err = cmdUpgrade(os.Args[2:])
 	case "version":
 		fmt.Printf("toktrail-release %s\n", version)
 	case "help", "-h", "--help":
@@ -278,6 +289,43 @@ func cmdInstall(args []string) error {
 		fmt.Printf("previous binary kept at %s\n", res.KeptOldPath)
 	}
 	fmt.Println("note: nothing else was changed - no state, no upload consent, no scheduler registration")
+	return nil
+}
+
+func cmdUpgrade(args []string) error {
+	fs := flag.NewFlagSet("upgrade", flag.ContinueOnError)
+	baseURL := fs.String("base-url", "", "release download/update endpoint root (http/https/file)")
+	distDir := fs.String("dist-dir", "", "upgrade from a local dist directory instead of a URL")
+	ver := fs.String("version", "", "exact version to upgrade to (required; there is no \"latest\" channel)")
+	pubkey := fs.String("pubkey", "", "pinned public key PEM (required trust root)")
+	installDir := fs.String("install-dir", "", "directory holding the existing binary (default: discover it on PATH)")
+	allowDowngrade := fs.Bool("allow-downgrade", false, "allow upgrading to an older or equal version (reinstall)")
+	keepOld := fs.Bool("keep-old", true, "keep the previous binary as <binary>.previous (overwritten on each upgrade)")
+	skipSelfCheck := fs.Bool("skip-self-check", false, "skip check that this tool matches the signed manifest (only for locally compiled tools)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	res, err := installer.Upgrade(installer.UpgradeOptions{
+		BaseURL:        *baseURL,
+		DistDir:        *distDir,
+		Version:        *ver,
+		PubKeyPath:     *pubkey,
+		InstallDir:     *installDir,
+		AllowDowngrade: *allowDowngrade,
+		KeepOld:        *keepOld,
+		SkipSelfCheck:  *skipSelfCheck,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("upgraded toktrail %s -> %s (%s) at %s\n", res.FromVersion, res.Version, res.Platform, res.BinaryPath)
+	if res.KeptOldPath != "" {
+		fmt.Printf("previous binary kept at %s (unverified copy; to roll back, stop scheduled runs and restore it, or reinstall the previous signed release with install -allow-downgrade)\n", res.KeptOldPath)
+	}
+	if res.DiscoveredViaPATH {
+		fmt.Printf("note: the target was found via PATH; only %s was upgraded - if a scheduler invokes a different path, rerun with -install-dir pointing at the scheduler's directory\n", res.BinaryPath)
+	}
+	fmt.Println("note: nothing else was changed - no state, grants or outbox, no upload consent, no connect, no scheduler registration")
 	return nil
 }
 

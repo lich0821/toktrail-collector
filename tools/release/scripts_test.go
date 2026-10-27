@@ -137,6 +137,17 @@ func TestScriptStaticInvariants(t *testing.T) {
 	if strings.Contains(shStr, "eval") {
 		t.Errorf("POSIX install script must not eval the connect link")
 	}
+	// 8. Must support --upgrade and reject the connect combination.
+	if !strings.Contains(shStr, "--upgrade") {
+		t.Errorf("POSIX install script missing --upgrade support")
+	}
+	if !strings.Contains(shStr, "--upgrade and --connect are mutually exclusive") {
+		t.Errorf("POSIX install script missing --upgrade/--connect mutual exclusion")
+	}
+	// 9. Upgrade mode must not default the install directory.
+	if !strings.Contains(shStr, "the pinned installer discovers the existing") {
+		t.Errorf("POSIX install script missing upgrade-mode install-dir discovery comment")
+	}
 
 	ps1Content, err := os.ReadFile(ps1Path)
 	if err != nil {
@@ -171,6 +182,16 @@ func TestScriptStaticInvariants(t *testing.T) {
 	}
 	if strings.Contains(ps1Str, "Invoke-Expression") {
 		t.Errorf("PowerShell install script must not Invoke-Expression the connect link")
+	}
+	// 7. Must support -Upgrade and reject the connect combination.
+	if !strings.Contains(ps1Str, "[switch]$Upgrade") {
+		t.Errorf("PowerShell install script missing -Upgrade switch")
+	}
+	if !strings.Contains(ps1Str, "-Upgrade and -ConnectUrl are mutually exclusive") {
+		t.Errorf("PowerShell install script missing -Upgrade/-ConnectUrl mutual exclusion")
+	}
+	if !strings.Contains(ps1Str, "$PSBoundParameters.ContainsKey('InstallDir')") {
+		t.Errorf("PowerShell install script missing explicit-InstallDir detection for upgrade mode")
 	}
 }
 
@@ -495,5 +516,186 @@ func TestConnectFlagValidation(t *testing.T) {
 				t.Fatalf("expected install.sh to reject arguments, but succeeded. Output: %s", out)
 			}
 		})
+	}
+}
+
+// upgradeTestFixture renders the install.sh pinned to a fake installer that
+// records every argument it receives, so tests can assert how upgrade mode
+// invokes the pinned installer without any real downloads or builds.
+func upgradeTestFixture(t *testing.T) (installScript, baseURL, recordFile string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping POSIX shell execution test on Windows")
+	}
+
+	dir := t.TempDir()
+	serverDir := filepath.Join(dir, "dist")
+	if err := os.MkdirAll(serverDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	version := "v0.9.9"
+	_, pubPEM := generateTestPubKey(t)
+
+	var osName, archName string
+	switch runtime.GOOS {
+	case "darwin":
+		osName = "darwin"
+	case "linux":
+		osName = "linux"
+	default:
+		t.Skipf("unsupported test OS: %s", runtime.GOOS)
+	}
+	switch runtime.GOARCH {
+	case "arm64":
+		archName = "arm64"
+	case "amd64":
+		archName = "amd64"
+	default:
+		t.Skipf("unsupported test ARCH: %s", runtime.GOARCH)
+	}
+
+	toolFile := fmt.Sprintf("toktrail-release-%s-%s-%s", version, osName, archName)
+	fakeToolPath := filepath.Join(serverDir, toolFile)
+	recordFile = filepath.Join(dir, "recorded_args.txt")
+
+	// Fake installer: records one argument per line, then exits 0.
+	fakeInstaller := fmt.Sprintf(`#!/bin/sh
+set -eu
+printf '%%s\n' "$@" > %q
+exit 0
+`, recordFile)
+
+	if err := os.WriteFile(fakeToolPath, []byte(fakeInstaller), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h := sha256.Sum256([]byte(fakeInstaller))
+	toolHash := hex.EncodeToString(h[:])
+
+	m := testManifest(version)
+	for i := range m.Artifacts {
+		if m.Artifacts[i].OS == osName && m.Artifacts[i].Arch == archName {
+			m.Artifacts[i].InstallerBinarySha256 = toolHash
+		}
+	}
+
+	scriptPaths, err := EmitInstallScripts(serverDir, m, pubPEM)
+	if err != nil {
+		t.Fatalf("EmitInstallScripts: %v", err)
+	}
+	for _, p := range scriptPaths {
+		if strings.HasSuffix(p, ".sh") {
+			installScript = p
+			break
+		}
+	}
+	if installScript == "" {
+		t.Fatal("install.sh not emitted")
+	}
+	baseURL = "file://" + filepath.ToSlash(serverDir)
+	return installScript, baseURL, recordFile
+}
+
+func recordedArgs(t *testing.T, recordFile string) []string {
+	t.Helper()
+	data, err := os.ReadFile(recordFile)
+	if err != nil {
+		t.Fatalf("fake installer was not invoked: %v", err)
+	}
+	return strings.Split(strings.TrimSpace(string(data)), "\n")
+}
+
+func containsArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestPOSIXScriptUpgradeModeInvokesInstallerWithoutDefaultInstallDir
+// verifies --upgrade runs the pinned installer's upgrade subcommand and
+// forwards no -install-dir unless one is explicitly given (the installer
+// then discovers the existing binary on PATH itself).
+func TestPOSIXScriptUpgradeModeInvokesInstallerWithoutDefaultInstallDir(t *testing.T) {
+	installScript, baseURL, recordFile := upgradeTestFixture(t)
+
+	cmd := exec.Command("/bin/sh", installScript, "--upgrade", baseURL)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("install.sh --upgrade failed: %v\nOutput: %s", err, out)
+	}
+	args := recordedArgs(t, recordFile)
+	if len(args) == 0 || args[0] != "upgrade" {
+		t.Fatalf("installer invoked as %q, want subcommand \"upgrade\"", args)
+	}
+	for _, want := range []string{"-base-url", "-version", "-pubkey"} {
+		if !containsArg(args, want) {
+			t.Errorf("upgrade invocation missing %s: %q", want, args)
+		}
+	}
+	if containsArg(args, "-install-dir") {
+		t.Errorf("upgrade mode must not forward a default -install-dir: %q", args)
+	}
+}
+
+// TestPOSIXScriptUpgradeModeForwardsExplicitInstallDir verifies an explicit
+// directory is forwarded in upgrade mode.
+func TestPOSIXScriptUpgradeModeForwardsExplicitInstallDir(t *testing.T) {
+	installScript, baseURL, recordFile := upgradeTestFixture(t)
+	dir := t.TempDir()
+
+	cmd := exec.Command("/bin/sh", installScript, "--upgrade", baseURL, dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("install.sh --upgrade with install dir failed: %v\nOutput: %s", err, out)
+	}
+	args := recordedArgs(t, recordFile)
+	if args[0] != "upgrade" {
+		t.Fatalf("installer invoked as %q, want subcommand \"upgrade\"", args)
+	}
+	if !containsArg(args, "-install-dir") {
+		t.Fatalf("explicit install dir not forwarded: %q", args)
+	}
+	for i, a := range args {
+		if a == "-install-dir" && i+1 < len(args) && args[i+1] != dir {
+			t.Errorf("-install-dir = %q, want %q", args[i+1], dir)
+		}
+	}
+}
+
+// TestPOSIXScriptUpgradeRejectsConnect verifies --upgrade and --connect are
+// mutually exclusive and the installer is never invoked.
+func TestPOSIXScriptUpgradeRejectsConnect(t *testing.T) {
+	installScript, baseURL, recordFile := upgradeTestFixture(t)
+
+	cmd := exec.Command("/bin/sh", installScript, "--upgrade", baseURL, "--connect", "TEST_TICKET_PLACEHOLDER")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected install.sh --upgrade --connect to fail, succeeded. Output: %s", out)
+	}
+	if !strings.Contains(string(out), "mutually exclusive") {
+		t.Errorf("failure should explain the mutual exclusion, got: %s", out)
+	}
+	if _, statErr := os.Stat(recordFile); !os.IsNotExist(statErr) {
+		t.Error("the pinned installer must not be invoked when --upgrade --connect is rejected")
+	}
+}
+
+// TestPOSIXScriptInstallModeStillDefaultsInstallDir verifies install mode
+// keeps forwarding the (defaulted or given) install directory.
+func TestPOSIXScriptInstallModeStillDefaultsInstallDir(t *testing.T) {
+	installScript, baseURL, recordFile := upgradeTestFixture(t)
+	dir := filepath.Join(t.TempDir(), "target")
+
+	cmd := exec.Command("/bin/sh", installScript, baseURL, dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("install.sh failed: %v\nOutput: %s", err, out)
+	}
+	args := recordedArgs(t, recordFile)
+	if args[0] != "install" {
+		t.Fatalf("installer invoked as %q, want subcommand \"install\"", args)
+	}
+	if !containsArg(args, "-install-dir") {
+		t.Fatalf("install mode must forward -install-dir: %q", args)
 	}
 }

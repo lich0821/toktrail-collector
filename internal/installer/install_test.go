@@ -25,8 +25,16 @@ type fakeDist struct {
 
 func newFakeDist(t *testing.T, version string) *fakeDist {
 	t.Helper()
+	return newFakeDistBinary(t, version, "fake collector binary for "+version)
+}
+
+// newFakeDistBinary builds a fake signed dist whose collector "binary" is
+// binContent. Tests use a version-reporting shell script as binContent to
+// exercise in-place upgrade preconditions.
+func newFakeDistBinary(t *testing.T, version, binContent string) *fakeDist {
+	t.Helper()
 	dir := t.TempDir()
-	fd := &fakeDist{version: version, distDir: dir, versionDir: filepath.Join(dir, version)}
+	fd := &fakeDist{version: version, distDir: dir, versionDir: filepath.Join(dir, version), binContent: binContent}
 	if err := os.MkdirAll(fd.versionDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +55,6 @@ func newFakeDist(t *testing.T, version string) *fakeDist {
 
 	osName, arch := runtime.GOOS, runtime.GOARCH
 	ext := distribution.BinaryExt(osName)
-	fd.binContent = "fake collector binary for " + version
 	binPath := filepath.Join(fd.versionDir, "toktrail"+ext)
 	if err := os.WriteFile(binPath, []byte(fd.binContent), 0o755); err != nil {
 		t.Fatal(err)

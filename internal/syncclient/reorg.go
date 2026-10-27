@@ -535,6 +535,19 @@ func reorganizeBatchAfterScopeError(ctx context.Context, client *http.Client, se
 	if entry.OriginConsentRevision > 0 && entry.OriginConsentRevision >= scope.revision {
 		return reorgJournal{}, fmt.Errorf("batch %s was already reorganized under consent revision %d but the server still rejects it at revision %d; the scope appears to have changed without a revision bump; failing closed with the batch pending and no records moved", batch.BatchID, entry.OriginConsentRevision, scope.revision)
 	}
+	return splitBatchUnderScope(stateDir, entry, batch, scope, "scope-error")
+}
+
+// splitBatchUnderScope partitions a batch against the live scope and
+// durably publishes the result with zero network traffic: out-of-scope
+// records are quarantined recoverably (carrying the scope revision so
+// recovery needs a strictly newer one), in-scope records move to a new
+// pending child batch, and the old batch becomes terminal so the outbox
+// head can never block on them. Legitimate records keep draining.
+func splitBatchUnderScope(stateDir string, entry outbox.BatchEntry, batch BatchRequest, scope liveScope, journalKind string) (reorgJournal, error) {
+	if entry.OriginConsentRevision > 0 && entry.OriginConsentRevision >= scope.revision {
+		return reorgJournal{}, fmt.Errorf("batch %s was already reorganized under consent revision %d but is still out of scope at revision %d; the scope appears to have changed without a revision bump; failing closed with the batch pending and no records moved", batch.BatchID, entry.OriginConsentRevision, scope.revision)
+	}
 	intervals, err := pendingIntervalsOf(stateDir, entry.Source, batch.BatchID)
 	if err != nil {
 		return reorgJournal{}, fmt.Errorf("cannot load pending intervals of batch %s; it stays pending and no records were moved: %w", batch.BatchID, err)
@@ -575,7 +588,7 @@ func reorganizeBatchAfterScopeError(ctx context.Context, client *http.Client, se
 		quarantineEntries = append(quarantineEntries, qEntry)
 	}
 	journal := reorgJournal{
-		Kind:            "scope-error",
+		Kind:            journalKind,
 		OldBatchID:      batch.BatchID,
 		OldSource:       entry.Source,
 		Quarantine:      quarantineEntries,

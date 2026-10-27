@@ -1,0 +1,516 @@
+package collection
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"toktrail-collector/internal/local/grants"
+	"toktrail-collector/internal/local/managedconsent"
+	"toktrail-collector/internal/local/outbox"
+	"toktrail-collector/internal/local/statedir"
+	"toktrail-collector/internal/source/registry"
+	synccmd "toktrail-collector/internal/syncclient"
+)
+
+// maxGrantSyncCycles bounds the fetch→apply→ack loop when the server's
+// consent revision keeps advancing during the sync. Reading never continues
+// under a revision the server has already moved past.
+const maxGrantSyncCycles = 2
+
+// GrantSync reports what the server-driven grant sync did in one run.
+// It is display/accounting state only; the applied policy governs reading.
+type GrantSync struct {
+	// Active is true when the grant protocol governed this run (a fresh
+	// view was fetched and applied).
+	Active bool
+	// Paused is the applied server pause state.
+	Paused bool
+	// ConsentRevision is the applied revision.
+	ConsentRevision int64
+	// AllowedTools mirrors the applied raw server tool list.
+	AllowedTools []string
+	// Refreshed is true when a fresh view was applied this run.
+	Refreshed bool
+	// Acked is true when the server confirmed the applied revision via
+	// grant-ack (never true while application is restricted).
+	Acked bool
+	// AddedGrants lists managed default-path grants added this run
+	// ("source input").
+	AddedGrants []string
+	// Pending maps an allowed tool to the reason it could not be fully
+	// applied locally. While non-empty the revision is not acknowledged.
+	Pending map[string]string
+	// Note carries non-fatal diagnostics (old protocol, ack retry, ...).
+	Note string
+}
+
+// syncGrants performs the server-driven grant authorization sync. It must
+// run before any local scanning and under the collector runlock (Run
+// guarantees both). The device's own credentials fetch the authoritative
+// view; the collector never re-runs connect or bind and never changes the
+// device identity, progress, or outbox.
+//
+// Fail-closed rules (contraction safety):
+//   - terminal conditions stop local reading unconditionally, even on first
+//     contact: a revoked or deleted device, rejected credentials (401/403),
+//     a self view naming a different device, or a structurally invalid
+//     self response;
+//   - after the grant protocol has been seen, any refresh failure or an
+//     old-protocol response (anti-downgrade) stops local reading — the
+//     cached overlay authorizes nothing;
+//   - a server that never spoke the protocol keeps the legacy behavior,
+//     including transport-level failures (documented compatibility: reading
+//     continues under local grants and the drain reports the failure);
+//   - a revision that keeps advancing during the sync stops the run rather
+//     than reading under a stale revision.
+//
+// The ack is sent only after the view is durably applied, the managed
+// grant merge completed, and no tool is restricted (pending); the server
+// must echo the same revision. Ack failures are non-fatal and retried on
+// the next run.
+func syncGrants(ctx context.Context, opt Options, stateDir string, grantStore grants.Store, now func() time.Time) (GrantSync, managedconsent.Policy, error) {
+	info := GrantSync{}
+	store := statedir.New(stateDir)
+	mcStore := managedconsent.New(stateDir)
+
+	st, err := store.Load()
+	if err != nil {
+		return info, managedconsent.Policy{}, err
+	}
+	unbound := st.DeviceID == "" || st.DeviceSecret == ""
+	if _, seen, err := mcStore.Load(); err != nil {
+		return info, managedconsent.Policy{}, err
+	} else if unbound {
+		if seen {
+			return info, managedconsent.Policy{}, errors.New("device is not bound but a server grant view was previously applied; refusing to read under an unconfirmable authorization (re-bind the device or resolve the state directory)")
+		}
+		// Never spoke the protocol and cannot ask the server: legacy
+		// local-grant behavior, zero network.
+		info.Note = "device is not bound; server grant sync skipped"
+		return info, managedconsent.Policy{}, nil
+	}
+
+	var lastOverlay managedconsent.Overlay
+	for cycle := 0; cycle < maxGrantSyncCycles; cycle++ {
+		// Durable authorization-attempt accounting precedes every
+		// authenticated self GET, mirroring the sync preflight.
+		if _, err := outbox.New(stateDir).RecordPreflightAttempt(now().UTC()); err != nil {
+			return info, managedconsent.Policy{}, fmt.Errorf("cannot persist grant-sync attempt accounting; no HTTP request was made: %w", err)
+		}
+		self, err := synccmd.FetchDeviceSelf(ctx, store, synccmd.Options{StateDir: stateDir, ServerURL: opt.ServerURL, HTTPClient: opt.HTTPClient})
+		if err != nil {
+			// Terminal conditions stop local reading unconditionally —
+			// even when the grant protocol was never seen. A device the
+			// server revoked or deleted, credentials the server rejects
+			// (401/403), a self view naming a different device, or a
+			// structurally invalid response are never treated as a
+			// transient network failure to fall back from.
+			if errors.Is(err, synccmd.ErrDeviceRevoked) || errors.Is(err, synccmd.ErrSubjectDeleted) ||
+				errors.Is(err, synccmd.ErrDeviceUnauthorized) || errors.Is(err, synccmd.ErrSelfProtocol) {
+				return info, managedconsent.Policy{}, err
+			}
+			_, seen, lerr := mcStore.Load()
+			if lerr != nil {
+				return info, managedconsent.Policy{}, lerr
+			}
+			if seen {
+				return info, managedconsent.Policy{}, fmt.Errorf("cannot refresh the server grant authorization (the grant protocol was previously active); local reading is stopped until the next successful refresh: %w", err)
+			}
+			// Transport-level failure on a server that never spoke the
+			// grant protocol: documented legacy-compatible behavior —
+			// reading continues under the local grants and the drain
+			// reports the same network failure.
+			info.Note = fmt.Sprintf("server grant sync unavailable, keeping legacy local-grant behavior: %v", err)
+			return info, managedconsent.Policy{}, nil
+		}
+
+		if self.GrantProtocolVersion == nil {
+			_, seen, lerr := mcStore.Load()
+			if lerr != nil {
+				return info, managedconsent.Policy{}, lerr
+			}
+			if seen {
+				return info, managedconsent.Policy{}, errors.New("server no longer advertises the grant protocol after it was previously active (possible downgrade); local reading is stopped until the server advertises grantProtocolVersion again")
+			}
+			info.Note = "server does not advertise the grant protocol; keeping legacy local-grant behavior"
+			return info, managedconsent.Policy{}, nil
+		}
+		if *self.GrantProtocolVersion != managedconsent.SchemaVersion {
+			return info, managedconsent.Policy{}, fmt.Errorf("server advertises unsupported grant protocol version %d (this collector supports %d); local reading is stopped - upgrade the collector", *self.GrantProtocolVersion, managedconsent.SchemaVersion)
+		}
+
+		view, omittedManaged, err := viewFromSelf(self)
+		if err != nil {
+			return info, managedconsent.Policy{}, fmt.Errorf("invalid server grant view: %w", err)
+		}
+
+		// Controlled merge first: its outcome decides whether a previous
+		// ack may be carried forward. A restricted (pending) application
+		// never inherits the "applied" marker.
+		prev, seen, lerr := mcStore.Load()
+		if lerr != nil {
+			return info, managedconsent.Policy{}, lerr
+		}
+		// Identity binding: an overlay recorded for a different device or
+		// server is never reused — its ack is dropped and the managed
+		// grants it added are disabled so no grant crosses devices.
+		identityMatch := seen && prev.DeviceID == st.DeviceID &&
+			normalizeServerURL(prev.ServerURL) == normalizeServerURL(resolveServerURL(opt.ServerURL, st))
+		if seen && !identityMatch {
+			if n, derr := grantStore.DisableManaged(); derr != nil {
+				return info, managedconsent.Policy{}, fmt.Errorf("disable managed grants after a device identity change: %w", derr)
+			} else if n > 0 {
+				info.Note = fmt.Sprintf("device identity changed; disabled %d managed grant(s) from the previous device", n)
+			}
+			seen = false
+			prev = managedconsent.Overlay{}
+		}
+		var added []string
+		var pending map[string]string
+		if view.DeviceGrantManaged {
+			added, pending, err = mergeManagedGrants(grantStore, view, homeDirOrDefault(opt.HomeDir))
+			if err != nil {
+				return info, managedconsent.Policy{}, err
+			}
+		}
+		// Unmanaged devices (explicit false, or the server omitted the
+		// flag) never gain grants: the sync only filters existing local
+		// grants, which always fully applies.
+		if omittedManaged && info.Note == "" {
+			info.Note = "server did not state deviceGrantManaged; treating the device as unmanaged (no automatic grants)"
+		}
+
+		// The collector version sent with the ack: only a strict SemVer
+		// release string is ever claimed; dev/unknown builds omit it.
+		effectiveVersion := strings.TrimSpace(opt.CollectorVersion)
+		if !synccmd.ValidCollectorVersion(effectiveVersion) {
+			effectiveVersion = ""
+		}
+
+		overlay := managedconsent.Overlay{
+			SchemaVersion:      managedconsent.SchemaVersion,
+			ConsentRevision:    view.ConsentRevision,
+			Paused:             view.Paused,
+			AllowedTools:       view.AllowedTools,
+			HistoryFrom:        view.HistoryFrom,
+			AppliedAt:          now().UTC(),
+			Pending:            pending,
+			DeviceGrantManaged: view.DeviceGrantManaged,
+			DeviceID:           st.DeviceID,
+			ServerURL:          resolveServerURL(opt.ServerURL, st),
+		}
+		// The applied state reported with the ack: "applied" when every
+		// allowed tool is executable, "pending" while a restriction holds.
+		// A restricted revision is still acknowledged — with its
+		// restrictions stated — so an earlier full ack cannot keep the UI
+		// claiming "applied".
+		applyState := "applied"
+		if len(pending) > 0 {
+			applyState = "pending"
+		}
+		note := ""
+		if omittedManaged {
+			note = "server did not state deviceGrantManaged; treating the device as unmanaged (no automatic grants)"
+		}
+		ackUpToDate := false
+		if seen && prev.AckedRevision == view.ConsentRevision &&
+			prev.AckedApplyState == applyState && prev.AckedCollectorVersion == effectiveVersion {
+			overlay.AckedRevision, overlay.AckedAt, overlay.AckedCollectorVersion, overlay.AckedApplyState =
+				prev.AckedRevision, prev.AckedAt, prev.AckedCollectorVersion, prev.AckedApplyState
+			ackUpToDate = true
+		}
+		if err := mcStore.Save(overlay); err != nil {
+			return info, managedconsent.Policy{}, fmt.Errorf("persist server grant view: %w", err)
+		}
+		lastOverlay = overlay
+
+		info = GrantSync{
+			Active:          true,
+			Paused:          view.Paused,
+			ConsentRevision: view.ConsentRevision,
+			AllowedTools:    view.AllowedTools,
+			Refreshed:       true,
+			AddedGrants:     added,
+			Pending:         pending,
+			Note:            note,
+		}
+
+		// Ack after the view is durably applied and the grant merge
+		// completed: fully applied revisions ack as applyState=applied,
+		// restricted ones (unknown tool, missing default directory,
+		// manually disabled grant) ack as applyState=pending so the server
+		// UI never keeps claiming a full application that no longer holds.
+		// The same revision is re-acked when the applied state or the
+		// collector version changed; an old revision's ack never stands in
+		// for a newer one.
+		if !ackUpToDate {
+			ackReq := synccmd.GrantAckRequest{ConsentRevision: view.ConsentRevision, ApplyState: applyState}
+			if effectiveVersion != "" {
+				ackReq.CollectorVersion = effectiveVersion
+			}
+			ack, ackErr := synccmd.ReportGrantAck(ctx, store, synccmd.Options{StateDir: stateDir, ServerURL: opt.ServerURL, HTTPClient: opt.HTTPClient}, ackReq)
+			if ackErr != nil {
+				if errors.Is(ackErr, synccmd.ErrAckRevisionAdvanced) {
+					// The server moved past the applied revision: never
+					// read under the stale view. Bounded re-fetch, and a
+					// conservative stop at the cycle limit.
+					if cycle == maxGrantSyncCycles-1 {
+						return info, managedconsent.Policy{}, fmt.Errorf("server consent revision advanced during the grant sync (%v); local reading is stopped for this run to avoid reading under a stale revision", ackErr)
+					}
+					continue
+				}
+				if errors.Is(ackErr, synccmd.ErrAckEchoMismatch) {
+					// The server confirmed an unexpected revision or
+					// state: the bookkeeping is unclear, stop reading.
+					return info, managedconsent.Policy{}, fmt.Errorf("grant ack state is unclear, stopping local reading for this run: %w", ackErr)
+				}
+				// Ordinary ack failure (network, endpoint absent, server
+				// error): the freshly fetched view remains this run's
+				// authorization — the fetch, not the receipt, authorizes
+				// reading, and the server still enforces the revision at
+				// ingest. Reading continues; the ack retries next run.
+				info.Note = fmt.Sprintf("grant ack not confirmed (retried on the next run): %v", ackErr)
+				break
+			}
+			ackedAt := ack.AckedAt
+			if ackedAt.IsZero() {
+				ackedAt = now().UTC()
+			}
+			overlay.AckedRevision = view.ConsentRevision
+			overlay.AckedApplyState = applyState
+			overlay.AckedCollectorVersion = effectiveVersion
+			overlay.AckedAt = &ackedAt
+			if err := mcStore.Save(overlay); err != nil {
+				return info, managedconsent.Policy{}, fmt.Errorf("persist grant ack: %w", err)
+			}
+			lastOverlay = overlay
+			info.Acked = true
+			if ack.CurrentConsentRevision > view.ConsentRevision {
+				// The server moved on: never read under the stale
+				// revision. Re-fetch and re-apply once more.
+				if cycle == maxGrantSyncCycles-1 {
+					return info, managedconsent.Policy{}, fmt.Errorf("server consent revision keeps advancing (applied %d, server at %d); local reading is stopped for this run to avoid reading under a stale revision", view.ConsentRevision, ack.CurrentConsentRevision)
+				}
+				continue
+			}
+		} else {
+			info.Acked = true
+		}
+		break
+	}
+
+	return info, lastOverlay.Policy(), nil
+}
+
+// viewFromSelf maps a fetched self snapshot onto the grant view. The pause
+// signal is honored from the explicit flag or the allowedTools sentinel.
+// DeviceGrantManaged defaults to false: only a present-and-true server flag
+// permits automatic grants, so a missing field (or an unconfirmed legacy
+// device) means filter-only. The second return value reports whether the
+// server omitted the field entirely under the new protocol.
+func viewFromSelf(self synccmd.SelfStatus) (managedconsent.View, bool, error) {
+	v := managedconsent.View{
+		ConsentRevision: self.ConsentRevision,
+		Paused:          self.Paused,
+		AllowedTools:    self.AllowedTools,
+		HistoryFrom:     self.HistoryFrom,
+	}
+	if self.DeviceGrantManaged != nil {
+		v.DeviceGrantManaged = *self.DeviceGrantManaged
+	}
+	omittedManaged := self.DeviceGrantManaged == nil
+	for _, tool := range self.AllowedTools {
+		if strings.TrimSpace(tool) == managedconsent.PausedToolSentinel {
+			v.Paused = true
+		}
+	}
+	if err := managedconsent.ValidateView(v); err != nil {
+		return managedconsent.View{}, false, err
+	}
+	return v, omittedManaged, nil
+}
+
+// mergeManagedGrants performs the controlled merge for the allowed tools:
+// for every allowed tool known to the compiled-in registry, the built-in
+// default-directory grant is added when no grant exists for that exact
+// (source, input) pair and the directory is present. Existing entries are
+// never modified, disabled entries are never silently restarted, unknown
+// tool names never become grants, and the server never supplies a path.
+// Tools that cannot be fully applied are reported as pending with a clear
+// reason so the revision is not acknowledged as applied.
+func mergeManagedGrants(grantStore grants.Store, view managedconsent.View, homeDir string) ([]string, map[string]string, error) {
+	var tools []string
+	for _, tool := range view.AllowedTools {
+		if strings.TrimSpace(tool) != managedconsent.PausedToolSentinel {
+			tools = append(tools, tool)
+		}
+	}
+	if view.Paused || len(tools) == 0 {
+		// Paused, or the legacy "unrestricted" empty list: no tool was
+		// explicitly confirmed, so nothing is added and nothing is
+		// restricted.
+		return nil, nil, nil
+	}
+	cfg, err := grantStore.Load()
+	if err != nil {
+		return nil, nil, err
+	}
+	var added []string
+	pending := map[string]string{}
+	for _, tool := range tools {
+		spec, ok := registry.LookupTool(tool)
+		if !ok {
+			pending[tool] = "unknown tool: not supported by this collector version"
+			continue
+		}
+		def := spec.ResolveDefaultInput(homeDir)
+		pair, pairExists := grantOf(cfg, spec.Source, def)
+		if pairExists {
+			if pair.Enabled {
+				continue
+			}
+			if pair.Managed && pair.SystemDisabled {
+				// The sync itself disabled this grant (device identity
+				// change): the new device's explicit authorization for the
+				// same tool restores it. A user's manual disable is never
+				// restarted here.
+				restored, err := grantStore.EnableManagedGrant(spec.Source, def)
+				if err != nil {
+					return nil, nil, fmt.Errorf("restore system-disabled grant for tool %q: %w", tool, err)
+				}
+				if restored {
+					added = append(added, pair.Source+" "+def+" (restored after device change)")
+				}
+				continue
+			}
+			pending[tool] = "default-directory grant is manually disabled; re-enable it (toktrail sources enable) to resume collection"
+			continue
+		}
+		if !inputExists(def) {
+			if anyEnabledForSource(cfg, spec.Source) {
+				// The tool is collected through a user-authored
+				// custom grant; the missing default directory is
+				// not a restriction.
+				continue
+			}
+			pending[tool] = "default directory not found: " + def
+			continue
+		}
+		g, wasAdded, err := grantStore.AddManagedGrant(spec.Source, def)
+		if err != nil {
+			return nil, nil, fmt.Errorf("add managed grant for tool %q: %w", tool, err)
+		}
+		if wasAdded {
+			added = append(added, g.Source+" "+g.Input)
+		}
+	}
+	return added, pending, nil
+}
+
+func grantOf(cfg grants.Config, source, input string) (grants.Grant, bool) {
+	input = filepath.Clean(input)
+	for idx := range cfg.Grants {
+		if cfg.Grants[idx].Source == source && filepath.Clean(cfg.Grants[idx].Input) == input {
+			return cfg.Grants[idx], true
+		}
+	}
+	return grants.Grant{}, false
+}
+
+func anyEnabledForSource(cfg grants.Config, source string) bool {
+	for idx := range cfg.Grants {
+		if cfg.Grants[idx].Source == source && cfg.Grants[idx].Enabled {
+			return true
+		}
+	}
+	return false
+}
+
+func inputExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && (info.IsDir() || info.Mode().IsRegular())
+}
+
+// resolveServerURL mirrors syncclient's server URL resolution so the
+// overlay records the same identity the fetch used.
+func resolveServerURL(optURL string, st statedir.DeviceState) string {
+	if u := strings.TrimSpace(optURL); u != "" {
+		return strings.TrimRight(u, "/")
+	}
+	if u := strings.TrimSpace(st.ServerURL); u != "" {
+		return strings.TrimRight(u, "/")
+	}
+	return "http://127.0.0.1:3211"
+}
+
+func normalizeServerURL(u string) string {
+	return strings.TrimRight(strings.TrimSpace(u), "/")
+}
+
+func homeDirOrDefault(override string) string {
+	if dir := strings.TrimSpace(override); dir != "" {
+		return dir
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return ""
+	}
+	return home
+}
+
+func pendingSummary(pending map[string]string) string {
+	keys := make([]string, 0, len(pending))
+	for k := range pending {
+		keys = append(keys, k)
+	}
+	sortStrings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+": "+pending[k])
+	}
+	return strings.Join(parts, "; ")
+}
+
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j] < s[j-1]; j-- {
+			s[j], s[j-1] = s[j-1], s[j]
+		}
+	}
+}
+
+// pendingToolStatuses maps the grant sync's per-tool restriction reasons
+// onto the tool-status vocabulary so the server sees why a revision is not
+// currently fully applied: unknown tools are unsupported, a missing
+// default directory is not detected, and a user-disabled default grant is
+// reported as disabled.
+func pendingToolStatuses(pending map[string]string) []synccmd.ToolStatus {
+	tools := make([]string, 0, len(pending))
+	for tool := range pending {
+		tools = append(tools, tool)
+	}
+	sortStrings(tools)
+	statuses := make([]synccmd.ToolStatus, 0, len(tools))
+	for _, tool := range tools {
+		reason := pending[tool]
+		status := synccmd.ToolStatus{Tool: tool}
+		switch {
+		case strings.Contains(reason, "unknown tool"):
+			status.Status = "unsupported"
+			status.Detail = "unsupported tool"
+		case strings.Contains(reason, "manually disabled"):
+			status.Status = "not_detected"
+			status.Detail = "default directory grant disabled"
+		default:
+			status.Status = "not_detected"
+			status.Detail = "default directory not found"
+		}
+		statuses = append(statuses, status)
+	}
+	return statuses
+}

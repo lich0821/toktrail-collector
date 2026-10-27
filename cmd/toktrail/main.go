@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -427,15 +428,33 @@ func runPeriodic(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	result, err := collection.Run(ctx, collection.Options{
-		StateDir:   dir,
-		ServerURL:  *serverURL,
-		MaxBatches: *maxBatches,
+		StateDir:         dir,
+		ServerURL:        *serverURL,
+		MaxBatches:       *maxBatches,
+		CollectorVersion: version,
 	})
 	if err != nil {
 		return err
 	}
-	if result.NoGrants {
-		fmt.Printf("no enabled source grants; nothing collected (enable with: toktrail sources enable --source <s> --input <path>)\n")
+	if result.GrantSync.Active {
+		fmt.Printf("grantSync: revision=%d paused=%t refreshed=%t acked=%t allowedTools=%s\n",
+			result.GrantSync.ConsentRevision, result.GrantSync.Paused, result.GrantSync.Refreshed, result.GrantSync.Acked, toolListDisplay(result.GrantSync.AllowedTools))
+		for _, added := range result.GrantSync.AddedGrants {
+			fmt.Printf("grantSync: added managed grant %s\n", added)
+		}
+		for _, p := range sortedPendingDisplay(result.GrantSync.Pending) {
+			fmt.Printf("grantSync: pending %s\n", p)
+		}
+		if result.GrantSync.Note != "" {
+			fmt.Printf("grantSync: %s\n", result.GrantSync.Note)
+		}
+	}
+	if result.Skipped != "" && result.NoGrants {
+		fmt.Printf("%s\n", result.Skipped)
+		return nil
+	}
+	if result.Skipped != "" && !result.NoGrants && len(result.GrantOutcomes) == 0 {
+		fmt.Printf("%s\n", result.Skipped)
 		return nil
 	}
 	for _, outcome := range result.GrantOutcomes {
@@ -454,6 +473,28 @@ func runPeriodic(args []string) error {
 		fmt.Printf("pendingRemaining=%d (drain stops at %d batch(es) per run; the next run continues)\n", result.PendingRemaining, *maxBatches)
 	}
 	return nil
+}
+
+func toolListDisplay(tools []string) string {
+	if len(tools) == 0 {
+		return "(unrestricted)"
+	}
+	parts := make([]string, 0, len(tools))
+	parts = append(parts, tools...)
+	return strings.Join(parts, ",")
+}
+
+func sortedPendingDisplay(pending map[string]string) []string {
+	keys := make([]string, 0, len(pending))
+	for k := range pending {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, k+": "+pending[k])
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------

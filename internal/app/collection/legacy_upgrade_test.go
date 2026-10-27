@@ -313,8 +313,8 @@ func TestRunUpgradeFromLegacySourcesPreservesHistoricalProgressAndZeroReplay(t *
 	// replay, one self preflight, and one deduplicated tool-status POST that
 	// covers both migrated tools.
 	requestsAfterSecondRun := server.totalRequests()
-	if requestsAfterSecondRun != requestsAfterFirstRun+2 {
-		t.Fatalf("second collection.Run must only add the empty-scan status report: before=%d, after=%d",
+	if requestsAfterSecondRun != requestsAfterFirstRun+3 {
+		t.Fatalf("second collection.Run must only add the grant-sync fetch and the empty-scan status report: before=%d, after=%d",
 			requestsAfterFirstRun, requestsAfterSecondRun)
 	}
 	if got := server.ingestRequests(); got != ingestAfterFirstRun {
@@ -530,8 +530,8 @@ func TestRunUpgradeLegacyWithPendingOutboxDrainsAndConfirmsOnce(t *testing.T) {
 	if got := server.ingestRequests(); got != ingestAfterRun2 {
 		t.Fatalf("Run 3 must not replay any ingest upload: before=%d, after=%d", ingestAfterRun2, got)
 	}
-	if n := server.totalRequests(); n != reqsAfterRun2+2 {
-		t.Fatalf("Run 3 must only add the empty-scan status report: before=%d, after=%d", reqsAfterRun2, n)
+	if n := server.totalRequests(); n != reqsAfterRun2+3 {
+		t.Fatalf("Run 3 must only add the grant-sync fetch and the empty-scan status report: before=%d, after=%d", reqsAfterRun2, n)
 	}
 }
 
@@ -618,8 +618,8 @@ func TestRunUpgradeAppendNewUsageAfterMigrationSyncsOnlyDelta(t *testing.T) {
 	if got := server.ingestRequests(); got != ingestAfterRun2 {
 		t.Fatalf("Run 3 must not replay any ingest upload: before=%d, after=%d", ingestAfterRun2, got)
 	}
-	if n := server.totalRequests(); n != reqsAfterRun2+2 {
-		t.Fatalf("Run 3 must only add the empty-scan status report: before=%d, after=%d", reqsAfterRun2, n)
+	if n := server.totalRequests(); n != reqsAfterRun2+3 {
+		t.Fatalf("Run 3 must only add the grant-sync fetch and the empty-scan status report: before=%d, after=%d", reqsAfterRun2, n)
 	}
 }
 
@@ -683,10 +683,10 @@ func TestRunUpgradeFromLegacySourcesColdStart(t *testing.T) {
 	if got := server.ingestRequests(); got != ingestAfterFirst {
 		t.Fatalf("second run must not replay any ingest upload: before=%d, after=%d", ingestAfterFirst, got)
 	}
-	if n := server.totalRequests(); n != reqsAfterFirst+2 {
-		t.Fatalf("second run must only add the empty-scan status report: before=%d, after=%d", reqsAfterFirst, n)
+	if n := server.totalRequests(); n != reqsAfterFirst+3 {
+		t.Fatalf("second run must only add the grant-sync fetch and the empty-scan status report: before=%d, after=%d", reqsAfterFirst, n)
 	}
-	if got := server.selfRequests(); got != 5 { // 2 drain + 2 receipt preflights in run 1, 1 status preflight in run 2
+	if got := server.selfRequests(); got != 7 { // run 1: 2 drain + 2 receipt preflights + grant-sync; run 2: status preflight + grant-sync
 		t.Fatalf("expected 5 total self preflights, got %d", got)
 	}
 	if got := server.toolStatusRequests(); got != 3 { // 2 synced receipts + 1 empty-scan POST
@@ -730,8 +730,8 @@ func TestRunUpgradeDisabledLegacyGrantsDoNotScanOrNetwork(t *testing.T) {
 	if res.ExportedBatches != 0 || res.SyncedBatches != 0 {
 		t.Fatalf("expected 0 exported and 0 synced batches, got %#v", res)
 	}
-	if n := server.totalRequests(); n != 0 {
-		t.Fatalf("disabled legacy grants must not touch the network, got %d requests", n)
+	if n := server.totalRequests(); n != 1 {
+		t.Fatalf("disabled legacy grants must only perform the grant-sync self fetch for the bound device, got %d requests", n)
 	}
 
 	// Verify grants.json was created and reflects disabled state.
@@ -842,8 +842,8 @@ func TestRunUpgradeExplicitEmptyCurrentConfigWinsOverEnabledLegacy(t *testing.T)
 	if res.ExportedBatches != 0 || res.SyncedBatches != 0 {
 		t.Fatalf("expected 0 exports and syncs, got %#v", res)
 	}
-	if n := server.totalRequests(); n != 0 {
-		t.Fatalf("run with empty current config must not touch network, got %d requests", n)
+	if n := server.totalRequests(); n != 1 {
+		t.Fatalf("run with empty current config must only perform the grant-sync self fetch for the bound device, got %d requests", n)
 	}
 
 	// Verify current grants.json was untouched and still contains 0 grants.

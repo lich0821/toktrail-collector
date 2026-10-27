@@ -152,7 +152,7 @@ No server URL or secret appears on the scheduler command line. See [Scheduled co
 
 ## Signed releases and installation
 
-GitHub Actions and `scripts/release.sh` build six platform targets. Maintainer tooling assembles archives and signs the manifest; the standalone installer verifies signatures and SHA-256 hashes before replacement. The tag workflow creates a draft GitHub Release for review. See [Release and installation](docs/RELEASE.md).
+GitHub Actions and `scripts/release.sh` build six platform targets. Maintainer tooling assembles archives and signs the manifest; the standalone installer verifies signatures and SHA-256 hashes before replacement. The tag workflow creates a draft GitHub Release for review. The installer and bootstrap scripts also support an explicit in-place `upgrade` that reuses the original install path, keeps the previous binary as `<binary>.previous`, and never touches state, grants, outbox, device binding or scheduler registration. See [Release and installation](docs/RELEASE.md).
 
 Production operators must provide their own release signing keys, trusted public-key distribution channel, download hosting, and any platform-specific notarization or code signing.
 

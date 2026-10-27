@@ -187,8 +187,8 @@ func Install(opts InstallOptions) (*InstallResult, error) {
 			}
 		}
 		if opts.KeepOld {
-			old := target + ".previous"
-			if err := copyFileMode(target, old, executableMode); err != nil {
+			old := target + previousBinarySuffix
+			if err := keepPrevious(target, old); err != nil {
 				return nil, fmt.Errorf("keep old binary: %w", err)
 			}
 			res.KeptOldPath = old
@@ -337,6 +337,56 @@ func atomicInstall(srcPath, targetPath string) error {
 		return err
 	}
 	if err := os.Rename(tmpName, targetPath); err != nil {
+		if runtime.GOOS == "windows" {
+			// Fail closed with an actionable hint; never retry or
+			// fall back to a non-atomic replacement.
+			return fmt.Errorf("replace %s: %w (the existing binary may be running; stop scheduled toktrail tasks and retry)", targetPath, err)
+		}
+		return err
+	}
+	ok = true
+	return nil
+}
+
+// previousBinarySuffix names the kept copy of the replaced binary.
+const previousBinarySuffix = ".previous"
+
+// keepPrevious preserves the current binary at dst (target+".previous") by
+// writing a fresh copy and renaming it into place, so a failed or partial
+// copy cannot corrupt an existing rollback copy. An existing regular file
+// at dst is replaced atomically; anything else must have been rejected by
+// the caller.
+func keepPrevious(srcPath, dstPath string) error {
+	dir := filepath.Dir(dstPath)
+	tmp, err := os.CreateTemp(dir, ".toktrail-previous-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			os.Remove(tmpName)
+		}
+	}()
+	if err := copyFileMode(srcPath, tmpName, executableMode); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, executableMode); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, dstPath); err != nil {
+		if runtime.GOOS == "windows" {
+			return fmt.Errorf("replace %s: %w (the previous binary may be running; stop scheduled toktrail tasks and retry)", dstPath, err)
+		}
 		return err
 	}
 	ok = true

@@ -46,6 +46,21 @@ var (
 	// out-of-scope records are quarantined recoverably and the outbox head
 	// is freed instead of blocking later batches.
 	ErrOutsideScope = errors.New("outside_scope")
+	// ErrDeviceUnauthorized marks an authentication or identity failure on
+	// GET /v1/devices/self: the server rejected the device credentials
+	// (HTTP 401/403) or answered with another device's authorization.
+	// Callers must stop local reading; this is never treated as a
+	// transient network failure.
+	ErrDeviceUnauthorized = errors.New("device_unauthorized")
+	// ErrSelfProtocol marks a structurally invalid device self response
+	// (undecodable body or a missing device object on HTTP 200). Callers
+	// must stop local reading rather than fall back to a previous scope.
+	ErrSelfProtocol = errors.New("self_protocol")
+	// ErrDevicePaused maps to the grant protocol's paused state: the
+	// server explicitly paused collection for this device. Callers stop
+	// sending (uploads and tool-status reports) and keep pending batches
+	// queued; it is a state, not a failure, and never triggers re-binding.
+	ErrDevicePaused = errors.New("device_paused")
 )
 
 type Options struct {
@@ -108,15 +123,31 @@ type ingestResponse struct {
 // and must be echoed back as the X-Consent-Revision header on every ingest
 // POST; HistoryFrom/UploadUntil/AllowedTools describe the live consent
 // scope (nil/empty means unrestricted).
+//
+// Grant protocol: when GrantProtocolVersion is present, the server speaks
+// the device grant protocol and the top-level Paused/AllowedTools/
+// HistoryFrom/ConsentRevision fields are this device's effective grant
+// scope (Paused is always sent as bool; a paused device reports
+// AllowedTools containing the "__toktrail_paused__" sentinel). Absent
+// GrantProtocolVersion means an older server: callers keep the legacy
+// behavior and must not apply grant-scope changes.
 type SelfStatus struct {
-	DeviceID         string     `json:"deviceId"`
-	ConsentRevision  int64      `json:"consentRevision"`
-	HistoryFrom      *time.Time `json:"historyFrom,omitempty"`
-	UploadUntil      *time.Time `json:"uploadUntil,omitempty"`
-	AllowedTools     []string   `json:"allowedTools,omitempty"`
-	ProductionBound  bool       `json:"productionBound,omitempty"`
-	UploadAuthorized bool       `json:"uploadAuthorized"`
-	Revoked          bool       `json:"revoked"`
+	DeviceID             string     `json:"deviceId"`
+	ConsentRevision      int64      `json:"consentRevision"`
+	HistoryFrom          *time.Time `json:"historyFrom,omitempty"`
+	UploadUntil          *time.Time `json:"uploadUntil,omitempty"`
+	AllowedTools         []string   `json:"allowedTools,omitempty"`
+	ProductionBound      bool       `json:"productionBound,omitempty"`
+	UploadAuthorized     bool       `json:"uploadAuthorized"`
+	Revoked              bool       `json:"revoked"`
+	Paused               bool       `json:"paused,omitempty"`
+	GrantProtocolVersion *int       `json:"grantProtocolVersion,omitempty"`
+	// DeviceGrantManaged is the server's persistent explicit-authorization
+	// flag for this device. Only a present-and-true flag permits the
+	// collector to add built-in default-directory grants for confirmed
+	// tools; false or absent means filter-only — the device never creates
+	// local paths on the server's behalf.
+	DeviceGrantManaged *bool `json:"deviceGrantManaged,omitempty"`
 }
 
 type selfResponse struct {
@@ -278,6 +309,33 @@ func Run(ctx context.Context, store statedir.Store, opt Options) (Result, error)
 	if err != nil {
 		return Result{}, err
 	}
+	// A server that speaks the grant protocol and reports the device
+	// paused stops all sending here: the batch stays pending (never
+	// quarantined — pause is temporary) and no ingest POST happens. The
+	// server's record-level scope enforcement remains the final defense
+	// for everything uploaded before the pause.
+	if err := checkNotPaused(selfStatus); err != nil {
+		return Result{Self: selfStatus}, err
+	}
+	// Local scope gate BEFORE any POST: narrowed-away data must never
+	// leave the device for the server to reject. Every record is checked
+	// against the fresh preflight scope (allowed tools and time range).
+	// Out-of-scope records in an outbox batch are split off through the
+	// durable WAL/quarantine path — quarantined locally, never submitted —
+	// while the in-scope remainder uploads normally; a --file batch with
+	// out-of-scope records is refused outright with zero network traffic.
+	//
+	// Race boundary (deliberately not over-promised): a consent change the
+	// user makes between this preflight GET and the ingest POST cannot be
+	// recalled from the wire — bytes already sent are sent. What the gate
+	// guarantees is that the server never PERSISTS such data: the POST
+	// still carries X-Consent-Revision and the server validates it, so a
+	// racing narrowing rejects the batch server-side exactly as before.
+	// No absolute instantaneous revocation of in-flight requests is
+	// claimed.
+	if err := gateBatchAgainstScope(&batch, &outboxEntry, &opt, ledger, fromOutbox, selfStatus, strings.TrimSpace(opt.StateDir)); err != nil {
+		return Result{Self: selfStatus}, err
+	}
 	// With the live scope in hand, recover any quarantined records that are
 	// back inside it (requires a strictly newer consent revision). A
 	// recovery failure fails closed: the batch stays pending and no POST
@@ -395,14 +453,38 @@ func Run(ctx context.Context, store statedir.Store, opt Options) (Result, error)
 	return Result{State: st, Receipt: body.Batch, Status: resp.StatusCode, Self: selfStatus, Recovered: recovered, Quarantined: quarantineCount(strings.TrimSpace(opt.StateDir))}, nil
 }
 
-// preflightSelf refreshes the device's live authorization snapshot via
-// GET /v1/devices/self before any upload. It returns the snapshot whose
-// ConsentRevision must be echoed on the ingest POST. Terminal conditions
-// (device revoked, subject deleted) return wrapped ErrDeviceRevoked /
-// ErrSubjectDeleted so callers stop sending; the collector never re-binds
-// automatically. Any other failure is a plain error: the batch stays
-// pending and the next sync run retries after a fresh preflight.
-func preflightSelf(ctx context.Context, client *http.Client, serverURL string, st statedir.DeviceState) (SelfStatus, error) {
+// FetchDeviceSelf fetches the device's live authorization snapshot via
+// GET /v1/devices/self using the device's own credentials, WITHOUT the
+// upload-preflight history adjustment: the returned HistoryFrom and
+// AllowedTools are the raw server-effective grant scope, so grant-sync
+// callers can honor server-side widenings. Revoked or unauthorized devices
+// fail like the upload preflight. This never binds or re-binds.
+func FetchDeviceSelf(ctx context.Context, store statedir.Store, opt Options) (SelfStatus, error) {
+	st, err := store.Load()
+	if err != nil {
+		return SelfStatus{}, err
+	}
+	if st.DeviceID == "" || st.DeviceSecret == "" {
+		return SelfStatus{}, errors.New("device is not bound; run toktrail bind first")
+	}
+	serverURL := strings.TrimSpace(opt.ServerURL)
+	if serverURL == "" {
+		serverURL = st.ServerURL
+	}
+	if serverURL == "" {
+		serverURL = "http://127.0.0.1:3211"
+	}
+	client := opt.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	return fetchSelf(ctx, client, serverURL, st)
+}
+
+// fetchSelf performs the authenticated GET and applies the shared
+// terminal-condition checks. The returned snapshot is raw (no local
+// history adjustment).
+func fetchSelf(ctx context.Context, client *http.Client, serverURL string, st statedir.DeviceState) (SelfStatus, error) {
 	endpoint, err := joinURL(serverURL, "/v1/devices/self")
 	if err != nil {
 		return SelfStatus{}, err
@@ -419,23 +501,22 @@ func preflightSelf(ctx context.Context, client *http.Client, serverURL string, s
 	defer resp.Body.Close()
 	var body selfResponse
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return SelfStatus{}, fmt.Errorf("device self check failed: status %d: %w", resp.StatusCode, err)
+		return SelfStatus{}, fmt.Errorf("%w: device self check returned an undecodable body (status %d): %v", ErrSelfProtocol, resp.StatusCode, err)
 	}
 	if resp.StatusCode == http.StatusOK {
 		if body.Device == nil {
-			return SelfStatus{}, errors.New("device self check response missing device status")
+			return SelfStatus{}, fmt.Errorf("%w: device self check response missing device status", ErrSelfProtocol)
 		}
 		if body.Device.Revoked || !body.Device.UploadAuthorized {
 			return SelfStatus{}, fmt.Errorf("%w: server reports device %s is no longer authorized to upload; sending stopped and the collector never re-binds automatically", ErrDeviceRevoked, body.Device.DeviceID)
 		}
-		dev := *body.Device
-		if st.HistoryFrom != nil && !st.HistoryFrom.IsZero() {
-			if dev.HistoryFrom == nil || dev.HistoryFrom.Before(*st.HistoryFrom) {
-				hf := *st.HistoryFrom
-				dev.HistoryFrom = &hf
-			}
+		// The snapshot must describe THIS device: applying another device's
+		// authorization (or a server that cannot name the authenticated
+		// device) fails closed.
+		if body.Device.DeviceID != st.DeviceID {
+			return SelfStatus{}, fmt.Errorf("%w: device self check returned authorization for device %q, but this collector is bound as %q; refusing to apply another device's authorization", ErrDeviceUnauthorized, body.Device.DeviceID, st.DeviceID)
 		}
-		return dev, nil
+		return *body.Device, nil
 	}
 	code, message := "", ""
 	if body.Error != nil {
@@ -447,10 +528,125 @@ func preflightSelf(ctx context.Context, client *http.Client, serverURL string, s
 	case "subject_deleted":
 		return SelfStatus{}, fmt.Errorf("%w: %s; sending stopped and the collector never re-binds automatically", ErrSubjectDeleted, message)
 	}
+	// Authentication failures are terminal for reading, never a transient
+	// network condition.
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return SelfStatus{}, fmt.Errorf("%w: device self check rejected the device credentials (HTTP %d)", ErrDeviceUnauthorized, resp.StatusCode)
+	}
 	if code != "" || message != "" {
 		return SelfStatus{}, fmt.Errorf("device self check failed: status %d: %s: %s", resp.StatusCode, code, message)
 	}
 	return SelfStatus{}, fmt.Errorf("device self check failed: status %d", resp.StatusCode)
+}
+
+// preflightSelf refreshes the device's live authorization snapshot via
+// GET /v1/devices/self before any upload. It returns the snapshot whose
+// ConsentRevision must be echoed on the ingest POST. Terminal conditions
+// (device revoked, subject deleted) return wrapped ErrDeviceRevoked /
+// ErrSubjectDeleted so callers stop sending; the collector never re-binds
+// automatically. Any other failure is a plain error: the batch stays
+// pending and the next sync run retries after a fresh preflight.
+// gateBatchAgainstScope enforces the fresh consent scope locally before
+// any ingest POST. It mutates batch/outboxEntry to the in-scope child when
+// a split happened, so the caller uploads exactly the scoped-down batch.
+func gateBatchAgainstScope(batch *BatchRequest, entry *outbox.BatchEntry, opt *Options, ledger outbox.Store, fromOutbox bool, self SelfStatus, stateDir string) error {
+	scope, err := liveScopeFromSelf(self)
+	if err != nil {
+		return err
+	}
+	outOfScope := 0
+	for _, raw := range batch.Records {
+		inScope, _, err := scope.evaluateRecord(raw)
+		if err != nil {
+			return fmt.Errorf("batch %s stays pending and was not uploaded: %w", batch.BatchID, err)
+		}
+		if !inScope {
+			outOfScope++
+		}
+	}
+	if outOfScope == 0 {
+		return nil
+	}
+	if !fromOutbox || stateDir == "" {
+		return fmt.Errorf("batch %s contains %d of %d record(s) outside the current consent scope; refusing to upload a --file batch without sending anything (drain the outbox instead, which quarantines out-of-scope records locally)",
+			batch.BatchID, outOfScope, len(batch.Records))
+	}
+	journal, err := splitBatchUnderScope(stateDir, *entry, *batch, scope, "pre-post-scope")
+	if err != nil {
+		return err
+	}
+	if len(journal.NewBatches) == 0 {
+		// Everything was out of scope: the old batch is terminal and its
+		// records are quarantined locally; nothing is uploaded.
+		return fmt.Errorf("%w; batch %s fully quarantined locally under revision %d without any upload", ErrOutsideScope, batch.BatchID, scope.revision)
+	}
+	child := journal.NewBatches[0]
+	childFile := batchFilePath(stateDir, child.BatchID)
+	childBatch, err := loadBatch(childFile, child.BatchID)
+	if err != nil {
+		return fmt.Errorf("load scoped child batch %s: %w", child.BatchID, err)
+	}
+	childEntry := outbox.BatchEntry{
+		BatchID:               child.BatchID,
+		File:                  childFile,
+		Source:                child.Source,
+		Input:                 child.Input,
+		Status:                outbox.StatusPending,
+		RecordCount:           len(child.Records),
+		OriginConsentRevision: journal.ConsentRevision,
+	}
+	if err := ledger.MarkAttempt(child.BatchID, time.Now().UTC()); err != nil {
+		return err
+	}
+	*batch = childBatch
+	*entry = childEntry
+	if strings.TrimSpace(opt.BatchID) != "" {
+		opt.BatchID = child.BatchID
+	}
+	return nil
+}
+
+// checkNotPaused reports ErrDevicePaused when the fetched snapshot speaks
+// the grant protocol and the device is paused (explicit flag or the
+// allowedTools sentinel). Old-protocol snapshots never pause.
+func checkNotPaused(self SelfStatus) error {
+	if self.GrantProtocolVersion == nil {
+		return nil
+	}
+	paused := self.Paused
+	for _, tool := range self.AllowedTools {
+		if strings.TrimSpace(tool) == pausedToolSentinel {
+			paused = true
+		}
+	}
+	if paused {
+		return fmt.Errorf("%w: server reports collection paused for this device; pending batches stay queued and nothing is sent", ErrDevicePaused)
+	}
+	return nil
+}
+
+// pausedToolSentinel is the marker the server places in allowedTools when
+// the device is paused.
+const pausedToolSentinel = "__toktrail_paused__"
+
+func preflightSelf(ctx context.Context, client *http.Client, serverURL string, st statedir.DeviceState) (SelfStatus, error) {
+	dev, err := fetchSelf(ctx, client, serverURL, st)
+	if err != nil {
+		return SelfStatus{}, err
+	}
+	// Under the grant protocol the server-confirmed effective cutoff is
+	// authoritative and may legitimately widen beyond the bind-time cutoff,
+	// so it is used as-is. Only old-protocol servers keep the legacy
+	// never-widen behavior (max with the bind-time cutoff).
+	if dev.GrantProtocolVersion == nil {
+		if st.HistoryFrom != nil && !st.HistoryFrom.IsZero() {
+			if dev.HistoryFrom == nil || dev.HistoryFrom.Before(*st.HistoryFrom) {
+				hf := *st.HistoryFrom
+				dev.HistoryFrom = &hf
+			}
+		}
+	}
+	return dev, nil
 }
 
 // classifyIngestError maps a non-2xx ingest response onto a typed error.

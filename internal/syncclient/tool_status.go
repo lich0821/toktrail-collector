@@ -39,7 +39,7 @@ func ReportToolStatuses(ctx context.Context, store statedir.Store, opt Options) 
 			return Result{}, errors.New("invalid tool status")
 		}
 		switch item.Detail {
-		case "", "no new records since last confirmed baseline", "unsupported tool", "default directory not found":
+		case "", "no new records since last confirmed baseline", "unsupported tool", "default directory not found", "default directory grant disabled":
 		default:
 			return Result{}, errors.New("invalid tool status detail")
 		}
@@ -69,6 +69,10 @@ func ReportToolStatuses(ctx context.Context, store statedir.Store, opt Options) 
 	}
 	self, err := preflightSelf(ctx, client, serverURL, st)
 	if err != nil {
+		return Result{}, err
+	}
+	// A paused device sends nothing — not even status metadata.
+	if err := checkNotPaused(self); err != nil {
 		return Result{}, err
 	}
 	if len(self.AllowedTools) > 0 {

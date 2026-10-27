@@ -304,9 +304,11 @@ func TestRunRefusesConcurrentRunWithoutNetwork(t *testing.T) {
 	}
 }
 
-// No enabled grants means a no-op run that never touches the network, even
-// with a bound device and pending batches present: validation happens
-// strictly before any network use.
+// No enabled grants means a no-op run for a bound device on a server
+// without the grant protocol: the only network traffic is the grant-sync
+// self fetch (a bound device always refreshes its authorization view so
+// the server can re-enable tools); there is no upload, no drain preflight
+// and no tool-status report.
 func TestRunWithNoGrantsUsesNoNetwork(t *testing.T) {
 	stateDir := t.TempDir()
 	server := fakeServer(t)
@@ -323,14 +325,21 @@ func TestRunWithNoGrantsUsesNoNetwork(t *testing.T) {
 	if res.Skipped == "" {
 		t.Fatal("expected a skip reason for the no-op run")
 	}
-	if n := server.totalRequests(); n != 0 {
-		t.Fatalf("no-grants run must not touch the network, got %d requests", n)
+	if res.GrantSync.Active {
+		t.Fatalf("old-protocol server must not activate the grant sync, got %#v", res.GrantSync)
+	}
+	if n := server.totalRequests(); n != 1 {
+		t.Fatalf("no-grants run must only perform the grant-sync self fetch, got %d requests", n)
+	}
+	if got := server.selfRequests(); got != 1 {
+		t.Fatalf("expected exactly the grant-sync self request, got %d", got)
 	}
 }
 
 // A granted input that disappeared after the grant was recorded is skipped
-// without failing the run and without any network traffic: a missing input is
-// a local validation failure, never a tool-status report.
+// without failing the run and without upload or tool-status traffic: a
+// missing input is a local validation failure, never a tool-status report.
+// The grant-sync self fetch still happens (bound device, before scanning).
 func TestRunSkipsMissingGrantedInputWithoutNetwork(t *testing.T) {
 	stateDir := t.TempDir()
 	server := fakeServer(t)
@@ -360,8 +369,8 @@ func TestRunSkipsMissingGrantedInputWithoutNetwork(t *testing.T) {
 	if !strings.Contains(res.GrantOutcomes[0].Skipped, "not accessible") {
 		t.Fatalf("expected the missing input to be reported as inaccessible, got %#v", res.GrantOutcomes)
 	}
-	if n := server.totalRequests(); n != 0 {
-		t.Fatalf("run with only a missing input must not touch the network, got %d requests", n)
+	if n := server.totalRequests(); n != 1 {
+		t.Fatalf("run with only a missing input must only perform the grant-sync self fetch, got %d requests", n)
 	}
 }
 
@@ -396,13 +405,13 @@ func TestRunCollectsExportsAndSyncsEndToEnd(t *testing.T) {
 	if len(res.GrantOutcomes) != 1 || !res.GrantOutcomes[0].Exported {
 		t.Fatalf("expected the grant to be exported: %#v", res.GrantOutcomes)
 	}
-	// First run network: drain preflight + upload, then the synced receipt
-	// (self preflight + tool-status POST).
+	// First run network: grant-sync self fetch, drain preflight + upload,
+	// then the synced receipt (self preflight + tool-status POST).
 	if got := server.ingestRequests(); got != 1 {
 		t.Fatalf("first run must upload exactly one batch, got %d", got)
 	}
-	if got := server.selfRequests(); got != 2 {
-		t.Fatalf("expected one drain preflight plus one receipt preflight, got %d self requests", got)
+	if got := server.selfRequests(); got != 3 {
+		t.Fatalf("expected grant-sync, drain and receipt preflights, got %d self requests", got)
 	}
 	if got := server.toolStatusRequests(); got != 1 {
 		t.Fatalf("first run must send exactly one synced receipt, got %d tool-status POSTs", got)
@@ -413,8 +422,8 @@ func TestRunCollectsExportsAndSyncsEndToEnd(t *testing.T) {
 	}
 
 	// Second run: no new observations and an empty outbox. The only network
-	// traffic is the empty-scan status report: one self preflight plus one
-	// tool-status POST, and strictly no ingest replay.
+	// traffic is the grant-sync self fetch plus the empty-scan status report
+	// (self preflight + tool-status POST), and strictly no ingest replay.
 	before, ingestBefore := server.totalRequests(), server.ingestRequests()
 	res2, err := Run(t.Context(), Options{StateDir: stateDir})
 	if err != nil {
@@ -429,8 +438,8 @@ func TestRunCollectsExportsAndSyncsEndToEnd(t *testing.T) {
 	if got := server.ingestRequests(); got != ingestBefore {
 		t.Fatalf("second run must not replay any ingest upload: %d -> %d", ingestBefore, got)
 	}
-	if n := server.totalRequests(); n != before+2 {
-		t.Fatalf("second run must only add the empty-scan status report: %d -> %d requests", before, n)
+	if n := server.totalRequests(); n != before+3 {
+		t.Fatalf("second run must only add the grant-sync fetch and the empty-scan status report: %d -> %d requests", before, n)
 	}
 	if got := server.toolStatusRequests(); got != 2 {
 		t.Fatalf("second run must add exactly one tool-status POST, got %d total", got)
@@ -466,7 +475,7 @@ func TestRunDrainIsBounded(t *testing.T) {
 	if res.PendingRemaining != 1 || res.DrainStopped == "" {
 		t.Fatalf("expected one remaining batch and a stop reason, got %#v", res)
 	}
-	if n := server.totalRequests(); n != 4 { // 2 batches x (preflight + upload)
+	if n := server.totalRequests(); n != 5 { // grant-sync self + 2 batches x (preflight + upload)
 		t.Fatalf("unexpected network requests: %d", n)
 	}
 	// The incomplete drain must suppress the empty-scan status report: the
@@ -498,7 +507,7 @@ func TestRunDrainIsBounded(t *testing.T) {
 		}) {
 		t.Fatalf("expected a Claude Code no_new_records status after the drain, got %#v", reports)
 	}
-	if n := server.totalRequests(); n != 8 { // run 1: 4; run 2: 2 drain + self + status
+	if n := server.totalRequests(); n != 10 { // run 1: 5; run 2: grant-sync + 2 drain + self + status
 		t.Fatalf("unexpected total network requests: %d", n)
 	}
 }
@@ -613,8 +622,8 @@ func TestRunReportsBatchedEmptyScanStatusForClaudeAndCodex(t *testing.T) {
 	if got := server.ingestRequests(); got != 0 {
 		t.Fatalf("an idle run must not upload anything, got %d ingest POSTs", got)
 	}
-	if got := server.selfRequests(); got != 1 {
-		t.Fatalf("expected exactly one self preflight, got %d", got)
+	if got := server.selfRequests(); got != 2 {
+		t.Fatalf("expected the grant-sync fetch plus one status preflight, got %d", got)
 	}
 	if got := server.toolStatusRequests(); got != 1 {
 		t.Fatalf("both tools must share one deduplicated tool-status POST, got %d", got)
@@ -646,8 +655,8 @@ func TestRunReportsBatchedEmptyScanStatusForClaudeAndCodex(t *testing.T) {
 	if len(reports) != 2 {
 		t.Fatalf("expected exactly two statuses[] entries, got %#v", reports)
 	}
-	if n := server.totalRequests(); n != 2 {
-		t.Fatalf("idle scan must only send the preflight and the status POST, got %d requests", n)
+	if n := server.totalRequests(); n != 3 {
+		t.Fatalf("idle scan must only send the grant-sync fetch, the preflight and the status POST, got %d requests", n)
 	}
 }
 
@@ -694,7 +703,7 @@ func TestRunSyncedToolSuppressesNoNewRecordsFromSameToolGrants(t *testing.T) {
 			t.Fatalf("status entry %d must stay the synced receipt without being overwritten, got %#v want %#v", i, r, want[i])
 		}
 	}
-	if n := server.totalRequests(); n != 4 { // drain self + ingest + receipt self + receipt POST
+	if n := server.totalRequests(); n != 5 { // grant-sync + drain self + ingest + receipt self + receipt POST
 		t.Fatalf("expected exactly the sync traffic with no empty-scan POST, got %d requests", n)
 	}
 }
@@ -735,7 +744,7 @@ func TestRunSkipsUnreadableGrantedInputWithoutNetwork(t *testing.T) {
 	if !strings.Contains(res.GrantOutcomes[0].Skipped, "export preparation failed") {
 		t.Fatalf("expected the unreadable input to fail export preparation, got %#v", res.GrantOutcomes)
 	}
-	if n := server.totalRequests(); n != 0 {
-		t.Fatalf("run with only an unreadable input must not touch the network, got %d requests", n)
+	if n := server.totalRequests(); n != 1 {
+		t.Fatalf("run with only an unreadable input must only perform the grant-sync self fetch, got %d requests", n)
 	}
 }

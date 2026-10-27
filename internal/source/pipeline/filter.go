@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"toktrail-collector/internal/local/managedconsent"
 	"toktrail-collector/internal/local/progress"
 	"toktrail-collector/internal/local/quarantine"
 	"toktrail-collector/internal/local/statedir"
@@ -24,12 +25,26 @@ import (
 func FilterHistoryCutoff(opt adapter.Options, records []adapter.Record, updates []progress.MessagePendingUpdate) ([]adapter.Record, []progress.MessagePendingUpdate, error) {
 	cutoff := opt.HistoryFrom
 	if cutoff == nil && strings.TrimSpace(opt.StateDir) != "" {
-		st, err := statedir.New(opt.StateDir).Load()
+		// Legacy fallback: without an applied server grant view, the
+		// bind-time state cutoff governs when the caller passed none.
+		// Under the grant protocol the server-confirmed effective cutoff is
+		// authoritative — including an explicit nil (unlimited), which must
+		// NOT fall back to the bind-time cutoff, or a server-side widening
+		// to unlimited could never take effect.
+		managed, seen, err := managedconsent.New(opt.StateDir).Load()
 		if err != nil {
-			return nil, nil, fmt.Errorf("load history cutoff: %w", err)
+			return nil, nil, fmt.Errorf("load managed consent overlay: %w", err)
 		}
-		if st.HistoryFrom != nil && !st.HistoryFrom.IsZero() {
-			cutoff = st.HistoryFrom
+		if !seen {
+			st, err := statedir.New(opt.StateDir).Load()
+			if err != nil {
+				return nil, nil, fmt.Errorf("load history cutoff: %w", err)
+			}
+			if st.HistoryFrom != nil && !st.HistoryFrom.IsZero() {
+				cutoff = st.HistoryFrom
+			}
+		} else if managed.HistoryFrom != nil {
+			cutoff = managed.HistoryFrom
 		}
 	}
 	if cutoff == nil || cutoff.IsZero() {
@@ -73,6 +88,19 @@ func FilterHistoryCutoff(opt adapter.Options, records []adapter.Record, updates 
 
 	stateDir := strings.TrimSpace(opt.StateDir)
 	if stateDir != "" {
+		// The revision the history scope was applied under: recovery of
+		// these entries requires a strictly newer revision, so the real
+		// current revision must be recorded — a zero revision would let a
+		// future unchanged revision wrongly recover records that are still
+		// before the live cutoff.
+		quarantineRevision := int64(0)
+		if managed, seen, err := managedconsent.New(stateDir).Load(); err == nil && seen {
+			quarantineRevision = managed.ConsentRevision
+		} else if err != nil {
+			return nil, nil, fmt.Errorf("load managed consent overlay: %w", err)
+		} else if st, serr := statedir.New(stateDir).Load(); serr == nil {
+			quarantineRevision = st.ConsentRevision
+		}
 		// Advance baseline for skipped message intervals so they don't replay deltas from 0
 		if len(skippedUpdates) > 0 {
 			if err := progress.New(stateDir).EstablishConfirmedBaseline(opt.Source, skippedUpdates); err != nil {
@@ -93,13 +121,14 @@ func FilterHistoryCutoff(opt adapter.Options, records []adapter.Record, updates 
 				continue
 			}
 			entries = append(entries, quarantine.Entry{
-				Source:        opt.Source,
-				Input:         opt.Input,
-				RecordKey:     key,
-				Record:        raw,
-				OriginBatchID: opt.BatchID,
-				Reason:        quarantine.ReasonBeforeHistoryFrom,
-				QuarantinedAt: now,
+				Source:          opt.Source,
+				Input:           opt.Input,
+				RecordKey:       key,
+				Record:          raw,
+				OriginBatchID:   opt.BatchID,
+				Reason:          quarantine.ReasonBeforeHistoryFrom,
+				QuarantinedAt:   now,
+				ConsentRevision: quarantineRevision,
 			})
 		}
 		if len(entries) > 0 {

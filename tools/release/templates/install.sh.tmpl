@@ -20,16 +20,28 @@
 #     lead to a call beyond the signed release download; the connect
 #     call itself is made by the installed collector binary under its
 #     own command surface, not by this script reaching into the network.
+#   * With --upgrade, the script instead runs the pinned installer's
+#     'upgrade' subcommand: it only replaces an EXISTING toktrail binary
+#     in place (discovered on PATH, or in INSTALL_DIR when given), keeps
+#     the previous binary as <binary>.previous, never re-runs connect,
+#     and never reads or writes state, grants, outbox or scheduler
+#     registration. There is no automatic rollback; see docs/RELEASE.md.
+#     --upgrade and --connect are mutually exclusive.
 #
-# Usage: install-{{.Version}}.sh [BASE_URL [INSTALL_DIR]] [--connect LINK]
+# Usage: install-{{.Version}}.sh [BASE_URL [INSTALL_DIR]] [--connect LINK] [--upgrade]
 #   BASE_URL      release download root that serves manifest.json et al.
 #                 (also via TOKTRAIL_DOWNLOAD_BASE); defaults to the
 #                 official GitHub release download root for {{.Version}}
-#   INSTALL_DIR   default $HOME/.toktrail/bin (also via TOKTRAIL_INSTALL_DIR)
+#   INSTALL_DIR   install mode: default $HOME/.toktrail/bin (also via
+#                 TOKTRAIL_INSTALL_DIR). upgrade mode: NO default - the
+#                 existing binary is discovered on PATH unless a directory
+#                 is given explicitly (pass the directory your scheduler
+#                 actually invokes if it differs from the PATH match)
 #   --connect LINK
 #                 optional one-time connect link; after a successful
 #                 install, runs 'toktrail connect LINK' using the
 #                 absolute path of the binary just installed
+#   --upgrade     in-place upgrade of an existing installation only
 set -eu
 
 VERSION='{{.Version}}'
@@ -40,6 +52,7 @@ fail() { echo "install: $*" >&2; exit 1; }
 BASE_URL_ARG=""
 INSTALL_DIR_ARG=""
 CONNECT_URL=""
+UPGRADE=0
 POSITIONAL=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -52,6 +65,10 @@ while [ $# -gt 0 ]; do
     --connect=*)
       CONNECT_URL="${1#--connect=}"
       [ -n "$CONNECT_URL" ] || fail "--connect requires a non-empty URL argument"
+      shift
+      ;;
+    --upgrade)
+      UPGRADE=1
       shift
       ;;
     --*)
@@ -69,10 +86,21 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-BASE_URL="${BASE_URL_ARG:-${TOKTRAIL_DOWNLOAD_BASE:-$DEFAULT_BASE_URL}}"
-INSTALL_DIR="${INSTALL_DIR_ARG:-${TOKTRAIL_INSTALL_DIR:-$HOME/.toktrail/bin}}"
+[ "$UPGRADE" != 1 ] || [ -z "$CONNECT_URL" ] || \
+  fail "--upgrade and --connect are mutually exclusive: an upgrade never re-connects or re-binds"
 
-[ -n "$BASE_URL" ] || fail "usage: $0 [BASE_URL [INSTALL_DIR]] [--connect LINK]"
+BASE_URL="${BASE_URL_ARG:-${TOKTRAIL_DOWNLOAD_BASE:-$DEFAULT_BASE_URL}}"
+
+if [ "$UPGRADE" = 1 ]; then
+  # Upgrade mode must only touch an existing installation, so there is no
+  # default install directory: the pinned installer discovers the existing
+  # binary on PATH, or uses the explicitly given directory.
+  INSTALL_DIR="${INSTALL_DIR_ARG:-${TOKTRAIL_INSTALL_DIR:-}}"
+else
+  INSTALL_DIR="${INSTALL_DIR_ARG:-${TOKTRAIL_INSTALL_DIR:-$HOME/.toktrail/bin}}"
+fi
+
+[ -n "$BASE_URL" ] || fail "usage: $0 [BASE_URL [INSTALL_DIR]] [--connect LINK] [--upgrade]"
 
 case "$(uname -s)/$(uname -m)" in
 {{- range .UnixPins}}
@@ -120,12 +148,28 @@ chmod 0755 "$TMP/toktrail-release"
 cat > "$TMP/pub.pem" <<'PUBEOF'
 {{.PublicKeyPEM}}PUBEOF
 
-echo "==> verifying release {{.Version}} and installing to $INSTALL_DIR"
-"$TMP/toktrail-release" install \
-  -base-url "$BASE_URL" \
-  -version "$VERSION" \
-  -pubkey "$TMP/pub.pem" \
-  -install-dir "$INSTALL_DIR"
+if [ "$UPGRADE" = 1 ]; then
+  echo "==> verifying release {{.Version}} and upgrading the existing installation"
+  if [ -n "$INSTALL_DIR" ]; then
+    "$TMP/toktrail-release" upgrade \
+      -base-url "$BASE_URL" \
+      -version "$VERSION" \
+      -pubkey "$TMP/pub.pem" \
+      -install-dir "$INSTALL_DIR"
+  else
+    "$TMP/toktrail-release" upgrade \
+      -base-url "$BASE_URL" \
+      -version "$VERSION" \
+      -pubkey "$TMP/pub.pem"
+  fi
+else
+  echo "==> verifying release {{.Version}} and installing to $INSTALL_DIR"
+  "$TMP/toktrail-release" install \
+    -base-url "$BASE_URL" \
+    -version "$VERSION" \
+    -pubkey "$TMP/pub.pem" \
+    -install-dir "$INSTALL_DIR"
+fi
 
 if [ -n "$CONNECT_URL" ]; then
   case "$INSTALL_DIR" in

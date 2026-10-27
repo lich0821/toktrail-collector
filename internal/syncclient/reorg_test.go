@@ -127,10 +127,11 @@ func TestRunSyncOutsideScopeQuarantinesAndFreesHeadOfLine(t *testing.T) {
 
 	var gets, posts atomic.Int32
 	var revision atomic.Int64
-	var restrict, reject atomic.Bool
+	var restrict atomic.Bool
+	var postedKeys []string
+	var postedMu sync.Mutex
 	revision.Store(8)
 	restrict.Store(true)
-	reject.Store(true)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/v1/devices/self" {
 			gets.Add(1)
@@ -144,19 +145,22 @@ func TestRunSyncOutsideScopeQuarantinesAndFreesHeadOfLine(t *testing.T) {
 			return
 		}
 		posts.Add(1)
-		if reject.Load() {
-			writeJSON(w, http.StatusForbidden, map[string]any{"error": map[string]any{
-				"code":          "outside_scope",
-				"message":       "records fall outside the consent scope",
-				"recordIndexes": []int{1, 2},
-			}})
-			return
-		}
 		var got BatchRequest
 		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
 			t.Error(err)
 			return
 		}
+		postedMu.Lock()
+		postedKeys = postedKeys[:0]
+		for _, raw := range got.Records {
+			key, err := recordKeyOf(raw)
+			if err != nil {
+				t.Error(err)
+			} else {
+				postedKeys = append(postedKeys, key)
+			}
+		}
+		postedMu.Unlock()
 		writeJSON(w, http.StatusAccepted, map[string]any{"batch": map[string]any{
 			"batchId":         got.BatchID,
 			"status":          "accepted",
@@ -168,24 +172,30 @@ func TestRunSyncOutsideScopeQuarantinesAndFreesHeadOfLine(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// Run 1: 403 outside_scope. The batch is durably reorganized: record-a
-	// kept in a new pending batch, record-b (tool) and record-c (window)
-	// quarantined, message intervals migrated or released, head freed.
-	_, err := Run(t.Context(), store, Options{ServerURL: server.URL, StateDir: stateDir})
-	if !errors.Is(err, ErrOutsideScope) {
-		t.Fatalf("expected ErrOutsideScope, got %v", err)
+	// Run 1: the pre-POST scope gate splits the batch LOCALLY — record-b
+	// (tool) and record-c (window) never leave the device — and the
+	// in-scope remainder (record-a) uploads cleanly in the same run.
+	res1, err := Run(t.Context(), store, Options{ServerURL: server.URL, StateDir: stateDir})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "1 record(s) kept") || !strings.Contains(err.Error(), "2 record(s) quarantined recoverably") {
-		t.Fatalf("expected the reorganization summary in the error, got: %v", err)
+	if res1.Receipt.BatchID != keptID || res1.Receipt.AcceptedRecords != 1 {
+		t.Fatalf("expected the scoped child batch uploaded, got %#v", res1.Receipt)
 	}
-	if gets.Load() != 2 || posts.Load() != 1 {
-		t.Fatalf("expected 2 GET / 1 POST in the reorganization run, got %d GET / %d POST", gets.Load(), posts.Load())
+	if gets.Load() != 1 || posts.Load() != 1 {
+		t.Fatalf("expected 1 GET / 1 POST in the gated run, got %d GET / %d POST", gets.Load(), posts.Load())
+	}
+	postedMu.Lock()
+	keys := append([]string(nil), postedKeys...)
+	postedMu.Unlock()
+	if len(keys) != 1 || keys[0] != "record-a" {
+		t.Fatalf("only the in-scope record may ever be posted, got %#v", keys)
 	}
 	if entry := outboxEntryOf(t, stateDir, batchID); entry.Status != outbox.StatusReorganized || entry.ReorganizedInto != keptID || entry.ReorganizedRevision != 8 {
 		t.Fatalf("expected old batch terminally reorganized into %s: %#v", keptID, entry)
 	}
-	if entry := outboxEntryOf(t, stateDir, keptID); entry.Status != outbox.StatusPending || entry.OriginConsentRevision != 8 || entry.RecordCount != 1 {
-		t.Fatalf("expected kept batch pending under revision 8: %#v", entry)
+	if entry := outboxEntryOf(t, stateDir, keptID); entry.Status != outbox.StatusSynced || entry.OriginConsentRevision != 8 || entry.RecordCount != 1 {
+		t.Fatalf("expected the kept batch synced by the gated upload: %#v", entry)
 	}
 	qEntries, qErr := quarantine.New(stateDir).Load()
 	if qErr != nil || len(qEntries) != 2 {
@@ -205,8 +215,8 @@ func TestRunSyncOutsideScopeQuarantinesAndFreesHeadOfLine(t *testing.T) {
 	if msgErr != nil {
 		t.Fatal(msgErr)
 	}
-	if msgs["msg-a"].Pending == nil || msgs["msg-a"].Pending.BatchID != keptID || msgs["msg-a"].Pending.RecordKey != "record-a" || !msgs["msg-a"].Pending.To.Equal(msgTo["msg-a"]) {
-		t.Fatalf("expected msg-a interval migrated to the kept batch: %#v", msgs["msg-a"])
+	if msgs["msg-a"].Pending != nil || !msgs["msg-a"].Confirmed.Equal(msgTo["msg-a"]) {
+		t.Fatalf("expected msg-a confirmed by the kept-batch ACK: %#v", msgs["msg-a"])
 	}
 	for _, id := range []string{"msg-b", "msg-c"} {
 		if msgs[id].Pending != nil || msgs[id].QuarantinedKey == "" || msgs[id].QuarantinedRevision != 8 || msgs[id].Confirmed != nil {
@@ -216,37 +226,19 @@ func TestRunSyncOutsideScopeQuarantinesAndFreesHeadOfLine(t *testing.T) {
 	if msgs["msg-b"].QuarantinedReason != quarantine.ReasonToolNotAllowed || msgs["msg-c"].QuarantinedReason != quarantine.ReasonBeforeHistoryFrom {
 		t.Fatalf("expected quarantine reasons in message progress: %#v %#v", msgs["msg-b"], msgs["msg-c"])
 	}
+	// The cursor is redirected to the kept child batch and CONFIRMED by
+	// its ACK — the split happens before any POST, so the local progress
+	// already points at the batch that actually uploaded.
 	cursorLedger, loadErr := cursors.Load()
 	if loadErr != nil {
 		t.Fatal(loadErr)
 	}
-	if len(cursorLedger.Cursors) != 1 || cursorLedger.Cursors[0].BatchID != keptID || cursorLedger.Cursors[0].ConfirmedBatchID != "" {
-		t.Fatalf("expected cursor pending on the kept batch: %#v", cursorLedger)
+	if len(cursorLedger.Cursors) != 1 || cursorLedger.Cursors[0].BatchID != keptID ||
+		cursorLedger.Cursors[0].ConfirmedBatchID != keptID || cursorLedger.Cursors[0].ConfirmedRecordCount != 1 {
+		t.Fatalf("expected cursor confirmed on the kept batch: %#v", cursorLedger)
 	}
 
-	// Run 2: the kept batch syncs normally (no re-post of old content).
-	reject.Store(false)
-	if _, err := Run(t.Context(), store, Options{ServerURL: server.URL, StateDir: stateDir}); err != nil {
-		t.Fatal(err)
-	}
-	if gets.Load() != 3 || posts.Load() != 2 {
-		t.Fatalf("expected one GET and one POST for the kept batch, got %d GET / %d POST", gets.Load(), posts.Load())
-	}
-	if entry := outboxEntryOf(t, stateDir, keptID); entry.Status != outbox.StatusSynced || entry.ReceiptStatus != "accepted" {
-		t.Fatalf("expected kept batch synced: %#v", entry)
-	}
-	msgs, _, msgErr = cursors.MessageProgressFor(source)
-	if msgErr != nil {
-		t.Fatal(msgErr)
-	}
-	if !msgs["msg-a"].Confirmed.Equal(msgTo["msg-a"]) || msgs["msg-a"].Pending != nil {
-		t.Fatalf("expected msg-a confirmed: %#v", msgs["msg-a"])
-	}
-	if msgs["msg-b"].Pending != nil || msgs["msg-c"].Pending != nil {
-		t.Fatalf("expected quarantined messages untouched by the kept-batch ACK")
-	}
-
-	// Run 3: empty outbox, quarantine non-empty, scope widened under a
+	// Run 2: empty outbox, quarantine non-empty, scope widened under a
 	// strictly newer revision — exactly one GET, no POST, records re-pended.
 	revision.Store(9)
 	restrict.Store(false)
@@ -257,7 +249,7 @@ func TestRunSyncOutsideScopeQuarantinesAndFreesHeadOfLine(t *testing.T) {
 	if result.Recovered != 2 || result.Quarantined != 0 || result.Receipt.BatchID != "" {
 		t.Fatalf("expected a recovery-only run of 2 records: %#v", result)
 	}
-	if gets.Load() != 4 || posts.Load() != 2 {
+	if gets.Load() != 2 || posts.Load() != 1 {
 		t.Fatalf("expected one GET and zero POST in the recovery-only run, got %d GET / %d POST", gets.Load(), posts.Load())
 	}
 	if entry := outboxEntryOf(t, stateDir, recoveryID); entry.Status != outbox.StatusPending || entry.OriginConsentRevision != 9 || entry.RecordCount != 2 {
@@ -276,13 +268,12 @@ func TestRunSyncOutsideScopeQuarantinesAndFreesHeadOfLine(t *testing.T) {
 		t.Fatalf("expected original interval and baseline restored for msg-b: %#v", msgs["msg-b"])
 	}
 
-	// Run 4: the recovery batch syncs under the new revision, confirming the
+	// Run 3: the recovery batch syncs under the new revision, confirming the
 	// recovered messages against their original endpoints.
-	reject.Store(false)
 	if _, err := Run(t.Context(), store, Options{ServerURL: server.URL, StateDir: stateDir}); err != nil {
 		t.Fatal(err)
 	}
-	if gets.Load() != 5 || posts.Load() != 3 {
+	if gets.Load() != 3 || posts.Load() != 2 {
 		t.Fatalf("expected one GET and one POST for the recovery batch, got %d GET / %d POST", gets.Load(), posts.Load())
 	}
 	if entry := outboxEntryOf(t, stateDir, recoveryID); entry.Status != outbox.StatusSynced || entry.ReceiptStatus != "accepted" {
@@ -349,11 +340,13 @@ func TestRunSyncAllOutOfScopeFreesHeadOfLine(t *testing.T) {
 	if !errors.Is(err, ErrOutsideScope) {
 		t.Fatalf("expected ErrOutsideScope, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "no new batch") || !strings.Contains(err.Error(), "after_upload_until") {
-		t.Fatalf("expected a no-new-batch summary with the upload-until reason, got: %v", err)
+	// The pre-POST scope gate quarantines everything LOCALLY: the record
+	// never leaves the device for the server to reject.
+	if !strings.Contains(err.Error(), "fully quarantined locally under revision 6 without any upload") {
+		t.Fatalf("expected the local-quarantine diagnosis, got: %v", err)
 	}
-	if gets.Load() != 2 || posts.Load() != 1 {
-		t.Fatalf("expected 2 GET / 1 POST, got %d GET / %d POST", gets.Load(), posts.Load())
+	if gets.Load() != 1 || posts.Load() != 0 {
+		t.Fatalf("expected 1 GET / 0 POST — nothing may be uploaded, got %d GET / %d POST", gets.Load(), posts.Load())
 	}
 	// Old batch terminal with no successor; outbox is drained.
 	out, loadErr := outbox.New(stateDir).Load()
@@ -380,8 +373,8 @@ func TestRunSyncAllOutOfScopeFreesHeadOfLine(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "need a strictly newer consent revision") {
 		t.Fatalf("expected the quarantine diagnosis on the next run, got %v", err)
 	}
-	if gets.Load() != 3 || posts.Load() != 1 {
-		t.Fatalf("expected one more GET and no further POST, got %d GET / %d POST", gets.Load(), posts.Load())
+	if gets.Load() != 2 || posts.Load() != 0 {
+		t.Fatalf("expected one more GET and still no POST, got %d GET / %d POST", gets.Load(), posts.Load())
 	}
 }
 
@@ -563,11 +556,18 @@ func TestRunSyncReorgUnknownRevisionFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	var gets, posts atomic.Int32
+	var served atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/v1/devices/self" {
 			gets.Add(1)
-			// The re-fetch reports revision 0: unknown, not unrestricted.
-			serveSelfScoped(w, r, 0, nil, nil, nil)
+			// The preflight serves a valid revision so the pre-POST scope
+			// gate passes; the re-fetch after the 409 reports revision 0:
+			// unknown, not unrestricted.
+			if served.Add(1) == 1 {
+				serveSelfScoped(w, r, 8, nil, nil, nil)
+			} else {
+				serveSelfScoped(w, r, 0, nil, nil, nil)
+			}
 			return
 		}
 		posts.Add(1)
@@ -1131,18 +1131,18 @@ func TestRunSyncGenericRecoveryAcrossLifecycle(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// Run 1: 403 outside_scope under revision 8 with a scope that admits
-	// neither record's tool. No record fits a new batch, so both are
-	// quarantined (without any MessageID) and the head is freed.
+	// Run 1: revision 8 with a scope that admits neither record's tool.
+	// The pre-POST scope gate quarantines both records LOCALLY — zero
+	// network submission of out-of-scope data — and frees the head.
 	_, err := Run(t.Context(), store, Options{ServerURL: server.URL, StateDir: stateDir})
 	if !errors.Is(err, ErrOutsideScope) {
 		t.Fatalf("expected ErrOutsideScope, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "no new batch") || !strings.Contains(err.Error(), "2 record(s) quarantined recoverably") {
-		t.Fatalf("expected the no-new-batch reorganization summary, got: %v", err)
+	if !strings.Contains(err.Error(), "fully quarantined locally under revision 8 without any upload") {
+		t.Fatalf("expected the local-quarantine diagnosis, got: %v", err)
 	}
-	if gets.Load() != 2 || posts.Load() != 1 {
-		t.Fatalf("expected 2 GET / 1 POST in the reorganization run, got %d GET / %d POST", gets.Load(), posts.Load())
+	if gets.Load() != 1 || posts.Load() != 0 {
+		t.Fatalf("expected 1 GET / 0 POST in the gated run, got %d GET / %d POST", gets.Load(), posts.Load())
 	}
 	qEntries, qErr := quarantine.New(stateDir).Load()
 	if qErr != nil || len(qEntries) != 2 {
@@ -1173,8 +1173,8 @@ func TestRunSyncGenericRecoveryAcrossLifecycle(t *testing.T) {
 	if qErr != nil || len(qEntries) != 0 {
 		t.Fatalf("expected the quarantine store drained, err=%v: %#v", qErr, qEntries)
 	}
-	if gets.Load() != 3 || posts.Load() != 1 {
-		t.Fatalf("expected one recovery GET and no POST, got %d GET / %d POST", gets.Load(), posts.Load())
+	if gets.Load() != 2 || posts.Load() != 0 {
+		t.Fatalf("expected one recovery GET and still no POST, got %d GET / %d POST", gets.Load(), posts.Load())
 	}
 	entry := outboxEntryOf(t, stateDir, recoveryID)
 	if entry.Status != outbox.StatusPending || entry.OriginConsentRevision != 9 || entry.RecordCount != 2 {
@@ -1195,7 +1195,7 @@ func TestRunSyncGenericRecoveryAcrossLifecycle(t *testing.T) {
 	if entry := outboxEntryOf(t, stateDir, recoveryID); entry.Status != outbox.StatusSynced || entry.ReceiptStatus != "accepted" {
 		t.Fatalf("expected the recovery batch synced: %#v", entry)
 	}
-	if gets.Load() != 4 || posts.Load() != 2 {
+	if gets.Load() != 3 || posts.Load() != 1 {
 		t.Fatalf("expected one GET and one POST for the recovery batch, got %d GET / %d POST", gets.Load(), posts.Load())
 	}
 	// Run 4: nothing pending, nothing quarantined. The run must report the
@@ -1208,7 +1208,7 @@ func TestRunSyncGenericRecoveryAcrossLifecycle(t *testing.T) {
 	if strings.Contains(err.Error(), "already synced") || strings.Contains(err.Error(), "strictly newer consent revision") {
 		t.Fatalf("the drained run must not re-recover or refuse the synced batch, got %v", err)
 	}
-	if gets.Load() != 4 || posts.Load() != 2 {
+	if gets.Load() != 3 || posts.Load() != 1 {
 		t.Fatalf("expected no further HTTP traffic, got %d GET / %d POST", gets.Load(), posts.Load())
 	}
 	qEntries, qErr = quarantine.New(stateDir).Load()
