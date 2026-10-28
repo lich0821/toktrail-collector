@@ -80,6 +80,9 @@ Common commands:
 - `toktrail bind` generates or reuses a local device secret and binds the device to a server-issued ticket.
 - `toktrail status` checks the current bound device state.
 - `toktrail sync` uploads either an explicit batch or the oldest pending local outbox batch.
+- `toktrail resync --all --dry-run` previews archived, already-synced device batches for currently enabled local grants without network or writes; it does not verify remote consent.
+- `toktrail resync --all` asks for confirmation, then retransmits those batches under the live server scope without resetting progress or binding another device. `--yes` skips the prompt; `--max-batches N` bounds one invocation. An interrupted pass resumes on the next invocation.
+- Resync does not scan source logs or include unexported records, pending batches, quarantine entries, or separate Cursor account-source history. Server-side idempotency is scoped to the current device; it does not guarantee cross-device deduplication. Missing archives, blocked records, and server rejections are reported, not counted as restored.
 - `toktrail sources` manages explicit local read grants for scheduled collection.
 - `toktrail periodic` collects from enabled grants and drains a bounded number of pending batches.
 - `toktrail service` installs or uninstalls the user-level scheduled task.

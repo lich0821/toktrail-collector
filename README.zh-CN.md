@@ -78,6 +78,9 @@ docs/                   架构、发布与调度设计说明
 - `toktrail bind` 生成或复用本地 device secret，并用服务端一次性 ticket 绑定设备。
 - `toktrail status` 检查当前绑定设备状态。
 - `toktrail sync` 上传指定 batch 或最旧的 pending outbox batch。
+- `toktrail resync --all --dry-run` 离线预览保存在本地 outbox、已同步且仍有本地读取授权的设备批次；预览不联网、不修改状态，不能验证当前远端授权。
+- `toktrail resync --all` 显示目标和计划并请求确认，再按实时服务端授权重传；可使用 `--yes` 跳过交互，使用 `--max-batches N` 限制本次上传数（默认处理完整计划）。中断后重复命令继续未完成任务。原批次、增量进度和设备身份保留不变。
+- `resync` 不扫描原始日志，不包括尚未导出的记录、pending 批次、隔离记录或独立 Cursor 账户来源；跨设备去重不受保证。服务器拒绝或范围外的记录不会被当作恢复成功。当前安装的旧发行版没有该命令，须使用包含此改动的新构建版本。
 - `toktrail sources` 管理计划采集的显式本地读取授权。
 - `toktrail periodic` 从已启用 grants 采集，并有限度 drain pending batches。
 - `toktrail service` 安装或卸载用户级计划任务。

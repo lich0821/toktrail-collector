@@ -401,6 +401,9 @@ func Run(ctx context.Context, store statedir.Store, opt Options) (Result, error)
 	if body.Batch.BatchID == "" {
 		return Result{}, errors.New("sync response missing batch receipt")
 	}
+	if body.Batch.BatchID != batch.BatchID {
+		return Result{}, fmt.Errorf("sync response batch receipt %q does not match submitted batch %q; keeping batch pending", body.Batch.BatchID, batch.BatchID)
+	}
 	// Reconcile the receipt against the submitted batch BEFORE any state
 	// change: an inconsistent receipt (wrong counts or indexes that do not
 	// match the submitted records) must leave the outbox pending, the
