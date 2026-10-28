@@ -101,6 +101,24 @@ func TestFilterHistoryCutoff(t *testing.T) {
 	}
 }
 
+func TestUnlimitedHistoryKeepsOlderRecords(t *testing.T) {
+	stateDir := t.TempDir()
+	if err := statedir.New(stateDir).Save(statedir.DeviceState{DeviceID: "dev-unlimited"}); err != nil {
+		t.Fatal(err)
+	}
+	records := []adapter.Record{
+		{"recordKey": "older-than-90-days", "occurredAt": "2025-01-01T00:00:00Z"},
+		{"recordKey": "recent", "occurredAt": "2026-10-25T12:00:00Z"},
+	}
+	kept, _, err := FilterHistoryCutoff(adapter.Options{Source: adapter.ClaudeCodeJSONLSource, StateDir: stateDir}, records, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kept) != 2 || adapter.StringField(kept[0], "recordKey") != "older-than-90-days" {
+		t.Fatalf("unlimited history dropped records: %v", kept)
+	}
+}
+
 func TestHistoryCutoffPropagatesStateErrors(t *testing.T) {
 	for _, tc := range []struct {
 		file string

@@ -58,6 +58,8 @@ func fakeCollectorBinary(t *testing.T) string {
 	return bin
 }
 
+func intPtr(n int) *int { return &n }
+
 func TestConnectHappyPathAndRetry(t *testing.T) {
 	stateDir := t.TempDir()
 	homeDir := t.TempDir()
@@ -147,7 +149,7 @@ func TestConnectHappyPathAndRetry(t *testing.T) {
 			ApplicationID: "app-test",
 			SubjectID:     "sub-test",
 			Tools:         []string{"Codex", "Claude Code", "NonExistentTool"},
-			Days:          30,
+			Days:          intPtr(30),
 			ExpiresAt:     time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
 		})
 	}))
@@ -319,7 +321,7 @@ func TestConnectCrashRecovery(t *testing.T) {
 		ApplicationID: "app-1",
 		SubjectID:     "sub-1",
 		Tools:         []string{"Codex"},
-		Days:          30,
+		Days:          intPtr(30),
 		ExpiresAt:     time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
 	}
 
@@ -398,13 +400,17 @@ func TestConnectHistoryCutoffPreservesWidestWindow(t *testing.T) {
 
 		connectServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
+			var requestedDays *int
+			if days != 0 {
+				requestedDays = intPtr(days)
+			}
 			_ = json.NewEncoder(w).Encode(Config{
 				SchemaVersion: 1,
 				ServerURL:     toktrailServer.URL,
 				ApplicationID: "app-1",
 				SubjectID:     "sub-1",
 				Tools:         []string{"Codex"},
-				Days:          days,
+				Days:          requestedDays,
 				ExpiresAt:     fixedNow.Add(24 * time.Hour).Format(time.RFC3339),
 			})
 		}))
@@ -469,6 +475,25 @@ func TestConnectHistoryCutoffPreservesWidestWindow(t *testing.T) {
 		st = runTicket(strings.Repeat("b", 64)) // new ticket → rebind
 		assertWindow(t, st, cutoff90, 90)
 	})
+
+	for _, tc := range []struct {
+		name   string
+		ticket string
+	}{
+		{"same_receipt_unlimited", strings.Repeat("a", 64)},
+		{"new_receipt_unlimited", strings.Repeat("b", 64)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runTicket, setDays := setup(t)
+			setDays(30)
+			assertWindow(t, runTicket(strings.Repeat("a", 64)), fixedNow.AddDate(0, 0, -30), 30)
+			setDays(0) // encode an explicit JSON null
+			st := runTicket(tc.ticket)
+			if st.HistoryFrom != nil || st.HistoryDays != 0 {
+				t.Fatalf("expected unlimited history, got from=%v days=%d", st.HistoryFrom, st.HistoryDays)
+			}
+		})
+	}
 
 	t.Run("rebind_with_wider_window_widens_cutoff", func(t *testing.T) {
 		runTicket, setDays := setup(t)
@@ -663,7 +688,7 @@ func TestConnectConfigValidation(t *testing.T) {
 				ApplicationID: "app-1",
 				SubjectID:     "sub-1",
 				Tools:         []string{"Codex"},
-				Days:          30,
+				Days:          intPtr(30),
 				ExpiresAt:     now.Add(-1 * time.Hour).Format(time.RFC3339),
 			})
 		})
@@ -671,6 +696,43 @@ func TestConnectConfigValidation(t *testing.T) {
 		_, err := fetchConnectConfig(context.Background(), s.Client(), s.URL, validTicket, now)
 		if err == nil || !strings.Contains(err.Error(), "expired") {
 			t.Fatalf("expected expired error, got %v", err)
+		}
+	})
+
+	t.Run("null_days_all_history", func(t *testing.T) {
+		s := makeServer(func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewEncoder(w).Encode(Config{
+				SchemaVersion: 1,
+				ServerURL:     "http://localhost:8080",
+				ApplicationID: "app-1",
+				SubjectID:     "sub-1",
+				Tools:         []string{"Codex"},
+				Days:          nil,
+				ExpiresAt:     now.Add(1 * time.Hour).Format(time.RFC3339),
+			})
+		})
+		defer s.Close()
+		cfg, err := fetchConnectConfig(context.Background(), s.Client(), s.URL, validTicket, now)
+		if err != nil {
+			t.Fatalf("expected null days to be accepted, got %v", err)
+		}
+		if cfg.Days != nil {
+			t.Fatalf("days should remain nil for unlimited history, got %v", *cfg.Days)
+		}
+	})
+
+	t.Run("missing_days_rejected", func(t *testing.T) {
+		s := makeServer(func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"schemaVersion": 1, "serverUrl": "http://localhost:8080",
+				"applicationId": "app-1", "subjectId": "sub-1",
+				"tools": []string{"Codex"}, "expiresAt": now.Add(time.Hour).Format(time.RFC3339),
+			})
+		})
+		defer s.Close()
+		_, err := fetchConnectConfig(context.Background(), s.Client(), s.URL, validTicket, now)
+		if err == nil || !strings.Contains(err.Error(), "missing days") {
+			t.Fatalf("expected missing days error, got %v", err)
 		}
 	})
 
@@ -682,7 +744,7 @@ func TestConnectConfigValidation(t *testing.T) {
 				ApplicationID: "app-1",
 				SubjectID:     "sub-1",
 				Tools:         []string{"Codex"},
-				Days:          15, // must be 7, 30, or 90
+				Days:          intPtr(15), // must be 7, 30, or 90
 				ExpiresAt:     now.Add(1 * time.Hour).Format(time.RFC3339),
 			})
 		})
@@ -701,7 +763,7 @@ func TestConnectConfigValidation(t *testing.T) {
 				ApplicationID: "app-1",
 				SubjectID:     "sub-1",
 				Tools:         []string{"Codex"},
-				Days:          7,
+				Days:          intPtr(7),
 				ExpiresAt:     now.Add(1 * time.Hour).Format(time.RFC3339),
 			})
 		})
@@ -724,7 +786,7 @@ func TestConnectLockContention(t *testing.T) {
 			ApplicationID: "app-1",
 			SubjectID:     "sub-1",
 			Tools:         []string{"Codex"},
-			Days:          7,
+			Days:          intPtr(7),
 			ExpiresAt:     time.Now().Add(1 * time.Hour).Format(time.RFC3339),
 		})
 	}))
@@ -798,7 +860,7 @@ func TestConnectToolStatusReportFailures(t *testing.T) {
 				ApplicationID: "app-1",
 				SubjectID:     "sub-1",
 				Tools:         []string{"NonExistentTool"},
-				Days:          30,
+				Days:          intPtr(30),
 				ExpiresAt:     time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
 			})
 		}))

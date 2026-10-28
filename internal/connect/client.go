@@ -132,9 +132,15 @@ func fetchConnectConfig(ctx context.Context, client *http.Client, endpoint, tick
 	if err := json.Unmarshal(body, &cfg); err != nil {
 		return Config{}, fmt.Errorf("invalid connect response JSON: %w", err)
 	}
-
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil || fields == nil {
+		return Config{}, errors.New("invalid connect response JSON: expected an object")
+	}
 	if cfg.SchemaVersion != 1 {
 		return Config{}, fmt.Errorf("unsupported connect schemaVersion: %d (expected 1)", cfg.SchemaVersion)
+	}
+	if _, present := fields["days"]; !present {
+		return Config{}, errors.New("missing days in connect response")
 	}
 	if err := validateServerURL(cfg.ServerURL); err != nil {
 		return Config{}, fmt.Errorf("invalid serverUrl in connect response: %w", err)
@@ -147,8 +153,8 @@ func fetchConnectConfig(ctx context.Context, client *http.Client, endpoint, tick
 	if cfg.SubjectID == "" {
 		return Config{}, errors.New("missing subjectId in connect response")
 	}
-	if cfg.Days != 7 && cfg.Days != 30 && cfg.Days != 90 {
-		return Config{}, fmt.Errorf("invalid days %d in connect response (must be 7, 30, or 90)", cfg.Days)
+	if cfg.Days != nil && *cfg.Days != 7 && *cfg.Days != 30 && *cfg.Days != 90 {
+		return Config{}, fmt.Errorf("invalid days %d in connect response (must be 7, 30, 90, or null)", *cfg.Days)
 	}
 
 	exp, err := time.Parse(time.RFC3339, cfg.ExpiresAt)

@@ -120,8 +120,10 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		bindFp := bind.Fingerprint(cfg.ServerURL, ticket, cfg.ApplicationID, cfg.SubjectID, deviceName, platform)
 
 		var cutoff *time.Time
-		if cfg.Days > 0 {
-			t := nowFn().UTC().AddDate(0, 0, -cfg.Days)
+		historyDays := 0
+		if cfg.Days != nil {
+			historyDays = *cfg.Days
+			t := nowFn().UTC().AddDate(0, 0, -historyDays)
 			cutoff = &t
 		}
 
@@ -136,8 +138,8 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 				st.PendingConnectReceiptHash = ""
 				needSave = true
 			}
-			if isNewReceipt || st.HistoryFrom == nil || st.HistoryFrom.IsZero() {
-				applyHistoryCutoff(&st, cutoff, cfg.Days)
+			if isNewReceipt || cfg.Days == nil || st.HistoryFrom == nil || st.HistoryFrom.IsZero() {
+				applyHistoryCutoff(&st, cutoff, historyDays)
 				needSave = true
 			}
 			if needSave {
@@ -174,7 +176,7 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 			}
 			st.ConnectReceiptHash = fingerprint
 			st.PendingConnectReceiptHash = ""
-			applyHistoryCutoff(&st, cutoff, cfg.Days)
+			applyHistoryCutoff(&st, cutoff, historyDays)
 			if err := store.Save(st); err != nil {
 				return fmt.Errorf("save bound state: %w", err)
 			}

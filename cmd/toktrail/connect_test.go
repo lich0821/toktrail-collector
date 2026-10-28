@@ -15,6 +15,8 @@ import (
 	"toktrail-collector/internal/connect"
 )
 
+func intPtr(n int) *int { return &n }
+
 func TestRunConnectCLIValidation(t *testing.T) {
 	t.Run("missing_args", func(t *testing.T) {
 		err := runConnect([]string{})
@@ -117,7 +119,7 @@ func TestRunConnectCLIIntegration(t *testing.T) {
 			ApplicationID: "app-cli",
 			SubjectID:     "sub-cli",
 			Tools:         []string{"Codex"},
-			Days:          7,
+			Days:          intPtr(7),
 			ExpiresAt:     time.Now().Add(1 * time.Hour).UTC().Format(time.RFC3339),
 		})
 	}))

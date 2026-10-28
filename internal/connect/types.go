@@ -44,6 +44,6 @@ type Config struct {
 	ApplicationID string   `json:"applicationId"`
 	SubjectID     string   `json:"subjectId"`
 	Tools         []string `json:"tools"`
-	Days          int      `json:"days"`
+	Days          *int     `json:"days"`
 	ExpiresAt     string   `json:"expiresAt"`
 }
