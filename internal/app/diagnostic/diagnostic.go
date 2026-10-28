@@ -97,9 +97,6 @@ func Privacy(opt PrivacyOptions) ([]PrivacyReport, error) {
 			return nil, err
 		}
 		targets = grants
-		if len(targets) == 0 {
-			return nil, nil
-		}
 	}
 
 	pendingBatches, pendingRecords, err := pendingSummary(stateDir)
@@ -107,7 +104,7 @@ func Privacy(opt PrivacyOptions) ([]PrivacyReport, error) {
 		return nil, err
 	}
 
-	reports := make([]PrivacyReport, 0, len(targets))
+	var reports []PrivacyReport
 	for _, grant := range targets {
 		scan, err := pipeline.Scan(adapter.Options{
 			Source:   grant.Source,
@@ -134,6 +131,15 @@ func Privacy(opt PrivacyOptions) ([]PrivacyReport, error) {
 			return nil, fmt.Errorf("scan %s %s: %w", grant.Source, grant.Input, err)
 		}
 		reports = append(reports, report)
+	}
+	if opt.Source == "" && opt.Input == "" {
+		queued, err := cursorPrivacy(stateDir)
+		if err != nil {
+			return nil, err
+		}
+		if queued != nil {
+			reports = append(reports, *queued)
+		}
 	}
 	return reports, nil
 }
@@ -237,10 +243,18 @@ func Doctor(opt DoctorOptions) (DoctorReport, error) {
 		add("consent", CheckOK, "upload consent authorized (revision %d)", st.ConsentRevision)
 	}
 
-	// 2. Grants.
+	// Cursor diagnostics inspect only TokTrail-owned permission/queue files.
+	cursorCheck, cursorActive := cursorDoctor(stateDir)
+	if cursorCheck.Status != CheckSkipped {
+		report.Checks = append(report.Checks, cursorCheck)
+	}
+
+	// 2. Local-file grants (Cursor account sources do not use grants.json).
 	enabledGrants, err := grants.New(stateDir).Enabled()
 	if err != nil {
 		add("grants", CheckFail, "sources config unreadable: %v", err)
+	} else if len(enabledGrants) == 0 && cursorActive {
+		add("grants", CheckOK, "no local-file grants; Cursor uses its separate account-source permit")
 	} else if len(enabledGrants) == 0 {
 		add("grants", CheckWarn, "no enabled source grants; the periodic run collects nothing (enable with `toktrail sources enable`)")
 	} else {

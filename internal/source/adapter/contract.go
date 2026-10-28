@@ -12,6 +12,12 @@ const (
 	ClaudeCodeJSONLSource = "claude-code-jsonl"
 	DeepSeekHarnessSource = "deepseek-harness"
 	WorkBuddyJSONLSource  = "workbuddy-jsonl"
+	// CursorDashboardAPISource identifies the account-level Cursor network
+	// source. It is deliberately NOT a compiled-in local file adapter: it
+	// never appears in the local grants store (whose validation requires
+	// an absolute input path) and is collected only through the dedicated
+	// cursor sync orchestration.
+	CursorDashboardAPISource = "cursor-dashboard-api"
 )
 
 type Options struct {

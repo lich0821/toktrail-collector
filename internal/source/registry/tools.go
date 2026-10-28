@@ -7,12 +7,28 @@ import (
 	"toktrail-collector/internal/source/adapter"
 )
 
+// SourceMode classifies how a tool's usage is collected.
+type SourceMode string
+
+const (
+	// ModeLocal marks tools collected by reading explicitly granted local
+	// files (the only mode before account sources existed).
+	ModeLocal SourceMode = "local"
+	// ModeAccountNetwork marks tools collected by direct authenticated
+	// requests to the vendor's account-level API, driven by a local
+	// permit that requires explicit first-time user confirmation.
+	ModeAccountNetwork SourceMode = "account-network"
+)
+
 // ToolSpec defines a supported developer tool and its default local source configuration.
 type ToolSpec struct {
 	Tool           string   // Canonical tool name, e.g. "Codex", "Claude Code"
 	Aliases        []string // Case-insensitive matching aliases
 	Source         string   // Collector adapter source identifier
 	DefaultSubpath []string // Path segments relative to user home directory
+	// Mode classifies the collection path. The zero value behaves as
+	// ModeLocal so every pre-existing local tool spec is unchanged.
+	Mode SourceMode
 }
 
 var supportedTools = []ToolSpec{
@@ -21,24 +37,41 @@ var supportedTools = []ToolSpec{
 		Aliases:        []string{"codex"},
 		Source:         adapter.CodexJSONLSource,
 		DefaultSubpath: []string{".codex", "sessions"},
+		Mode:           ModeLocal,
 	},
 	{
 		Tool:           "Claude Code",
 		Aliases:        []string{"claude code", "claude-code", "claudecode"},
 		Source:         adapter.ClaudeCodeJSONLSource,
 		DefaultSubpath: []string{".claude", "projects"},
+		Mode:           ModeLocal,
 	},
 	{
 		Tool:           "DeepSeek Harness",
 		Aliases:        []string{"deepseek harness", "deepseek-harness", "deepseekharness", "dsh"},
 		Source:         adapter.DeepSeekHarnessSource,
 		DefaultSubpath: []string{".dsh", "sessions"},
+		Mode:           ModeLocal,
 	},
 	{
 		Tool:           "WorkBuddy",
 		Aliases:        []string{"workbuddy", "workbuddy-ai"},
 		Source:         adapter.WorkBuddyJSONLSource,
 		DefaultSubpath: []string{".workbuddy-ai", "projects"},
+		Mode:           ModeLocal,
+	},
+	{
+		// Cursor is the first account-level network source: usage is
+		// collected by direct authenticated requests to the Cursor
+		// dashboard API using the locally confirmed desktop login. It
+		// has NO default local directory: connect probing and the grant
+		// sync must branch on IsAccountNetwork instead of touching the
+		// filesystem, and its local permit lives in the cursor sync
+		// orchestration — never in grants.json.
+		Tool:    "Cursor",
+		Aliases: []string{"cursor"},
+		Source:  adapter.CursorDashboardAPISource,
+		Mode:    ModeAccountNetwork,
 	},
 }
 
@@ -75,9 +108,18 @@ func LookupTool(name string) (ToolSpec, bool) {
 	return ToolSpec{}, false
 }
 
+// IsAccountNetwork reports whether this tool is collected through the
+// account-level network path instead of granted local files.
+func (t ToolSpec) IsAccountNetwork() bool { return t.Mode == ModeAccountNetwork }
+
 // ResolveDefaultInput returns the absolute default input directory path
-// for this tool, anchored at homeDir.
+// for this tool, anchored at homeDir. Account-network tools have no local
+// default input; the empty string tells callers to branch to their
+// account-source flow instead of touching the filesystem.
 func (t ToolSpec) ResolveDefaultInput(homeDir string) string {
+	if t.IsAccountNetwork() || len(t.DefaultSubpath) == 0 {
+		return ""
+	}
 	parts := append([]string{homeDir}, t.DefaultSubpath...)
 	return filepath.Join(parts...)
 }

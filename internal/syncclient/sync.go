@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"toktrail-collector/internal/cursor/protocol"
 	"toktrail-collector/internal/local/outbox"
 	"toktrail-collector/internal/local/progress"
 	"toktrail-collector/internal/local/quarantine"
@@ -148,6 +149,10 @@ type SelfStatus struct {
 	// tools; false or absent means filter-only — the device never creates
 	// local paths on the server's behalf.
 	DeviceGrantManaged *bool `json:"deviceGrantManaged,omitempty"`
+	// AccountSources lists the account-level sources this device is the
+	// designated executor of (the server only returns the executing
+	// device's sources). Absent/empty on servers without account sources.
+	AccountSources []protocol.Source `json:"accountSources,omitempty"`
 }
 
 type selfResponse struct {

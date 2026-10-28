@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"toktrail-collector/internal/app/collection"
+	"toktrail-collector/internal/app/cursorsync"
 	"toktrail-collector/internal/scheduler"
 )
 
@@ -22,6 +23,15 @@ type Options struct {
 	DryRun          bool             // Optional dry run for scheduler installation
 	Now             func() time.Time // Injectable clock for deterministic tests
 	Out             io.Writer        // Destination for progress output (defaults to io.Discard)
+	// Cursor carries the cursorsync options for the account-level Cursor
+	// source. When the connect authorization names Cursor and no local
+	// permit exists yet, connect performs the first-time local
+	// confirmation (the integrated enable). Nil skips the cursor branch
+	// entirely (builds without the cursor wiring).
+	Cursor *cursorsync.Options
+	// CursorConfirm overrides the first-enable confirmation prompt
+	// (tests). Nil uses cursorsync.DefaultConfirm.
+	CursorConfirm cursorsync.ConfirmFunc
 }
 
 // Result summarizes a completed connect orchestration.

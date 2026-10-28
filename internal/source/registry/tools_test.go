@@ -31,9 +31,11 @@ func TestLookupTool(t *testing.T) {
 		{"work-buddy", "WorkBuddy", "workbuddy-jsonl", true},
 		{"workbuddy-ai", "WorkBuddy", "workbuddy-jsonl", true},
 		{"  WorkBuddy  ", "WorkBuddy", "workbuddy-jsonl", true},
+		{"Cursor", "Cursor", "cursor-dashboard-api", true},
+		{"cursor", "Cursor", "cursor-dashboard-api", true},
+		{"  cursor  ", "Cursor", "cursor-dashboard-api", true},
 		{"Unknown", "", "", false},
 		{"", "", "", false},
-		{"Cursor", "", "", false},
 		{"../../etc", "", "", false},
 	}
 
@@ -91,5 +93,19 @@ func TestResolveDefaultInput(t *testing.T) {
 	expected = filepath.Join("test", "home", ".workbuddy-ai", "projects")
 	if resolved != expected {
 		t.Errorf("expected %q, got %q", expected, resolved)
+	}
+
+	// Account-network tools have no local default input: the empty string
+	// tells callers to branch to the account-source flow instead of
+	// touching the filesystem.
+	spec, found = LookupTool("Cursor")
+	if !found {
+		t.Fatal("Cursor not found")
+	}
+	if !spec.IsAccountNetwork() {
+		t.Errorf("Cursor must be classified as an account-network tool, got mode %q", spec.Mode)
+	}
+	if resolved := spec.ResolveDefaultInput(home); resolved != "" {
+		t.Errorf("account-network tool must have no default input, got %q", resolved)
 	}
 }

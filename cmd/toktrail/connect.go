@@ -38,12 +38,21 @@ func runConnect(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	_, err := connect.Run(ctx, connect.Options{
+	// Account-level cursor wiring: the desktop credential reader and the
+	// pinned-host Cursor API client. Construction reads no credential;
+	// the integrated first-time confirmation happens only when the server
+	// authorization names Cursor and no local permit exists.
+	cursorOpts, err := cursorSyncOptions(dir, "", nil)
+	if err != nil {
+		return err
+	}
+	_, err = connect.Run(ctx, connect.Options{
 		URL:             connectURL,
 		StateDir:        dir,
 		DeviceName:      *deviceName,
 		Interval:        *interval,
 		SchedulerRunner: connectSchedulerRunner,
+		Cursor:          cursorOpts,
 		Out:             os.Stdout,
 	})
 	return err

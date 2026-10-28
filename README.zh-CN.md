@@ -188,6 +188,30 @@ GOCACHE="$PWD/.gocache" GOPROXY=off go vet ./...
 GOCACHE="$PWD/.gocache" GOPROXY=off TOKTRAIL_RELEASE_E2E=1 go test ./tools/release/ -run '^TestEndToEndRelease$' -count=1 -v
 ```
 
+## Cursor 账号用量采集
+
+在网站安装流程中选择 Cursor 后，`toktrail connect` 会整合首次本机授权，复用桌面端已有登录；不需要再执行一套 Cursor 登录流程。采集器直接查询 Cursor 个人用量接口，只向 TokTrail 上传脱敏事件与计数，不上传登录凭据、原始账号 ID、邮箱或聊天内容。
+
+```sh
+toktrail cursor enable
+toktrail cursor status
+toktrail cursor sync
+toktrail cursor logout
+```
+
+桌面登录状态无法读取时，可以通过受保护的管道或文件输入执行 `toktrail cursor enable --token-stdin --confirm-local`；已有有效许可时可用 `toktrail cursor sync --token-stdin`。Token 不作为命令参数，也不保存到配置中；仅在本次进程内复用，终端明文输入会被拒绝。默认后台任务继续使用桌面登录状态。
+
+同一用户的账号事件跨采集设备去重，重复快照不累加；修正值按修订号替换，支持下调。普通拉取保留重叠窗口，并每日完整核对授权范围内的历史。缺失计数保持未知，不用费用推算 Token。
+
+部署时先升级 Server 与账号投影，再发布带 schema-2 签名能力声明的 Collector，最后启用网站运营开关。详细流程、隐私边界与限制见 [Cursor 接入说明](docs/CURSOR-ACCOUNT-COLLECTION.md)。
+
+## Cursor 采集已知局限（账号级网络来源）
+
+- 桌面登录状态以只读方式读取（SQLite `mode=ro`，只查认证键）；凭据仅存于内存，不落盘、不进日志与上传。
+- WAL 模式使用 `immutable` 只读，仅访问已 checkpoint 的主库内容；刚完成的登录可能仅存在于 WAL 中，需要 Cursor 正常关闭并 checkpoint 后再重试。
+- 无人值守调度任务不会发起首次授权：通常由 connect 或 `toktrail cursor enable` 交互确认；受保护管道的手动备用模式必须显式指定 `--confirm-local`。
+- 账号级统计由 Cursor 服务端汇总，可能包含该账号在其他电脑上的使用；首版仅支持每个用户一个 Cursor 账号来源、一台指定采集设备，接管由网站重新指定，collector 不自动抢占。
+
 ## 贡献与安全
 
 - 开发规范和 PR 检查见 [CONTRIBUTING.md](CONTRIBUTING.md)。

@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"toktrail-collector/internal/app/collection"
+	"toktrail-collector/internal/app/cursorsync"
 	"toktrail-collector/internal/bind"
+	"toktrail-collector/internal/local/cursorsource"
 	"toktrail-collector/internal/local/grants"
 	"toktrail-collector/internal/local/runlock"
 	"toktrail-collector/internal/local/statedir"
@@ -206,6 +208,47 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 				}
 				continue
 			}
+			if spec.IsAccountNetwork() {
+				// Account-network tools never map to a local directory
+				// grant. The first-time local confirmation (integrated
+				// enable) runs here, inside the state lock, because the
+				// server-side enable and the license write are state
+				// mutations; an existing permit defers to the initial
+				// collection. A confirmation failure is a clear skip — it
+				// never fails the whole connect run (the other tools keep
+				// their setup) and never reports a fabricated tool status.
+				if opt.Cursor == nil {
+					fmt.Fprintf(out, "tool %q: account source; this build has no cursor wiring, skipped\n", spec.Tool)
+					continue
+				}
+				license, hasLicense, lErr := cursorsource.New(stateDir).Load()
+				if lErr != nil {
+					return lErr
+				}
+				if hasLicense && license.Collectable() {
+					fmt.Fprintf(out, "tool %q: local permit already active; the initial collection continues it\n", spec.Tool)
+					authorizedTools = append(authorizedTools, spec.Tool)
+					continue
+				}
+				enableOpts := *opt.Cursor
+				enableOpts.StateDir = stateDir
+				enableOpts.ServerURL = cfg.ServerURL
+				enableOpts.HTTPClient = opt.HTTPClient
+				enableOpts.Out = out
+				enableRes, enableErr := cursorsync.Enable(ctx, enableOpts, opt.CursorConfirm)
+				if enableErr != nil {
+					fmt.Fprintf(out, "tool %q: %v\n", spec.Tool, enableErr)
+					fmt.Fprintf(out, "tool %q: not enabled; run `toktrail cursor enable` in a terminal to confirm locally\n", spec.Tool)
+					continue
+				}
+				fmt.Fprintf(out, "tool %q: enabled (sourceInstanceId=%s, state=%s)\n", spec.Tool, enableRes.Source.SourceInstanceID, enableRes.Source.State)
+				if enableRes.Sync.Ran {
+					fmt.Fprintf(out, "tool %q: first sync pulled=%d new=%d replaced=%d uploaded=%d pending=%d\n",
+						spec.Tool, enableRes.Sync.PulledEvents, enableRes.Sync.NewRecords, enableRes.Sync.ReplacedRecords, enableRes.Sync.SyncedRecords, enableRes.Sync.PendingRemaining)
+				}
+				authorizedTools = append(authorizedTools, spec.Tool)
+				continue
+			}
 			targetDir := spec.ResolveDefaultInput(homeDir)
 			stat, err := os.Stat(targetDir)
 			if err != nil || !stat.IsDir() {
@@ -233,7 +276,9 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		if err != nil {
 			return fmt.Errorf("apply grants: %w", err)
 		}
-		if len(enabledGrants) == 0 {
+		if len(enabledGrants) == 0 && len(authorizedTools) == 0 {
+			// Account-network tools (Cursor) never create local grants;
+			// a run that enabled one is not "no sources active".
 			fmt.Fprintf(out, "warning: no tool directories detected locally; no sources active\n")
 		}
 
@@ -282,12 +327,22 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 
 	// 7. Initial collection run (collection.Run acquires its own state lock)
 	fmt.Fprintf(out, "running initial collection...\n")
+	cursorOpts := opt.Cursor
+	if cursorOpts != nil {
+		c := *cursorOpts
+		c.StateDir = stateDir
+		c.ServerURL = cfg.ServerURL
+		c.HTTPClient = opt.HTTPClient
+		c.Out = out
+		cursorOpts = &c
+	}
 	periodicResult, err := collection.Run(ctx, collection.Options{
 		StateDir:   stateDir,
 		ServerURL:  cfg.ServerURL,
 		MaxBatches: collection.DefaultMaxSyncBatches,
 		HTTPClient: opt.HTTPClient,
 		Now:        nowFn,
+		Cursor:     cursorOpts,
 	})
 	if err != nil {
 		return Result{
@@ -308,6 +363,15 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		fmt.Fprintf(out, "initial collection: exportedBatches=%d exportedRecords=%d syncedBatches=%d syncedRecords=%d\n",
 			periodicResult.ExportedBatches, periodicResult.ExportedRecords,
 			periodicResult.SyncedBatches, periodicResult.SyncedRecords)
+	}
+	if periodicResult.Cursor.Ran {
+		// The account-level cursor round is independent of the local
+		// grant counts above; surface it so a cursor-only device never
+		// looks like an all-zero run.
+		fmt.Fprintf(out, "initial collection: cursor pulledEvents=%d newRecords=%d replacedRecords=%d uploadedRecords=%d pendingBatches=%d\n",
+			periodicResult.Cursor.PulledEvents, periodicResult.Cursor.NewRecords,
+			periodicResult.Cursor.ReplacedRecords, periodicResult.Cursor.SyncedRecords,
+			periodicResult.Cursor.PendingRemaining)
 	}
 
 	return Result{

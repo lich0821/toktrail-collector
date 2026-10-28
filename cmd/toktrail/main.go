@@ -71,9 +71,19 @@ func main() {
 			fmt.Fprintf(os.Stderr, "sync failed: %v\n", err)
 			os.Exit(1)
 		}
+	case "resync":
+		if err := runResync(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "resync failed: %v\n", err)
+			os.Exit(1)
+		}
 	case "periodic":
 		if err := runPeriodic(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "periodic failed: %v\n", err)
+			os.Exit(1)
+		}
+	case "cursor":
+		if err := runCursor(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "cursor failed: %v\n", err)
 			os.Exit(1)
 		}
 	case "sources":
@@ -413,7 +423,7 @@ func runPeriodic(args []string) error {
 	fs.SetOutput(os.Stderr)
 	serverURL := fs.String("server", env("TOKTRAIL_SERVER_URL", ""), "toktrail-server base URL; defaults to bound server")
 	stateDir := fs.String("state-dir", env("TOKTRAIL_HOME", ""), "local TokTrail state directory")
-	maxBatches := fs.Int("max-batches", collection.DefaultMaxSyncBatches, "max pending outbox batches to upload per run")
+	maxBatches := fs.Int("max-batches", collection.DefaultMaxSyncBatches, "max pending batches to upload per queue per run")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -425,6 +435,15 @@ func runPeriodic(args []string) error {
 			return err
 		}
 	}
+	// Account-level cursor source wiring (desktop credential reader +
+	// pinned-host Cursor API client). Construction reads no credential
+	// and touches no network; the periodic cursor branch runs only when
+	// a local permit exists.
+	cursorOpts, err := cursorSyncOptions(dir, *serverURL, nil)
+	if err != nil {
+		return err
+	}
+	cursorOpts.MaxBatches = *maxBatches
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	result, err := collection.Run(ctx, collection.Options{
@@ -432,6 +451,7 @@ func runPeriodic(args []string) error {
 		ServerURL:        *serverURL,
 		MaxBatches:       *maxBatches,
 		CollectorVersion: version,
+		Cursor:           cursorOpts,
 	})
 	if err != nil {
 		return err
@@ -448,6 +468,12 @@ func runPeriodic(args []string) error {
 		if result.GrantSync.Note != "" {
 			fmt.Printf("grantSync: %s\n", result.GrantSync.Note)
 		}
+	}
+	if result.Cursor.Ran {
+		printCursorSyncResult(result.Cursor)
+	}
+	if result.Cursor.Status != "" && result.Cursor.Skipped != "" {
+		fmt.Printf("cursor sync: %s\n", result.Cursor.Skipped)
 	}
 	if result.Skipped != "" && result.NoGrants {
 		fmt.Printf("%s\n", result.Skipped)
@@ -938,6 +964,11 @@ Commands:
   sync [--file <batch.json>]  preflight device authorization, then upload a local batch
                               (or the oldest pending outbox batch) with the current
                               consent revision; revoked/deleted devices stop sending
+
+  resync --all [--dry-run] [--yes] [--max-batches N]
+                              retransmit archived synced batches to the bound device;
+                              dry-run is offline and read-only; execution confirms
+                              live authorization and preserves collection progress
 
 Planned by the approved architecture:
   sources / plugins            adapter visibility and enablement

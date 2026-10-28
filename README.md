@@ -190,6 +190,13 @@ The release end-to-end test is slower and gated explicitly:
 GOCACHE="$PWD/.gocache" GOPROXY=off TOKTRAIL_RELEASE_E2E=1 go test ./tools/release/ -run '^TestEndToEndRelease$' -count=1 -v
 ```
 
+## Known Cursor limitations (account-level network source)
+
+- The desktop login state is read strictly read-only (SQLite `mode=ro`, auth keys only); the credential stays in memory and never reaches disk, logs, or uploads.
+- The state database's WAL content is immutable but not readable in every state: already-checkpointed logins read fine at any time; a freshly created login may live only in the WAL until Cursor itself closes and checkpoints it. The error messages state this honestly — no claim is made that every login state is readable.
+- An unattended scheduled run can never complete the first-time authorization: the local confirmation must be given interactively via connect or `toktrail cursor enable`.
+- Account-level totals are aggregated by Cursor and may include usage from other machines. The first version supports one Cursor account source per user with one designated collector device; takeover is a website-side reassignment — the collector never claims an occupied executor slot.
+
 ## Contributing and security
 
 - See [CONTRIBUTING.md](CONTRIBUTING.md) for development rules and pull request expectations.

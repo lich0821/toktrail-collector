@@ -33,6 +33,8 @@ import (
 	"strings"
 	"time"
 
+	"toktrail-collector/internal/app/cursorsync"
+	"toktrail-collector/internal/local/cursorsource"
 	"toktrail-collector/internal/local/exportcommit"
 	"toktrail-collector/internal/local/grants"
 	"toktrail-collector/internal/local/outbox"
@@ -63,6 +65,13 @@ type Options struct {
 	CollectorVersion string
 	// Now is injectable for deterministic batch ids in tests.
 	Now func() time.Time
+	// Cursor, when non-nil, runs the account-level Cursor source sync
+	// inside the same runlock, under the same server grant policy, after
+	// the grant sync and before the local-grant collection. Nil keeps the
+	// periodic behavior exactly as before. The cursor sync is independent
+	// of local file grants: a cursor-only device (no enabled local
+	// grants) still syncs its account source.
+	Cursor *cursorsync.Options
 }
 
 // GrantOutcome reports what one granted source produced locally.
@@ -93,6 +102,9 @@ type Result struct {
 	// GrantSync reports the server-driven grant authorization sync that
 	// ran before any local scanning.
 	GrantSync GrantSync
+	// Cursor reports the account-level cursor source round (zeroed when
+	// the cursor wiring is absent).
+	Cursor cursorsync.Result
 
 	ExportedBatches int
 	ExportedRecords int
@@ -192,6 +204,55 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		return res, nil
 	}
 
+	// Account-level cursor source: runs under the same lock and server
+	// grant policy, independent of local file grants (a cursor-only
+	// device has no local grants but still syncs). Failures are
+	// non-fatal for the local tools: they are recorded and surfaced,
+	// never allowed to block the device-batch collection or drain.
+	if opt.Cursor != nil {
+		gate := cursorsync.Gate{
+			Paused:       policy.Paused,
+			AllowedTools: policy.AllowedTools,
+			HistoryFrom:  policy.HistoryFrom,
+		}
+		cursorRes, cursorErr := cursorsync.Sync(ctx, *opt.Cursor, gate)
+		if cursorErr != nil {
+			if cursorRes.Skipped == "" {
+				cursorRes.Skipped = cursorErr.Error()
+			} else {
+				cursorRes.Note = cursorRes.Note + "; " + cursorErr.Error()
+			}
+		}
+		res.Cursor = cursorRes
+		// Tool-status receipt for the account-level source. A cursor-only
+		// device has no local grant outcome, so without this report its
+		// first successful round would never produce a "connected"
+		// receipt on the server. It is sent ONLY for a fully successful,
+		// fully drained round — no error, ran, nothing skipped or noted,
+		// nothing pending — so failures, pauses, fence/consent stops and
+		// undrained backlogs are never dressed up as success. The report
+		// rides the existing tool-status channel (fresh consent preflight
+		// and fixed detail vocabulary). A report failure never blocks the
+		// local tools; it is surfaced as a note on the cursor round.
+		if cursorErr == nil && cursorRes.Ran && cursorRes.Skipped == "" &&
+			cursorRes.Note == "" && cursorRes.PendingRemaining == 0 {
+			status, detail := "synced", ""
+			if cursorRes.SyncedBatches == 0 {
+				status, detail = "no_new_records", "no new records since last confirmed baseline"
+			}
+			if _, err := synccmd.ReportToolStatuses(ctx, statedir.New(stateDir), synccmd.Options{
+				StateDir:     stateDir,
+				ServerURL:    opt.ServerURL,
+				HTTPClient:   opt.HTTPClient,
+				ToolStatuses: []synccmd.ToolStatus{{Tool: cursorsource.ToolName, Status: status, Detail: detail}},
+			}); err != nil && !errors.Is(err, synccmd.ErrDevicePaused) {
+				// Note is empty on this path by construction.
+				cursorRes.Note = fmt.Sprintf("cursor tool-status report failed: %v", err)
+				res.Cursor = cursorRes
+			}
+		}
+	}
+
 	// (Re)load grants after the sync: newly confirmed tools may have gained
 	// managed default-directory grants that this run must already collect.
 	enabledGrants, err := grantStore.Enabled()
@@ -200,6 +261,16 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	}
 	res.Grants = len(enabledGrants)
 	if len(enabledGrants) == 0 {
+		// A cursor-only device (no local file grants) is NOT a no-op:
+		// the account-level source either ran this round or holds a
+		// local permit (res.Cursor.Status is set whenever a permit
+		// exists). Reporting NoGrants/"nothing to collect" there would
+		// hide a successful cursor round from the caller; the cursor
+		// outcome — synced records or its skip reason — lives in
+		// res.Cursor.
+		if opt.Cursor != nil && (res.Cursor.Ran || res.Cursor.Status != "") {
+			return res, nil
+		}
 		res.NoGrants = true
 		res.Skipped = "no enabled source grants; nothing to collect (sources enable requires explicit --source and --input)"
 		return res, nil

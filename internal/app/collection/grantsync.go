@@ -455,6 +455,16 @@ func mergeManagedGrants(grantStore grants.Store, view managedconsent.View, homeD
 			pending[tool] = "unknown tool: not supported by this collector version"
 			continue
 		}
+		if spec.IsAccountNetwork() {
+			// Account-network tools (Cursor) are never auto-granted: their
+			// local permit requires an explicit first-time confirmation
+			// (connect or `toktrail cursor enable`) that an unattended sync
+			// must not complete by itself, and their server-side state
+			// travels on self.accountSources instead of the tool-grant
+			// channel. They are also never "pending" here: the account
+			// source state governs them.
+			continue
+		}
 		def := spec.ResolveDefaultInput(homeDir)
 		pair, pairExists := grantOf(cfg, spec.Source, def)
 		if pairExists {

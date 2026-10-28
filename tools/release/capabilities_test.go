@@ -61,8 +61,8 @@ func TestBuildCapabilitiesMatchesRegistry(t *testing.T) {
 	const ver = "v1.2.3"
 	c := mustBuildCapabilities(t, ver)
 
-	if c.Schema != CapabilitiesSchema || CapabilitiesSchema != 1 {
-		t.Errorf("schema = %d, want 1", c.Schema)
+	if c.Schema != CapabilitiesSchema || CapabilitiesSchema != 2 {
+		t.Errorf("schema = %d, want 2", c.Schema)
 	}
 	if c.Product != distribution.ProductName {
 		t.Errorf("product = %q, want %q", c.Product, distribution.ProductName)
@@ -126,22 +126,22 @@ func TestCapabilitiesMarshalFixedFormat(t *testing.T) {
 		t.Fatalf("Marshal is not deterministic:\n%s\n---\n%s", data, again)
 	}
 
-	// Exactly four top-level keys with the required names and types.
+	// Exactly five top-level keys with the required names and types.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatalf("marshal produced invalid JSON: %v\n%s", err, data)
 	}
-	if len(raw) != 4 {
-		t.Fatalf("document has %d top-level fields, want exactly 4: %v", len(raw), raw)
+	if len(raw) != 5 {
+		t.Fatalf("document has %d top-level fields, want exactly 5: %v", len(raw), raw)
 	}
-	for _, key := range []string{"schema", "product", "version", "tools"} {
+	for _, key := range []string{"schema", "product", "version", "tools", "sources"} {
 		if _, ok := raw[key]; !ok {
 			t.Fatalf("document missing required field %q: %s", key, data)
 		}
 	}
 	var schema int
-	if err := json.Unmarshal(raw["schema"], &schema); err != nil || schema != 1 {
-		t.Errorf("schema = %d (err %v), want number 1", schema, err)
+	if err := json.Unmarshal(raw["schema"], &schema); err != nil || schema != 2 {
+		t.Errorf("schema = %d (err %v), want number 2", schema, err)
 	}
 	var product string
 	if err := json.Unmarshal(raw["product"], &product); err != nil || product != "toktrail-collector" {
@@ -173,6 +173,59 @@ func TestCapabilitiesMarshalFixedFormat(t *testing.T) {
 	}
 	if strings.Join(parsed.Tools, "\x00") != strings.Join(c.Tools, "\x00") {
 		t.Errorf("round trip tools mismatch: %q vs %q", parsed.Tools, c.Tools)
+	}
+	if len(parsed.Sources) != len(c.Sources) {
+		t.Fatalf("round trip sources length = %d, want %d", len(parsed.Sources), len(c.Sources))
+	}
+	for i := range c.Sources {
+		if parsed.Sources[i] != c.Sources[i] {
+			t.Errorf("round trip sources[%d] = %+v, want %+v", i, parsed.Sources[i], c.Sources[i])
+		}
+	}
+}
+
+// TestParseCapabilitiesAcceptsLegacySchema1 pins that already-published
+// schema-1 documents (tools only, every source implicitly local) stay
+// readable, while the same document with a sources field fails closed.
+func TestParseCapabilitiesAcceptsLegacySchema1(t *testing.T) {
+	legacy := capabilitiesDocJSON(1, "toktrail-collector", "v0.1.0", `"Codex", "Cursor"`)
+	c, err := ParseCapabilities(legacy)
+	if err != nil {
+		t.Fatalf("legacy schema 1 document must parse: %v\n%s", err, legacy)
+	}
+	if c.Schema != 1 || len(c.Sources) != 0 || len(c.Tools) != 2 {
+		t.Fatalf("unexpected legacy parse: %+v", c)
+	}
+	withSources := []byte(strings.Replace(string(legacy), `"tools": [`, `"sources": [{"tool":"Codex","source":"codex-jsonl","mode":"local","protocol":1}], "tools": [`, 1))
+	if _, err := ParseCapabilities(withSources); err == nil {
+		t.Fatal("schema 1 document carrying sources must fail closed")
+	}
+}
+
+// TestParseCapabilitiesRejectsInvalidSources pins the closed schema-2
+// sources set: only known modes, protocol 1, registered tool names and
+// adapter-shaped source ids are accepted.
+func TestParseCapabilitiesRejectsInvalidSources(t *testing.T) {
+	base := func(sources string) []byte {
+		return []byte("{\n  \"schema\": 2,\n  \"product\": \"toktrail-collector\",\n  \"version\": \"v0.1.0\",\n  \"tools\": [\"Codex\", \"Cursor\"],\n  \"sources\": [" + sources + "]\n}\n")
+	}
+	valid := base(`{"tool":"Codex","source":"codex-jsonl","mode":"local","protocol":1},{"tool":"Cursor","source":"cursor-dashboard-api","mode":"account-network","protocol":1}`)
+	if _, err := ParseCapabilities(valid); err != nil {
+		t.Fatalf("valid schema 2 document rejected: %v\n%s", err, valid)
+	}
+	for name, doc := range map[string][]byte{
+		"empty sources":       base(``),
+		"unknown mode":        base(`{"tool":"Codex","source":"codex-jsonl","mode":"remote","protocol":1}`),
+		"unknown protocol":    base(`{"tool":"Codex","source":"codex-jsonl","mode":"local","protocol":2}`),
+		"tool not in tools":   base(`{"tool":"Other","source":"codex-jsonl","mode":"local","protocol":1}`),
+		"duplicate tool":      base(`{"tool":"Codex","source":"codex-jsonl","mode":"local","protocol":1},{"tool":"codex","source":"codex-jsonl","mode":"local","protocol":1}`),
+		"bad source id":       base(`{"tool":"Codex","source":"../evil","mode":"local","protocol":1}`),
+		"uppercase source id": base(`{"tool":"Codex","source":"Codex-JSONL","mode":"local","protocol":1}`),
+		"bad tool name":       base(`{"tool":"../evil","source":"codex-jsonl","mode":"local","protocol":1}`),
+	} {
+		if _, err := ParseCapabilities(doc); err == nil {
+			t.Errorf("%s: schema 2 sources accepted, want rejected:\n%s", name, doc)
+		}
 	}
 }
 

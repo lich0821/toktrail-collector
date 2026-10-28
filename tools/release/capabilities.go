@@ -16,16 +16,27 @@ import (
 )
 
 // Capabilities metadata constants. The capabilities document is a small,
-// strictly fixed-format, version-bound statement of which developer tools a
-// release can collect. It is generated exactly once per release by the
-// assembler from the single canonical tool registry
-// (internal/source/registry.SupportedTools) - the same registry that is
-// compiled into every platform binary - so all platforms of a version share
-// one identical document. There is no per-platform variant and therefore no
-// possibility of conflicting platform capabilities.
+// strictly fixed-format, version-bound statement of which developer tools
+// a release can collect and HOW each source is collected. It is generated
+// exactly once per release by the assembler from the single canonical
+// tool registry (internal/source/registry.SupportedTools) - the same
+// registry that is compiled into every platform binary - so all platforms
+// of a version share one identical document. There is no per-platform
+// variant and therefore no possibility of conflicting platform
+// capabilities.
+//
+// Schema 2 adds the closed `sources` set ({tool, source, mode, protocol})
+// so the website can distinguish account-network sources (Cursor: direct
+// authenticated requests to the vendor, driven by a locally confirmed
+// permit) from plain local-file sources. A `tools` entry alone no longer
+// expresses the collection mode. Schema 1 documents (tools only, every
+// source implicitly local) remain readable for already-published releases.
 const (
-	// CapabilitiesSchema is the only capabilities schema this code accepts.
-	CapabilitiesSchema = 1
+	// CapabilitiesSchema is the schema this code emits.
+	CapabilitiesSchema = 2
+	// capabilitiesLegacySchema is the earlier schema still accepted on
+	// read (no sources field; every tool implicitly collects locally).
+	capabilitiesLegacySchema = 1
 	// CapabilitiesFileName is the canonical capabilities metadata filename.
 	CapabilitiesFileName = "capabilities.json"
 	// CapabilitiesSignatureFileName is the detached Ed25519 signature of the
@@ -39,7 +50,28 @@ const (
 	MaxCapabilityTools = 64
 	// MaxCapabilityToolNameLen bounds one tool name (ASCII pattern below).
 	MaxCapabilityToolNameLen = 64
+	// MaxCapabilitySourceIDLen bounds one source id.
+	MaxCapabilitySourceIDLen = 64
 )
+
+// Source collection modes (capabilities sources[].mode).
+const (
+	// SourceModeLocal marks sources collected by reading granted local
+	// files.
+	SourceModeLocal = "local"
+	// SourceModeAccountNetwork marks sources collected by direct
+	// authenticated requests to the vendor's account-level API, driven by
+	// a locally confirmed permit.
+	SourceModeAccountNetwork = "account-network"
+)
+
+// SourceProtocol1 is the only account-source protocol generation.
+const SourceProtocol1 = 1
+
+// CapabilitySourceIDRegex is the exact source-id pattern accepted in the
+// sources set: it matches every compiled-in adapter source id shape
+// ("codex-jsonl", "cursor-dashboard-api") and excludes anything else.
+var CapabilitySourceIDRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
 
 // CapabilityToolNameRegex is the exact tool-name pattern the website and
 // receipts accept: ASCII-only, starting with an alphanumeric, allowing
@@ -50,20 +82,31 @@ const (
 // separators, path-traversal elements, control characters and non-ASCII.
 var CapabilityToolNameRegex = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,63}$`)
 
+// SourceCapability declares one collectible source and its mode.
+type SourceCapability struct {
+	Tool     string `json:"tool"`
+	Source   string `json:"source"`
+	Mode     string `json:"mode"`
+	Protocol int    `json:"protocol"`
+}
+
 // Capabilities is the signed, version-bound capability statement of a
 // release. The field set is closed and fixed: {schema, product, version,
-// tools}. Unknown fields, wrong types, or trailing data are all rejected,
-// mirroring the strictness of the release manifest.
+// tools, sources}. Unknown fields, wrong types, or trailing data are all
+// rejected, mirroring the strictness of the release manifest.
 type Capabilities struct {
-	Schema  int      `json:"schema"`
-	Product string   `json:"product"`
-	Version string   `json:"version"`
-	Tools   []string `json:"tools"`
+	Schema  int                `json:"schema"`
+	Product string             `json:"product"`
+	Version string             `json:"version"`
+	Tools   []string           `json:"tools"`
+	Sources []SourceCapability `json:"sources,omitempty"`
 }
 
 // BuildCapabilities derives the capability statement for version from the
 // one canonical tool registry. The version is validated and embedded in the
 // document, binding the capability statement to that release version.
+// Every registered tool appears in both `tools` and the closed `sources`
+// set with its collection mode.
 func BuildCapabilities(version string) (*Capabilities, error) {
 	if _, err := distribution.ParseVersion(version); err != nil {
 		return nil, fmt.Errorf("capabilities version: %w", err)
@@ -76,6 +119,7 @@ func BuildCapabilities(version string) (*Capabilities, error) {
 		return nil, fmt.Errorf("tool registry has %d entries, exceeds limit %d", len(specs), MaxCapabilityTools)
 	}
 	tools := make([]string, 0, len(specs))
+	sources := make([]SourceCapability, 0, len(specs))
 	seen := make(map[string]bool, len(specs))
 	for _, spec := range specs {
 		if err := validateCapabilityToolName(spec.Tool); err != nil {
@@ -87,12 +131,26 @@ func BuildCapabilities(version string) (*Capabilities, error) {
 		}
 		seen[key] = true
 		tools = append(tools, spec.Tool)
+		if err := validateCapabilitySourceID(spec.Source); err != nil {
+			return nil, fmt.Errorf("registry source id: %w", err)
+		}
+		mode := SourceModeLocal
+		if spec.IsAccountNetwork() {
+			mode = SourceModeAccountNetwork
+		}
+		sources = append(sources, SourceCapability{
+			Tool:     spec.Tool,
+			Source:   spec.Source,
+			Mode:     mode,
+			Protocol: SourceProtocol1,
+		})
 	}
 	return &Capabilities{
 		Schema:  CapabilitiesSchema,
 		Product: distribution.ProductName,
 		Version: version,
 		Tools:   tools,
+		Sources: sources,
 	}, nil
 }
 
@@ -139,8 +197,8 @@ func ParseCapabilities(data []byte) (*Capabilities, error) {
 }
 
 func (c *Capabilities) validate() error {
-	if c.Schema != CapabilitiesSchema {
-		return fmt.Errorf("capabilities schema %d, want %d", c.Schema, CapabilitiesSchema)
+	if c.Schema != CapabilitiesSchema && c.Schema != capabilitiesLegacySchema {
+		return fmt.Errorf("capabilities schema %d, want %d (or legacy %d)", c.Schema, CapabilitiesSchema, capabilitiesLegacySchema)
 	}
 	if c.Product != distribution.ProductName {
 		return fmt.Errorf("capabilities product %q, want %q", c.Product, distribution.ProductName)
@@ -164,6 +222,61 @@ func (c *Capabilities) validate() error {
 			return fmt.Errorf("tools[%d] %q duplicates another entry case-insensitively", i, name)
 		}
 		seen[key] = true
+	}
+	if c.Schema == capabilitiesLegacySchema {
+		// Legacy documents carry no sources; everything is implicitly a
+		// local source. A sources field on a schema-1 document is a
+		// contradiction and fails closed.
+		if len(c.Sources) > 0 {
+			return errors.New("schema 1 capabilities must not carry sources")
+		}
+		return nil
+	}
+	// Schema 2: the closed sources set is required and must cover the
+	// declared tools exactly.
+	if len(c.Sources) == 0 {
+		return errors.New("schema 2 capabilities requires a non-empty sources set")
+	}
+	if len(c.Sources) > MaxCapabilityTools {
+		return fmt.Errorf("capabilities has %d sources, exceeds limit %d", len(c.Sources), MaxCapabilityTools)
+	}
+	seenSources := make(map[string]bool, len(c.Sources))
+	for i, src := range c.Sources {
+		if err := validateCapabilityToolName(src.Tool); err != nil {
+			return fmt.Errorf("sources[%d]: %w", i, err)
+		}
+		if err := validateCapabilitySourceID(src.Source); err != nil {
+			return fmt.Errorf("sources[%d]: %w", i, err)
+		}
+		switch src.Mode {
+		case SourceModeLocal, SourceModeAccountNetwork:
+		default:
+			return fmt.Errorf("sources[%d]: unknown mode %q", i, src.Mode)
+		}
+		if src.Protocol != SourceProtocol1 {
+			return fmt.Errorf("sources[%d]: unknown protocol %d", i, src.Protocol)
+		}
+		if !seen[strings.ToLower(src.Tool)] {
+			return fmt.Errorf("sources[%d]: tool %q is not in the tools list", i, src.Tool)
+		}
+		key := strings.ToLower(src.Tool)
+		if seenSources[key] {
+			return fmt.Errorf("sources[%d]: tool %q duplicates another source entry", i, src.Tool)
+		}
+		seenSources[key] = true
+	}
+	return nil
+}
+
+// validateCapabilitySourceID enforces the source-id pattern for the
+// sources set (lowercase alphanumeric plus dashes, like every compiled-in
+// adapter source id).
+func validateCapabilitySourceID(id string) error {
+	if !CapabilitySourceIDRegex.MatchString(id) {
+		return fmt.Errorf("source id %q does not match the accepted pattern ^[a-z0-9][a-z0-9-]{0,63}$", id)
+	}
+	if len(id) > MaxCapabilitySourceIDLen {
+		return fmt.Errorf("source id %q exceeds max length %d", id, MaxCapabilitySourceIDLen)
 	}
 	return nil
 }

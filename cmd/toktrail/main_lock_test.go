@@ -18,6 +18,7 @@ func TestStateCommandsRejectConcurrentAccessBeforeAnyWork(t *testing.T) {
 	commands := map[string]func([]string) error{
 		"bind": runBind, "status": runStatus, "scan": runScan,
 		"preview": runPreview, "export": runExport, "sync": runSync,
+		"resync": func(args []string) error { return runResync(append([]string{"--all", "--yes"}, args...)) },
 	}
 	for name, run := range commands {
 		t.Run(name, func(t *testing.T) {
