@@ -14,6 +14,28 @@ import (
 
 var exportFields = []string{"recordKey", "groupKey", "resetKey", "kind", "occurredAt", "tool", "model", "input", "cacheRead", "cacheWrite", "output", "adapterVersion", "sourceType", "mutationType"}
 
+func TestInvalidUTF8UsageJSONFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.json")
+	if err := os.WriteFile(path, []byte("{\"model\":\""+string([]byte{0xff})+"\"}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := usagejson.LoadRecords(path); err == nil || !strings.Contains(err.Error(), "UTF-8") {
+		t.Fatalf("invalid UTF-8 must fail before decoding: %v", err)
+	}
+}
+
+func TestInvalidModelIsNotDroppedDuringExport(t *testing.T) {
+	input := writeJSONFile(t, []map[string]any{{
+		"recordKey": "invalid-model", "kind": "delta", "occurredAt": "2026-10-20T01:00:00Z",
+		"tool": "Codex", "model": map[string]any{"id": "not-a-string"},
+		"input": "1", "output": "1", "adapterVersion": "test", "sourceType": "fixture",
+	}})
+	_, err := pipeline.PrepareExport(adapter.Options{Input: input, Output: filepath.Join(t.TempDir(), "batch.json"), BatchID: "invalid-model"})
+	if err == nil || !strings.Contains(err.Error(), "model") {
+		t.Fatalf("invalid model should fail export: %v", err)
+	}
+}
+
 func TestScanSupportsServerFixtureFormat(t *testing.T) {
 	input := writeJSONFile(t, []map[string]any{
 		{"name": "complete", "record": map[string]any{
@@ -271,8 +293,8 @@ func TestLoadRecordsWhitelistsFreeFormFields(t *testing.T) {
 			}
 		}
 	}
-	if records[0]["model"] != "unknown" {
-		t.Fatalf("expected private model to collapse to unknown, got %#v", records[0]["model"])
+	if records[0]["model"] != "company-private-route-42" {
+		t.Fatalf("expected recorded model, got %#v", records[0]["model"])
 	}
 	if records[1]["model"] != "gpt-4o" {
 		t.Fatalf("expected public OpenAI model to survive, got %#v", records[1]["model"])
@@ -280,8 +302,8 @@ func TestLoadRecordsWhitelistsFreeFormFields(t *testing.T) {
 	if records[2]["model"] != "claude-sonnet-4-5" {
 		t.Fatalf("expected public Claude model to survive, got %#v", records[2]["model"])
 	}
-	if records[3]["model"] != "unknown" {
-		t.Fatalf("expected non-public Claude model to collapse to unknown, got %#v", records[3]["model"])
+	if records[3]["model"] != "claude-internal-preview" {
+		t.Fatalf("expected recorded Claude model, got %#v", records[3]["model"])
 	}
 	// The idempotent identity is untouched by the projection.
 	for idx, key := range []string{"privacy-1", "privacy-2", "privacy-3", "privacy-4"} {
@@ -329,7 +351,7 @@ func TestExportWritesOnlyWhitelistedFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(b), "sess-secret-123") || strings.Contains(string(b), "secret/project") || strings.Contains(string(b), "acquisition memo") || strings.Contains(string(b), "company-private-route-42") {
+	if strings.Contains(string(b), "sess-secret-123") || strings.Contains(string(b), "secret/project") || strings.Contains(string(b), "acquisition memo") {
 		t.Fatalf("batch payload leaked private input content: %s", b)
 	}
 	var batch adapter.Batch
@@ -346,8 +368,8 @@ func TestExportWritesOnlyWhitelistedFields(t *testing.T) {
 				t.Errorf("batch record %d leaked non-whitelisted field %q", idx, field)
 			}
 		}
-		if record["model"] != "unknown" {
-			t.Errorf("batch record %d model not collapsed to unknown: %#v", idx, record["model"])
+		if record["model"] != "company-private-route-42" {
+			t.Errorf("batch record %d model changed: %#v", idx, record["model"])
 		}
 	}
 }

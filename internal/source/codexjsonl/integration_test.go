@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"toktrail-collector/internal/local/outbox"
 	"toktrail-collector/internal/source/adapter"
+	"toktrail-collector/internal/source/codexjsonl"
 	"toktrail-collector/internal/source/pipeline"
 )
 
@@ -47,14 +49,17 @@ func TestCodexJSONLConvertsTokenCountDeltasWithoutPrivateFields(t *testing.T) {
 		t.Fatalf("unexpected tool distribution: %#v", res.Tools)
 	}
 	record := res.Records[0]
-	if record["tool"] != "Codex" || record["model"] != "unknown" || record["input"] != "47" || record["cacheRead"] != "10" || record["cacheWrite"] != "3" || record["output"] != "40" {
+	if record["tool"] != "Codex" || record["model"] != privateModel || record["input"] != "47" || record["cacheRead"] != "10" || record["cacheWrite"] != "3" || record["output"] != "40" {
 		t.Fatalf("unexpected codex record: %#v", record)
 	}
 	wire, err := json.Marshal(record)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, marker := range []string{privateSession, privateModel, privatePrompt, dir} {
+	// The turn_context model is a protocol field and is preserved verbatim
+	// (only its wire shape is validated); session ids, prompts, and local
+	// paths must still never appear in the exported record.
+	for _, marker := range []string{privateSession, privatePrompt, dir} {
 		if strings.Contains(string(wire), marker) {
 			t.Fatalf("private marker %q leaked in %s", marker, string(wire))
 		}
@@ -462,6 +467,518 @@ func TestCodexJSONLRejectsMissingOrMalformedCounters(t *testing.T) {
 	}
 }
 
+func TestCodexJSONLAttributesTurnContextModel(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "sessions")
+	if err := os.MkdirAll(input, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONLFile(t, filepath.Join(input, "model.jsonl"), []map[string]any{
+		codexTurn("2026-10-20T01:00:00Z", "gpt-5"),
+		codexCount("2026-10-20T01:01:00Z", 100, 20, 5, 40),
+		codexCount("2026-10-20T01:02:00Z", 160, 30, 8, 80),
+		codexTurn("2026-10-20T01:03:00Z", "gpt-5"),
+		codexCount("2026-10-20T01:04:00Z", 210, 40, 10, 100),
+	})
+	res, err := pipeline.Scan(adapter.Options{Source: adapter.CodexJSONLSource, Input: input})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RecordCount != 2 || res.ValidRecords != 2 || res.InvalidRecords != 0 {
+		t.Fatalf("unexpected scan result: %#v", res)
+	}
+	// The second delta straddles a turn boundary, but both turns recorded
+	// the same model, so attribution stays exact.
+	for idx, want := range []string{"gpt-5", "gpt-5"} {
+		if res.Records[idx]["model"] != want {
+			t.Fatalf("record %d model = %v, want %q", idx, res.Records[idx]["model"], want)
+		}
+	}
+	if res.Records[0]["input"] != "47" || res.Records[1]["input"] != "38" {
+		t.Fatalf("unexpected deltas: %#v", res.Records)
+	}
+}
+
+func TestCodexJSONLModelSwitchInsideIntervalReportsUnknown(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "sessions")
+	if err := os.MkdirAll(input, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONLFile(t, filepath.Join(input, "switch.jsonl"), []map[string]any{
+		codexTurn("2026-10-20T01:00:00Z", "gpt-4o"),
+		codexCount("2026-10-20T01:01:00Z", 100, 0, 0, 10),
+		codexCount("2026-10-20T01:02:00Z", 150, 0, 0, 20),
+		codexTurn("2026-10-20T01:03:00Z", "gpt-5"),
+		codexCount("2026-10-20T01:04:00Z", 220, 0, 0, 30),
+		codexCount("2026-10-20T01:05:00Z", 260, 0, 0, 40),
+	})
+	res, err := pipeline.Scan(adapter.Options{Source: adapter.CodexJSONLSource, Input: input})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RecordCount != 3 || res.ValidRecords != 3 {
+		t.Fatalf("unexpected scan result: %#v", res)
+	}
+	if res.Records[0]["model"] != "gpt-4o" {
+		t.Fatalf("first delta model = %v, want gpt-4o", res.Records[0]["model"])
+	}
+	// The middle delta spans the tail of the gpt-4o turn and the head of
+	// the gpt-5 turn; the cumulative counters cannot split it, so it must
+	// not be attributed to either model — in particular not to the model
+	// recorded at the end of the interval.
+	if got := res.Records[1]["model"]; got != "unknown" {
+		t.Fatalf("straddling delta model = %v, want unknown (must not inherit the interval-end model gpt-5)", got)
+	}
+	if res.Records[2]["model"] != "gpt-5" {
+		t.Fatalf("last delta model = %v, want gpt-5", res.Records[2]["model"])
+	}
+	// Attribution never changes the token deltas themselves.
+	if res.Records[1]["input"] != "70" || res.Records[1]["output"] != "10" {
+		t.Fatalf("unexpected straddling delta: %#v", res.Records[1])
+	}
+}
+
+func TestCodexJSONLModelSwitchWithoutCountsStillBlocksAttribution(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "sessions")
+	if err := os.MkdirAll(input, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONLFile(t, filepath.Join(input, "zero-count-switch.jsonl"), []map[string]any{
+		codexTurn("2026-10-20T01:00:00Z", "gpt-4o"),
+		codexCount("2026-10-20T01:01:00Z", 100, 0, 0, 10),
+		codexCount("2026-10-20T01:02:00Z", 150, 0, 0, 20),
+		codexTurn("2026-10-20T01:03:00Z", "gpt-5"),
+		codexTurn("2026-10-20T01:04:00Z", "gpt-4o"),
+		codexCount("2026-10-20T01:05:00Z", 220, 0, 0, 30),
+	})
+	res, err := pipeline.Scan(adapter.Options{Source: adapter.CodexJSONLSource, Input: input})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RecordCount != 2 {
+		t.Fatalf("unexpected scan result: %#v", res)
+	}
+	// The interval contains a zero-count turn recorded with a different
+	// model; the cumulative counters cannot prove it consumed nothing, so
+	// the delta is still ambiguous.
+	if got := res.Records[1]["model"]; got != "unknown" {
+		t.Fatalf("delta across zero-count model switch = %v, want unknown", got)
+	}
+	if res.Records[0]["model"] != "gpt-4o" {
+		t.Fatalf("first delta model = %v, want gpt-4o", res.Records[0]["model"])
+	}
+}
+
+func TestCodexJSONLMissingTurnContextModelReportsUnknown(t *testing.T) {
+	cases := []struct {
+		name     string
+		lines    []map[string]any
+		expected []string
+	}{
+		{
+			name: "observation before first turn_context",
+			lines: []map[string]any{
+				codexCount("2026-10-20T01:00:00Z", 100, 0, 0, 10),
+				codexTurn("2026-10-20T01:01:00Z", "gpt-5"),
+				codexCount("2026-10-20T01:02:00Z", 150, 0, 0, 20),
+				codexCount("2026-10-20T01:03:00Z", 220, 0, 0, 30),
+			},
+			expected: []string{"unknown", "gpt-5"},
+		},
+		{
+			name: "turn without recorded model",
+			lines: []map[string]any{
+				codexTurn("2026-10-20T01:00:00Z", "gpt-5"),
+				codexCount("2026-10-20T01:01:00Z", 100, 0, 0, 10),
+				codexCount("2026-10-20T01:02:00Z", 150, 0, 0, 20),
+				codexTurn("2026-10-20T01:03:00Z", nil),
+				codexCount("2026-10-20T01:04:00Z", 220, 0, 0, 30),
+				codexCount("2026-10-20T01:05:00Z", 260, 0, 0, 40),
+			},
+			expected: []string{"gpt-5", "unknown", "unknown"},
+		},
+		{
+			name: "turn with null model",
+			lines: []map[string]any{
+				codexTurn("2026-10-20T01:00:00Z", "gpt-5"),
+				codexCount("2026-10-20T01:01:00Z", 100, 0, 0, 10),
+				codexCount("2026-10-20T01:02:00Z", 150, 0, 0, 20),
+				codexTurnNullModel("2026-10-20T01:03:00Z"),
+				codexCount("2026-10-20T01:04:00Z", 220, 0, 0, 30),
+				codexCount("2026-10-20T01:05:00Z", 260, 0, 0, 40),
+			},
+			expected: []string{"gpt-5", "unknown", "unknown"},
+		},
+		{
+			name: "turn with null payload",
+			lines: []map[string]any{
+				codexTurn("2026-10-20T01:00:00Z", "gpt-5"),
+				codexCount("2026-10-20T01:01:00Z", 100, 0, 0, 10),
+				codexCount("2026-10-20T01:02:00Z", 150, 0, 0, 20),
+				codexTurnNullPayload("2026-10-20T01:03:00Z"),
+				codexCount("2026-10-20T01:04:00Z", 220, 0, 0, 30),
+				codexCount("2026-10-20T01:05:00Z", 260, 0, 0, 40),
+			},
+			expected: []string{"gpt-5", "unknown", "unknown"},
+		},
+		{
+			name: "no turn_context lines at all",
+			lines: []map[string]any{
+				codexCount("2026-10-20T01:00:00Z", 100, 0, 0, 10),
+				codexCount("2026-10-20T01:01:00Z", 150, 0, 0, 20),
+				codexCount("2026-10-20T01:02:00Z", 220, 0, 0, 30),
+			},
+			expected: []string{"unknown", "unknown"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			input := filepath.Join(dir, "sessions")
+			if err := os.MkdirAll(input, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			writeJSONLFile(t, filepath.Join(input, "missing.jsonl"), tc.lines)
+			res, err := pipeline.Scan(adapter.Options{Source: adapter.CodexJSONLSource, Input: input})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.RecordCount != len(tc.expected) {
+				t.Fatalf("unexpected scan result: %#v", res)
+			}
+			for idx, want := range tc.expected {
+				if res.Records[idx]["model"] != want {
+					t.Fatalf("record %d model = %v, want %q", idx, res.Records[idx]["model"], want)
+				}
+			}
+		})
+	}
+}
+
+func TestCodexJSONLPreservesRecordedModelVerbatim(t *testing.T) {
+	for _, model := range []string{
+		"gpt-5-codex",
+		"Company_Private-Route.42+preview",
+		"my custom route",
+		"GPT-5",
+	} {
+		t.Run(model, func(t *testing.T) {
+			dir := t.TempDir()
+			input := filepath.Join(dir, "sessions")
+			if err := os.MkdirAll(input, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			writeJSONLFile(t, filepath.Join(input, "verbatim.jsonl"), []map[string]any{
+				codexTurn("2026-10-20T01:00:00Z", model),
+				codexCount("2026-10-20T01:01:00Z", 100, 0, 0, 10),
+				codexCount("2026-10-20T01:02:00Z", 150, 0, 0, 20),
+			})
+			res, err := pipeline.Scan(adapter.Options{Source: adapter.CodexJSONLSource, Input: input})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.RecordCount != 1 || res.Records[0]["model"] != model {
+				t.Fatalf("model = %#v, want verbatim %q", res.Records[0]["model"], model)
+			}
+		})
+	}
+}
+
+func TestCodexJSONLRejectsInvalidTurnContextModel(t *testing.T) {
+	cases := map[string]any{
+		"control-character": "gpt-5\u0001",
+		"too-long":          strings.Repeat("m", 129),
+		"empty":             "",
+		"whitespace-only":   "   ",
+		"number":            123,
+		"object":            map[string]any{"id": "gpt-5"},
+	}
+	for name, model := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			input := filepath.Join(dir, "sessions")
+			if err := os.MkdirAll(input, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			writeJSONLFile(t, filepath.Join(input, "invalid-model.jsonl"), []map[string]any{
+				codexTurn("2026-10-20T01:00:00Z", model),
+				codexCount("2026-10-20T01:01:00Z", 100, 0, 0, 10),
+				codexCount("2026-10-20T01:02:00Z", 150, 0, 0, 20),
+			})
+			_, err := pipeline.Scan(adapter.Options{Source: adapter.CodexJSONLSource, Input: input})
+			if err == nil {
+				t.Fatalf("expected invalid turn_context model %v to be rejected", model)
+			}
+			if !strings.Contains(err.Error(), "turn_context model") {
+				t.Fatalf("unexpected error for %s: %v", name, err)
+			}
+		})
+	}
+}
+
+func TestCodexJSONLRejectsMalformedTurnContextLines(t *testing.T) {
+	dir := t.TempDir()
+	cases := map[string]struct {
+		line           string
+		expectedSubstr string
+	}{
+		"payload-string": {
+			line:           `{"timestamp":"2026-10-20T01:00:00Z","type":"turn_context","payload":"not-an-object"}`,
+			expectedSubstr: "turn_context malformed payload",
+		},
+		"payload-number": {
+			line:           `{"timestamp":"2026-10-20T01:00:00Z","type":"turn_context","payload":123}`,
+			expectedSubstr: "turn_context malformed payload",
+		},
+		"invalid-timestamp": {
+			line:           `{"timestamp":"not-a-timestamp","type":"turn_context","payload":{"model":"gpt-5"}}`,
+			expectedSubstr: "invalid timestamp",
+		},
+		"missing-timestamp": {
+			line:           `{"type":"turn_context","payload":{"model":"gpt-5"}}`,
+			expectedSubstr: "invalid timestamp",
+		},
+	}
+	for name, tc := range cases {
+		path := filepath.Join(dir, name+".jsonl")
+		if err := os.WriteFile(path, []byte(tc.line+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := pipeline.Scan(adapter.Options{Source: adapter.CodexJSONLSource, Input: path})
+		if err == nil {
+			t.Fatalf("expected %s to be rejected", name)
+		}
+		if !strings.Contains(err.Error(), tc.expectedSubstr) {
+			t.Fatalf("unexpected error for %s (expected %q): %v", name, tc.expectedSubstr, err)
+		}
+	}
+}
+
+func TestCodexJSONLExportFilterStaysStrictAcrossModelEnrichment(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "sessions")
+	if err := os.MkdirAll(input, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONLFile(t, filepath.Join(input, "model.jsonl"), []map[string]any{
+		codexTurn("2026-10-20T01:00:00Z", "gpt-5"),
+		codexCount("2026-10-20T01:01:00Z", 100, 20, 5, 40),
+		codexCount("2026-10-20T01:02:00Z", 160, 30, 8, 80),
+	})
+	res, err := pipeline.Scan(adapter.Options{Source: adapter.CodexJSONLSource, Input: input})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RecordCount != 1 || res.Records[0]["model"] != "gpt-5" {
+		t.Fatalf("fixture did not produce the recorded model record: %#v", res)
+	}
+	fresh := res.Records
+
+	storeHistory := func(t *testing.T, records []adapter.Record) string {
+		t.Helper()
+		stateDir := t.TempDir()
+		file := filepath.Join(stateDir, "history.json")
+		payload, err := json.Marshal(adapter.Batch{BatchID: "history", Records: records})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(file, payload, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := outbox.New(stateDir).Save(outbox.Outbox{Batches: []outbox.BatchEntry{{BatchID: "history", File: file, Source: adapter.CodexJSONLSource, Status: outbox.StatusSynced}}}); err != nil {
+			t.Fatal(err)
+		}
+		return stateDir
+	}
+
+	// Identical history (same recorded model) dedups cleanly.
+	stateDir := storeHistory(t, fresh)
+	got, err := codexjsonl.Adapter().FilterForExport(adapter.Options{Source: adapter.CodexJSONLSource, StateDir: stateDir}, fresh)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("identical model history must dedup: %v %v", got, err)
+	}
+
+	// A previously exported record with a different model value — for
+	// example exported before model collection existed — is an
+	// immutable-history conflict: strict idempotency, no upgrade path.
+	for _, stale := range []string{"unknown", "gpt-4o"} {
+		old := make(adapter.Record, len(fresh[0]))
+		for k, v := range fresh[0] {
+			old[k] = v
+		}
+		old["model"] = stale
+		stateDir := storeHistory(t, []adapter.Record{old})
+		if _, err := codexjsonl.Adapter().FilterForExport(adapter.Options{Source: adapter.CodexJSONLSource, StateDir: stateDir}, fresh); err == nil {
+			t.Fatalf("stored model %q drifting to a recorded model must fail closed", stale)
+		} else if !strings.Contains(err.Error(), "changed after export") {
+			t.Fatalf("unexpected conflict error for stored model %q: %v", stale, err)
+		}
+	}
+}
+
+func TestCodexJSONLScanSurfacesModelDiagnostics(t *testing.T) {
+	cases := []struct {
+		name            string
+		lines           []map[string]any
+		unknownLines    []int
+		reasonSubstring string
+	}{
+		{
+			name: "model switch within interval",
+			lines: []map[string]any{
+				codexTurn("2026-10-20T01:00:00Z", "gpt-4o"),
+				codexCount("2026-10-20T01:01:00Z", 100, 0, 0, 10),
+				codexCount("2026-10-20T01:02:00Z", 150, 0, 0, 20),
+				codexTurn("2026-10-20T01:03:00Z", "gpt-5"),
+				codexCount("2026-10-20T01:04:00Z", 220, 0, 0, 30),
+				codexCount("2026-10-20T01:05:00Z", 260, 0, 0, 40),
+			},
+			unknownLines:    []int{5},
+			reasonSubstring: "model switch",
+		},
+		{
+			name: "no turn_context in file",
+			lines: []map[string]any{
+				codexCount("2026-10-20T01:00:00Z", 100, 0, 0, 10),
+				codexCount("2026-10-20T01:01:00Z", 150, 0, 0, 20),
+				codexCount("2026-10-20T01:02:00Z", 220, 0, 0, 30),
+			},
+			unknownLines:    []int{2, 3},
+			reasonSubstring: "no turn_context",
+		},
+		{
+			name: "turn_context without recorded model",
+			lines: []map[string]any{
+				codexTurn("2026-10-20T01:00:00Z", "gpt-5"),
+				codexCount("2026-10-20T01:01:00Z", 100, 0, 0, 10),
+				codexCount("2026-10-20T01:02:00Z", 150, 0, 0, 20),
+				codexTurn("2026-10-20T01:03:00Z", nil),
+				codexCount("2026-10-20T01:04:00Z", 220, 0, 0, 30),
+				codexCount("2026-10-20T01:05:00Z", 260, 0, 0, 40),
+			},
+			unknownLines:    []int{5, 6},
+			reasonSubstring: "no recorded model",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			input := filepath.Join(dir, "sessions")
+			if err := os.MkdirAll(input, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(input, "diagnostics.jsonl")
+			writeJSONLFile(t, path, tc.lines)
+			res, err := pipeline.Scan(adapter.Options{Source: adapter.CodexJSONLSource, Input: input})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Quarantined != 0 {
+				t.Fatalf("model diagnostics must not quarantine lines: %#v", res)
+			}
+			if len(res.Issues) != len(tc.unknownLines) {
+				t.Fatalf("issues = %#v, want %d diagnostics", res.Issues, len(tc.unknownLines))
+			}
+			for idx, issue := range res.Issues {
+				if issue.File != path || issue.Line != tc.unknownLines[idx] {
+					t.Fatalf("issue %d = %#v, want %s:%d", idx, issue, path, tc.unknownLines[idx])
+				}
+				if !strings.Contains(issue.Reason, tc.reasonSubstring) {
+					t.Fatalf("issue %d reason = %q, want substring %q", idx, issue.Reason, tc.reasonSubstring)
+				}
+				// The diagnostic explains the cause without ever carrying a
+				// recorded model value.
+				if strings.Contains(issue.Reason, "gpt-") {
+					t.Fatalf("issue %d reason leaks a model value: %q", idx, issue.Reason)
+				}
+			}
+		})
+	}
+
+	// A turn that literally recorded the model "unknown" is exact
+	// attribution, not a missing-model or ambiguity diagnostic.
+	t.Run("literal unknown model is not misreported", func(t *testing.T) {
+		dir := t.TempDir()
+		input := filepath.Join(dir, "sessions")
+		if err := os.MkdirAll(input, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		writeJSONLFile(t, filepath.Join(input, "literal-unknown.jsonl"), []map[string]any{
+			codexTurn("2026-10-20T01:00:00Z", "unknown"),
+			codexCount("2026-10-20T01:01:00Z", 100, 0, 0, 10),
+			codexCount("2026-10-20T01:02:00Z", 150, 0, 0, 20),
+		})
+		res, err := pipeline.Scan(adapter.Options{Source: adapter.CodexJSONLSource, Input: input})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.RecordCount != 1 || res.Records[0]["model"] != "unknown" {
+			t.Fatalf("literal unknown model must be recorded verbatim: %#v", res)
+		}
+		if len(res.Issues) != 0 || res.Quarantined != 0 {
+			t.Fatalf("literal unknown model must not be misreported as missing: %#v", res.Issues)
+		}
+	})
+
+	// The diagnostic list is capped across the whole scan, not per file:
+	// 58 unattributed deltas over two files surface at most 50 issues.
+	t.Run("diagnostics are capped per scan", func(t *testing.T) {
+		dir := t.TempDir()
+		input := filepath.Join(dir, "sessions")
+		if err := os.MkdirAll(input, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		first := filepath.Join(input, "a.jsonl")
+		second := filepath.Join(input, "b.jsonl")
+		for _, path := range []string{first, second} {
+			lines := make([]map[string]any, 0, 30)
+			for i := 0; i < 30; i++ {
+				lines = append(lines, codexCount(
+					fmt.Sprintf("2026-10-20T01:%02d:00Z", i),
+					uint64(100+10*i), 0, 0, uint64(10+i),
+				))
+			}
+			writeJSONLFile(t, path, lines)
+		}
+		res, err := pipeline.Scan(adapter.Options{Source: adapter.CodexJSONLSource, Input: input})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.RecordCount != 58 || res.Quarantined != 0 {
+			t.Fatalf("unexpected scan result: %#v", res)
+		}
+		if len(res.Issues) != 50 {
+			t.Fatalf("scan-wide diagnostic cap = %d issues, want 50", len(res.Issues))
+		}
+		if res.Issues[0].File != first || res.Issues[29].File != second {
+			t.Fatalf("cap must span the whole scan, not restart per file: %#v", res.Issues)
+		}
+	})
+
+	// A fully attributed session produces no diagnostics.
+	t.Run("attributed session is clean", func(t *testing.T) {
+		dir := t.TempDir()
+		input := filepath.Join(dir, "sessions")
+		if err := os.MkdirAll(input, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		writeJSONLFile(t, filepath.Join(input, "clean.jsonl"), []map[string]any{
+			codexTurn("2026-10-20T01:00:00Z", "gpt-5"),
+			codexCount("2026-10-20T01:01:00Z", 100, 0, 0, 10),
+			codexCount("2026-10-20T01:02:00Z", 150, 0, 0, 20),
+		})
+		res, err := pipeline.Scan(adapter.Options{Source: adapter.CodexJSONLSource, Input: input})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.RecordCount != 1 || len(res.Issues) != 0 || res.Quarantined != 0 {
+			t.Fatalf("attributed session must be clean: %#v", res)
+		}
+	})
+}
+
 func overflowTotalRecord(key, input, cacheRead string) map[string]any {
 	return map[string]any{
 		"recordKey":      key,
@@ -493,6 +1010,34 @@ func codexCount(timestamp string, input, cacheRead, cacheWrite, output uint64) m
 				"output_tokens":            output,
 			}},
 		},
+	}
+}
+
+func codexTurn(timestamp string, model any) map[string]any {
+	payload := map[string]any{}
+	if model != nil {
+		payload["model"] = model
+	}
+	return map[string]any{
+		"timestamp": timestamp,
+		"type":      "turn_context",
+		"payload":   payload,
+	}
+}
+
+func codexTurnNullModel(timestamp string) map[string]any {
+	return map[string]any{
+		"timestamp": timestamp,
+		"type":      "turn_context",
+		"payload":   map[string]any{"model": nil},
+	}
+}
+
+func codexTurnNullPayload(timestamp string) map[string]any {
+	return map[string]any{
+		"timestamp": timestamp,
+		"type":      "turn_context",
+		"payload":   nil,
 	}
 }
 

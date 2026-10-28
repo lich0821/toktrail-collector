@@ -21,12 +21,27 @@ import (
 	"toktrail-collector/internal/source/pipeline"
 )
 
-// TestRunSyncUploadsWhitelistedUsageJSONRecords runs the real pipeline end
-// to end — free-form usage-json input → PrepareExport → CommitExport (outbox)
-// → Run — and asserts the records that actually leave the machine carry only
-// the ingest whitelist: malicious extra fields (sessionId, path, prompt,
-// nested objects) are dropped before the batch file is ever written, and a
-// private model route collapses to "unknown".
+func TestUploadPrivacyModelValidation(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		safe bool
+	}{
+		{`{"model":"private/Model-v2"}`, true},
+		{`{"model":null}`, true},
+		{`{"model":{"id":"m"}}`, false},
+		{`{"model":"bad\nmodel"}`, false},
+		{"{\"model\":\"" + string([]byte{0xff}) + "\"}", false},
+		{`{"model":"m","prompt":"secret"}`, false},
+	} {
+		err := requireUploadPrivacy(BatchRequest{BatchID: "test", Records: []json.RawMessage{[]byte(tc.raw)}})
+		if (err == nil) != tc.safe {
+			t.Errorf("privacy validation safe=%t, error=%v", tc.safe, err)
+		}
+	}
+}
+
+// TestRunSyncUploadsWhitelistedUsageJSONRecords covers export, commit, and
+// sync: model identifiers survive while non-protocol fields are dropped.
 func TestRunSyncUploadsWhitelistedUsageJSONRecords(t *testing.T) {
 	stateDir, store, _ := setupBoundState(t)
 	inputDir := t.TempDir()
@@ -79,7 +94,7 @@ func TestRunSyncUploadsWhitelistedUsageJSONRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, leak := range []string{"sess-secret-123", "secret/project", "acquisition memo", "company-private-finetune-42", "deep"} {
+	for _, leak := range []string{"sess-secret-123", "secret/project", "acquisition memo", "deep"} {
 		if strings.Contains(string(batchBytes), leak) {
 			t.Fatalf("batch file leaked private input content %q: %s", leak, batchBytes)
 		}
@@ -132,8 +147,8 @@ func TestRunSyncUploadsWhitelistedUsageJSONRecords(t *testing.T) {
 			t.Errorf("uploaded record leaked non-whitelisted field %q: %#v", field, uploaded[0][field])
 		}
 	}
-	if uploaded[0]["model"] != "unknown" {
-		t.Errorf("uploaded record must not carry a private model route, got %#v", uploaded[0]["model"])
+	if uploaded[0]["model"] != "company-private-finetune-42" {
+		t.Errorf("uploaded model changed: %#v", uploaded[0]["model"])
 	}
 	if uploaded[0]["recordKey"] != "privacy-1" {
 		t.Errorf("uploaded recordKey changed: %#v", uploaded[0]["recordKey"])
@@ -141,8 +156,8 @@ func TestRunSyncUploadsWhitelistedUsageJSONRecords(t *testing.T) {
 }
 
 // legacyLeakyBatchFile simulates a batch frozen before the export-side
-// privacy fix: one clean record and one carrying free-form extras and a
-// private model route. Such a batch must never be uploaded verbatim again.
+// privacy fix: one clean record and one carrying free-form extras.
+// Such a batch must never be uploaded verbatim.
 func legacyLeakyBatchFile(t *testing.T, batchID string) string {
 	t.Helper()
 	return writeBatchFile(t, map[string]any{
@@ -217,7 +232,7 @@ func TestRunSyncRefusesLegacyOutboxBatchBeforeAnyRequest(t *testing.T) {
 	defer server.Close()
 
 	_, err = Run(t.Context(), store, Options{ServerURL: server.URL, StateDir: stateDir})
-	if err == nil || !strings.Contains(err.Error(), "outside the upload whitelist") || !strings.Contains(err.Error(), "no HTTP request was made") {
+	if err == nil || !strings.Contains(err.Error(), "carries extra fields or an invalid model") || !strings.Contains(err.Error(), "no HTTP request was made") {
 		t.Fatalf("expected the static privacy gate error, got %v", err)
 	}
 	if strings.Contains(err.Error(), "sess-secret-123") || strings.Contains(err.Error(), "acquisition memo") || strings.Contains(err.Error(), "company-private-finetune-42") {
@@ -271,11 +286,11 @@ func TestRunSyncRefusesLegacyExplicitFileBatch(t *testing.T) {
 	defer server.Close()
 
 	_, err = Run(t.Context(), store, Options{ServerURL: server.URL, StateDir: stateDir, BatchFile: batchFile, BatchID: "batch-legacy-file-1"})
-	if err == nil || !strings.Contains(err.Error(), "outside the upload whitelist") || !strings.Contains(err.Error(), "no HTTP request was made") {
+	if err == nil || !strings.Contains(err.Error(), "carries extra fields or an invalid model") || !strings.Contains(err.Error(), "no HTTP request was made") {
 		t.Fatalf("expected the static privacy gate error (stateful --file), got %v", err)
 	}
 	_, err = Run(t.Context(), store, Options{ServerURL: server.URL, BatchFile: batchFile, BatchID: "batch-legacy-file-1"})
-	if err == nil || !strings.Contains(err.Error(), "outside the upload whitelist") || !strings.Contains(err.Error(), "no HTTP request was made") {
+	if err == nil || !strings.Contains(err.Error(), "carries extra fields or an invalid model") || !strings.Contains(err.Error(), "no HTTP request was made") {
 		t.Fatalf("expected the static privacy gate error (stateless --file), got %v", err)
 	}
 	if requests.Load() != 0 {
@@ -387,7 +402,7 @@ func TestRunSyncReorganizedLegacyBatchStaysGated(t *testing.T) {
 	}))
 	defer counting.Close()
 	_, err = Run(t.Context(), store, Options{ServerURL: counting.URL, StateDir: stateDir})
-	if err == nil || !strings.Contains(err.Error(), "outside the upload whitelist") || !strings.Contains(err.Error(), "no HTTP request was made") {
+	if err == nil || !strings.Contains(err.Error(), "carries extra fields or an invalid model") || !strings.Contains(err.Error(), "no HTTP request was made") {
 		t.Fatalf("expected the static privacy gate error for the reorganized batch, got %v", err)
 	}
 	if requests.Load() != 0 {

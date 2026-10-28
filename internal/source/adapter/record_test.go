@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -31,8 +32,8 @@ func TestSanitizeUsageJSONRecordDoesNotMutateInput(t *testing.T) {
 	if _, ok := sanitized["prompt"]; ok {
 		t.Fatal("sanitized record leaked prompt")
 	}
-	if sanitized["model"] != "unknown" {
-		t.Fatalf("expected model unknown, got %#v", sanitized["model"])
+	if sanitized["model"] != "company-private-route-42" {
+		t.Fatalf("expected recorded model, got %#v", sanitized["model"])
 	}
 	if record["sessionId"] != "sess-secret-123" || record["prompt"] != "secret" || record["model"] != "company-private-route-42" {
 		t.Fatalf("sanitize mutated the original input map: %#v", record)
@@ -42,12 +43,16 @@ func TestSanitizeUsageJSONRecordDoesNotMutateInput(t *testing.T) {
 	}
 }
 
-func TestDeepSeekHarnessRecordedModelProjection(t *testing.T) {
-	if got := DeepSeekHarnessRecordedModel(" deepseek-flash "); got != "deepseek-flash" {
-		t.Fatalf("model = %q, want deepseek-flash", got)
+func TestValidateModel(t *testing.T) {
+	for _, value := range []any{nil, "main", "Company/Model-v2", " model "} {
+		if err := ValidateModel(value); err != nil {
+			t.Errorf("valid model %q: %v", value, err)
+		}
 	}
-	if got := DeepSeekHarnessRecordedModel("bad\nmodel"); got != "unknown" {
-		t.Fatalf("control-bearing model must collapse to unknown, got %q", got)
+	for _, value := range []any{"", "  ", "bad\nmodel", string([]byte{0xff}), 42, strings.Repeat("a", 129)} {
+		if err := ValidateModel(value); err == nil {
+			t.Errorf("invalid model accepted: %#v", value)
+		}
 	}
 	record := Record{
 		"recordKey":      "dsh-key",

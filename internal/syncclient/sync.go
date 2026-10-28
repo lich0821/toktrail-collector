@@ -229,8 +229,8 @@ func Run(ctx context.Context, store statedir.Store, opt Options) (Result, error)
 	if err != nil {
 		return Result{}, err
 	}
-	// Privacy gate before any state change or HTTP traffic: a pre-fix
-	// batch (extra fields, private model) must never leave the device, so
+	// Privacy gate before any state change or HTTP traffic: a batch with
+	// extra fields or malformed model identifiers must never leave the device, so
 	// the upload cannot rely on the server rejecting it. The check sits
 	// before MarkAttempt and the preflight journal so a rejection leaves
 	// the outbox entry, attempt accounting, and batch file untouched.

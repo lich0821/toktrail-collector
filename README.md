@@ -1,6 +1,6 @@
 # TokTrail Collector
 
-[Chinese](README.zh-CN.md)
+[中文](README.zh-CN.md)
 
 TokTrail Collector is a local-first Go CLI for collecting privacy-filtered token usage metadata from supported local developer tools.
 
@@ -13,10 +13,10 @@ Supported sources in the current implementation:
 - Codex session JSONL (`codex-jsonl`).
 - Claude Code session JSONL (`claude-code-jsonl`).
 - DeepSeek Harness session JSONL (`deepseek-harness`).
-- WorkBuddy AI session JSONL (`workbuddy-jsonl`): passive JSONL only; model names are always reported as `unknown`.
+- WorkBuddy AI session JSONL (`workbuddy-jsonl`): passive JSONL only.
 - Synthetic/free-form `usage-json` fixtures for integration and compatibility testing.
 
-The collector uploads token usage counters and stable privacy-safe record identifiers. It must not upload prompts, message bodies, raw session IDs, raw message IDs, absolute local paths, or private model route names.
+The collector uploads token usage counters, stable privacy-safe record identifiers, and source-specific model identifiers described below. It must not upload prompts, message bodies, raw session IDs, raw message IDs, or absolute local paths.
 
 ## Privacy and consent model
 
@@ -33,7 +33,7 @@ Important invariants:
 - A scheduled run with no enabled source grants performs no scan and no network request.
 - `sync` performs `GET /v1/devices/self` before uploading and sends the learned consent revision with the ingest request.
 - Unknown token counters remain unknown; they are not silently coerced to zero.
-- Private model routes collapse to `unknown` unless they match the public allowlist.
+- Recorded model identifiers, including private names and local aliases, are preserved and uploaded when attribution is reliable. Missing or ambiguous attribution is `unknown`. Invalid identifiers are reported rather than silently changed. Identifiers are nonempty UTF-8 strings of at most 128 bytes without control characters; no aliases are resolved to backend identities. The leaderboard controls public disclosure.
 
 ## Repository layout
 
@@ -126,7 +126,7 @@ WorkBuddy specifics:
 
 - The source is passive JSONL only: it reads the session JSONL files WorkBuddy appends to and never writes to them.
 - It does not cover the WorkBuddy SQLite history database; usage recorded only there is not collected.
-- For privacy, model identifiers recorded by WorkBuddy are not uploaded; `model` is always reported as `unknown`.
+- Recorded request model identifiers are included in uploads when they can be attributed reliably; they do not imply a verified backend identity.
 - The default directory is `~/.workbuddy-ai/projects` (current WorkBuddy AI versions). Older WorkBuddy versions used `~/.workbuddy/projects`; there is no automatic fallback for the old layout, so grant it explicitly, for example `toktrail sources enable --source workbuddy-jsonl --input ~/.workbuddy/projects`.
 - `connect` reapplies the server-authorized grants and disables manually enabled grants that are not part of them. Add the old-layout `~/.workbuddy/projects` grant after running `connect`, and re-check it after every reconnect.
 

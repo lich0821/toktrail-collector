@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 func StringAny(v any) string {
@@ -33,7 +35,27 @@ func ShortHash(s string) string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
+// ValidateModel validates the wire representation without altering a recorded identifier.
+func ValidateModel(value any) error {
+	if value == nil {
+		return nil
+	}
+	model, ok := value.(string)
+	if !ok || !utf8.ValidString(model) || len(model) > 128 || strings.TrimSpace(model) == "" {
+		return fmt.Errorf("model must be a nonempty UTF-8 string of at most 128 bytes or null")
+	}
+	for _, r := range model {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("model must not contain control characters")
+		}
+	}
+	return nil
+}
+
 func ValidateRecord(record Record) error {
+	if err := ValidateModel(record["model"]); err != nil {
+		return err
+	}
 	for _, key := range []string{"recordKey", "kind", "occurredAt", "tool", "adapterVersion", "sourceType"} {
 		if strings.TrimSpace(StringField(record, key)) == "" {
 			return fmt.Errorf("missing %s", key)

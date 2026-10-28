@@ -14,6 +14,17 @@ import (
 const (
 	claudeCodeAdapterVersion = "claude-code-jsonl-v1"
 	claudeCodeTool           = "Claude Code"
+	// claudeUnknownModel is the reported model when no snapshot of a
+	// message records a usable identifier, or when snapshots contradict
+	// each other. Missing is mapped explicitly; it is never guessed.
+	claudeUnknownModel = "unknown"
+	// claudeMissingModelReason is the local, value-free diagnostic for a
+	// message whose snapshots never record a model identifier: the record
+	// still exports with the explicit "unknown" mapping, so the gap is
+	// surfaced without embedding any value and without quarantining the
+	// usage. A literal recorded "unknown" identifier is data, not a gap,
+	// and never triggers this diagnostic.
+	claudeMissingModelReason = "model missing from every snapshot of this message; reporting unknown"
 )
 
 // maxReportedLineIssues caps how many quarantined lines are kept for
@@ -52,15 +63,54 @@ func messageUsageComponents(s progress.MessageUsageState) [4]*uint64 {
 // claudeUsageComponentNames are the API field names used in diagnostics.
 var claudeUsageComponentNames = [4]string{"input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"}
 
+// claudeModelSnapshot is the model identifier recorded by one assistant
+// snapshot. present is false when the snapshot carries no model at all
+// (absent key or JSON null); value is the identifier verbatim otherwise —
+// never trimmed, rewritten, or guessed.
+type claudeModelSnapshot struct {
+	present bool
+	value   string
+}
+
+// claudeModelSnapshotFrom extracts the model identifier recorded by an
+// assistant message object, verbatim. The model may be a plain string or an
+// object with an id field. An absent key or JSON null is not an error: the
+// snapshot simply carries no model. Any other shape that yields no valid
+// identifier (empty or whitespace-only string, number, object without a
+// usable id, control characters, over-long values) fails the shared
+// validation so the line is quarantined instead of silently degrading the
+// record to "unknown".
+func claudeModelSnapshotFrom(message map[string]any) (claudeModelSnapshot, error) {
+	raw, ok := message["model"]
+	if !ok || raw == nil {
+		return claudeModelSnapshot{}, nil
+	}
+	candidate := raw
+	if object, isObject := raw.(map[string]any); isObject {
+		id, hasID := object["id"]
+		if !hasID || id == nil {
+			candidate = ""
+		} else {
+			candidate = id
+		}
+	}
+	if err := adapter.ValidateModel(candidate); err != nil {
+		return claudeModelSnapshot{}, err
+	}
+	value, _ := candidate.(string)
+	return claudeModelSnapshot{present: true, value: value}, nil
+}
+
 // claudeCodeObservation is one assistant message.usage observation. The same
 // message.id can appear as several observations: streaming snapshots of one
 // response grow toward the final usage, and the same session content can be
-// duplicated or renamed across the scanned input.
+// duplicated or renamed across the scanned input. Model carries the verified
+// identifier this snapshot records, if any.
 type claudeCodeObservation struct {
 	MessageID string
 	Timestamp time.Time
 	Usage     claudeCodeUsage
-	Model     string
+	Model     claudeModelSnapshot
 	File      string
 	Line      int
 }
@@ -68,10 +118,13 @@ type claudeCodeObservation struct {
 // claudeCodeMessage is the deduplicated view of one assistant message keyed
 // by API message.id. Usage is the latest distinct observed value, selected
 // by observation timestamp (newest wins; equal-timestamp ties keep the
-// within-file line order). The timestamp, model, and source location come
-// from the first observation of that latest distinct value
-// (representative), which keeps exports deterministic regardless of file
-// order or duplicates.
+// within-file line order). The timestamp and source location come from the
+// first observation of that latest distinct value (representative), which
+// keeps exports deterministic regardless of file order or duplicates. The
+// model is resolved independently of the representative: it is the single
+// recorded identifier carried by every snapshot of the message — verbatim,
+// or "unknown" when no snapshot records one or snapshots contradict each
+// other.
 type claudeCodeMessage struct {
 	ID        string
 	Model     string
@@ -79,6 +132,33 @@ type claudeCodeMessage struct {
 	Usage     claudeCodeUsage
 	File      string
 	Line      int
+
+	// modelObserved holds the one valid identifier recorded so far (""
+	// while none has been seen); modelConflict marks that snapshots
+	// recorded contradicting identifiers. Model is derived from both once
+	// the scan completes (resolveClaudeModel), never mid-scan.
+	modelObserved string
+	modelConflict bool
+}
+
+// resolveClaudeModel finalizes the per-message model after the scan: the
+// single recorded identifier verbatim, or "unknown" when every snapshot
+// omitted the model or snapshots conflicted. It never picks between
+// contradicting identifiers. A message whose snapshots all omit the model
+// additionally emits one local, value-free diagnostic at the usage
+// representative: the record still exports with "unknown" and nothing is
+// quarantined, while a literal recorded "unknown" identifier is kept as
+// data and never misreported as missing.
+func (m *claudeCodeMessage) resolveClaudeModel(quarantine *claudeCodeQuarantine) {
+	switch {
+	case m.modelConflict:
+		m.Model = claudeUnknownModel
+	case m.modelObserved == "":
+		quarantine.report(m.File, m.Line, claudeMissingModelReason)
+		m.Model = claudeUnknownModel
+	default:
+		m.Model = m.modelObserved
+	}
 }
 
 type claudeLineOutcome int
@@ -101,16 +181,26 @@ type claudeCodeQuarantine struct {
 
 func (q *claudeCodeQuarantine) add(file string, line int, reason string) {
 	q.total++
+	q.report(file, line, reason)
+}
+
+// report records a diagnostic without quarantining the line: the line's
+// usage stays valid and counted (for example a model conflict between two
+// valid snapshots of one message), but the problem is surfaced instead of
+// being silently resolved.
+func (q *claudeCodeQuarantine) report(file string, line int, reason string) {
 	if len(q.issues) < maxReportedLineIssues {
 		q.issues = append(q.issues, adapter.LineIssue{File: file, Line: line, Reason: reason})
 	}
 }
 
 // loadClaudeCodeMessages scans Claude Code session JSONL and returns the
-// per-message (message.id keyed) latest usage snapshots, sorted by message
-// id for deterministic output. Only assistant message.usage counters are
-// read; every other field stays local. Invalid lines are quarantined and
-// reported instead of aborting the scan.
+// per-message (message.id keyed) latest usage snapshots together with each
+// message's recorded model identifier, sorted by message id for
+// deterministic output. Only assistant message.usage counters are read;
+// every other field stays local. Invalid lines are quarantined and reported
+// instead of aborting the scan, and a message whose snapshots never record
+// a model gets one local diagnostic while still exporting "unknown".
 func loadClaudeCodeMessages(path string) ([]claudeCodeMessage, []adapter.LineIssue, int, error) {
 	paths, err := jsonl.Files(path, jsonl.Options{SkipHiddenFiles: true})
 	if err != nil {
@@ -125,6 +215,7 @@ func loadClaudeCodeMessages(path string) ([]claudeCodeMessage, []adapter.LineIss
 	}
 	messages := make([]claudeCodeMessage, 0, len(final))
 	for _, message := range final {
+		message.resolveClaudeModel(quarantine)
 		messages = append(messages, *message)
 	}
 	sort.Slice(messages, func(i, j int) bool { return messages[i].ID < messages[j].ID })
@@ -138,32 +229,49 @@ func loadClaudeCodeMessages(path string) ([]claudeCodeMessage, []adapter.LineIss
 // representative, and an equal usage value keeps the earlier representative.
 // Equal-timestamp ties stay resolved by within-file line order, so two
 // same-instant observations with different usage remain file-order dependent.
-func applyClaudeObservation(final map[string]*claudeCodeMessage, obs claudeCodeObservation) {
+// The model is merged separately by mergeClaudeModelSnapshot: it is resolved
+// across every snapshot of the message, independently of which snapshot is
+// the usage representative.
+func applyClaudeObservation(final map[string]*claudeCodeMessage, obs claudeCodeObservation, quarantine *claudeCodeQuarantine) {
 	current, ok := final[obs.MessageID]
 	if !ok {
-		final[obs.MessageID] = &claudeCodeMessage{
+		current = &claudeCodeMessage{
 			ID:        obs.MessageID,
-			Model:     adapter.ClaudePublicModel(obs.Model),
 			Timestamp: obs.Timestamp,
 			Usage:     obs.Usage,
 			File:      obs.File,
 			Line:      obs.Line,
 		}
+		final[obs.MessageID] = current
+	} else if !current.Usage.equal(obs.Usage) && !obs.Timestamp.Before(current.Timestamp) {
+		current.Usage = obs.Usage
+		current.Timestamp = obs.Timestamp
+		current.File = obs.File
+		current.Line = obs.Line
+	}
+	mergeClaudeModelSnapshot(current, obs, quarantine)
+}
+
+// mergeClaudeModelSnapshot folds one snapshot's verified model identifier
+// into the per-message model state. Snapshots that carry no model keep the
+// identifier already recorded by other snapshots of the same message (a
+// streaming snapshot may omit the field); they never erase or invent one.
+// Two different identifiers on the same message id are a conflict: refusing
+// to guess, the conflict is reported and the message's model becomes
+// "unknown" while its usage keeps the existing dedup semantics.
+func mergeClaudeModelSnapshot(current *claudeCodeMessage, obs claudeCodeObservation, quarantine *claudeCodeQuarantine) {
+	if !obs.Model.present {
 		return
 	}
-	if current.Usage.equal(obs.Usage) {
-		return
+	switch {
+	case current.modelConflict:
+		// Already reported; later snapshots add nothing.
+	case current.modelObserved == "":
+		current.modelObserved = obs.Model.value
+	case current.modelObserved != obs.Model.value:
+		current.modelConflict = true
+		quarantine.report(obs.File, obs.Line, fmt.Sprintf("model conflict on one message id: earlier snapshots record %q, this snapshot records %q; reporting unknown instead of guessing", current.modelObserved, obs.Model.value))
 	}
-	if obs.Timestamp.Before(current.Timestamp) {
-		// Stale snapshot (e.g. an older duplicate in a lexically later
-		// file): the newer observation keeps the latest usage.
-		return
-	}
-	current.Usage = obs.Usage
-	current.Timestamp = obs.Timestamp
-	current.Model = adapter.ClaudePublicModel(obs.Model)
-	current.File = obs.File
-	current.Line = obs.Line
 }
 
 func loadClaudeCodeJSONLFile(path string, final map[string]*claudeCodeMessage, quarantine *claudeCodeQuarantine) error {
@@ -173,7 +281,7 @@ func loadClaudeCodeJSONLFile(path string, final map[string]*claudeCodeMessage, q
 		case claudeLineQuarantine:
 			quarantine.add(line.File, line.Number, reason)
 		case claudeLineObserve:
-			applyClaudeObservation(final, obs)
+			applyClaudeObservation(final, obs, quarantine)
 		}
 		return nil
 	})
@@ -224,9 +332,16 @@ func parseClaudeCodeLine(line string, path string, lineNo int) (claudeCodeObserv
 		// information; unknown is not zero, so there is nothing to record.
 		return obs, claudeLineIgnore, ""
 	}
+	model, modelErr := claudeModelSnapshotFrom(message)
+	if modelErr != nil {
+		// A recorded but malformed model invalidates the whole line: the
+		// usage is not attributed and the line is quarantined, instead of
+		// silently degrading the record's model to "unknown".
+		return obs, claudeLineQuarantine, "invalid model: " + modelErr.Error()
+	}
 	obs.Timestamp = timestamp
 	obs.Usage = usageCounts
-	obs.Model = claudeRawModel(message["model"])
+	obs.Model = model
 	obs.File = path
 	obs.Line = lineNo
 	return obs, claudeLineObserve, ""
@@ -260,19 +375,6 @@ func parseClaudeCodeUsage(usage map[string]any) (claudeCodeUsage, string) {
 		*f.field = &value
 	}
 	return u, ""
-}
-
-// claudeRawModel extracts the raw model identifier candidate: the model may
-// be a plain string or an object with an id field.
-func claudeRawModel(v any) string {
-	switch m := v.(type) {
-	case string:
-		return strings.TrimSpace(m)
-	case map[string]any:
-		return adapter.StringAny(m["id"])
-	default:
-		return ""
-	}
 }
 
 // loadClaudeMessageProgress loads the per-message baselines for
@@ -453,10 +555,14 @@ func buildClaudeCodeRecords(messages []claudeCodeMessage, progressByMessage map[
 	return records, updates, issues
 }
 
-// loadClaudeCodeJSONL is the stateful loader behind Scan, Preview, and
-// PrepareExport. With a state directory it loads the confirmed per-message
-// baselines (enforcing the progress-integrity rule) and emits incremental
-// intervals; without one it emits the full current usage per message.
+// Load is the stateful loader behind Scan, Preview, and PrepareExport. With
+// a state directory it loads the confirmed per-message baselines (enforcing
+// the progress-integrity rule) and emits incremental intervals; without one
+// it emits the full current usage per message. Each record carries the model
+// identifier recorded in the history for that message, preserved verbatim;
+// missing models report "unknown" (with a local, value-free diagnostic) and
+// conflicting or malformed models are
+// reported, never guessed.
 func Load(opt adapter.Options) (adapter.LoadResult, error) {
 	if strings.TrimSpace(opt.StateDir) == "" && strings.TrimSpace(opt.Output) != "" {
 		return adapter.LoadResult{}, fmt.Errorf("claude-code-jsonl export requires a state directory (Set --state-dir / TOKTRAIL_HOME) so usage baselines are not double counted")

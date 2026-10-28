@@ -82,7 +82,8 @@ func (c workbuddyFixtureCall) line(t *testing.T) string {
 		"timestamp": c.at.UnixMilli(),
 		"sessionId": workbuddySessionIDSentinel,
 		"providerData": map[string]any{
-			"messageId": c.messageID,
+			"messageId":      c.messageID,
+			"requestModelId": "Fixture-Model-v2",
 			"rawUsage": map[string]any{
 				"prompt_tokens":               c.prompt,
 				"completion_tokens":           c.output,
@@ -297,8 +298,8 @@ func assertWorkBuddyUploadedRecord(t *testing.T, got map[string]any, call workbu
 	if field := adapter.StringField(record, "kind"); field != "delta" {
 		t.Fatalf("per-request WorkBuddy usage must be a delta record, got kind %q", field)
 	}
-	if field := adapter.StringField(record, "model"); field != "unknown" {
-		t.Fatalf("WorkBuddy records carry no model information and must report unknown, got %q", field)
+	if field := adapter.StringField(record, "model"); field != "Fixture-Model-v2" {
+		t.Fatalf("WorkBuddy model changed in upload: %q", field)
 	}
 	if field := adapter.StringField(record, "recordKey"); !strings.HasPrefix(field, "workbuddy-jsonl:") {
 		t.Fatalf("WorkBuddy recordKey must use the workbuddy-jsonl: namespace, got %q", field)

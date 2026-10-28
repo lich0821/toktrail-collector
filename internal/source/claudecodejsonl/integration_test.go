@@ -358,8 +358,10 @@ func TestClaudeCodeJSONLQuarantinesBadLinesWithoutBlockingValidUsage(t *testing.
 	if res.Quarantined != 8 {
 		t.Fatalf("expected 8 quarantined lines, got %d: %#v", res.Quarantined, res.Issues)
 	}
-	if len(res.Issues) != 8 {
-		t.Fatalf("expected all quarantined lines to be reported: %#v", res.Issues)
+	// The valid model-less message additionally carries the local
+	// missing-model diagnostic, which must not count as a quarantine.
+	if len(res.Issues) != 9 {
+		t.Fatalf("expected 8 quarantine issues plus the missing-model diagnostic: %#v", res.Issues)
 	}
 	reasons := map[int]string{}
 	for _, issue := range res.Issues {
@@ -373,6 +375,9 @@ func TestClaudeCodeJSONLQuarantinesBadLinesWithoutBlockingValidUsage(t *testing.
 			t.Fatalf("expected line %d to be quarantined, issues: %#v", line, res.Issues)
 		}
 	}
+	if !strings.Contains(reasons[2], "model missing") {
+		t.Fatalf("expected the model-less valid message to carry the missing-model diagnostic, got %q", reasons[2])
+	}
 	if !strings.Contains(reasons[5], "input_tokens") {
 		t.Fatalf("expected overflow reason to name the counter, got %q", reasons[5])
 	}
@@ -381,7 +386,13 @@ func TestClaudeCodeJSONLQuarantinesBadLinesWithoutBlockingValidUsage(t *testing.
 	}
 }
 
-func TestClaudeCodeJSONLModelWhitelistAndContentPrivacy(t *testing.T) {
+// TestClaudeCodeJSONLModelCollectionAndContentPrivacy locks the history
+// model collection: recorded identifiers are preserved verbatim (no
+// whitelist, no rewriting), a missing key or null reports "unknown" with a
+// local value-free diagnostic, and a present-but-malformed model
+// quarantines the line instead of silently degrading to "unknown". Content
+// outside the protocol fields never reaches a record.
+func TestClaudeCodeJSONLModelCollectionAndContentPrivacy(t *testing.T) {
 	dir := t.TempDir()
 	input := filepath.Join(dir, "sessions")
 	if err := os.MkdirAll(input, 0o700); err != nil {
@@ -390,56 +401,99 @@ func TestClaudeCodeJSONLModelWhitelistAndContentPrivacy(t *testing.T) {
 	privateSession := "SYNTHETIC_SESSION_PRIVATE"
 	privatePrompt := "SYNTHETIC_PROMPT_PRIVATE"
 	privateDisplay := "SYNTHETIC_DISPLAY_PRIVATE"
-	privateRoute := "claude-sonnet-4-5[private-router-do-not-upload]"
 	privatePath := filepath.Join(dir, "sessions", "private-cwd-marker")
+	oversized := "claude-" + strings.Repeat("x", 130)
 	lines := []map[string]any{
-		claudeAssistantLine("2026-10-20T01:00:00Z", privateSession, "msg_private_1", claudeUsage(1, 0, 0, 1)),
-		claudeAssistantLine("2026-10-20T01:01:00Z", privateSession, "msg_private_2", claudeUsage(2, 0, 0, 2)),
-		claudeAssistantLine("2026-10-20T01:02:00Z", privateSession, "msg_private_3", claudeUsage(3, 0, 0, 3)),
-		claudeAssistantLine("2026-10-20T01:03:00Z", privateSession, "msg_private_4", claudeUsage(4, 0, 0, 4)),
-		claudeAssistantLine("2026-10-20T01:04:00Z", privateSession, "msg_private_5", claudeUsage(5, 0, 0, 5)),
-		claudeAssistantLine("2026-10-20T01:05:00Z", privateSession, "msg_private_6", claudeUsage(6, 0, 0, 6)),
+		claudeAssistantLine("2026-10-20T01:00:00Z", privateSession, "msg_model_1", claudeUsage(1, 0, 0, 1)),
+		claudeAssistantLine("2026-10-20T01:01:00Z", privateSession, "msg_model_2", claudeUsage(2, 0, 0, 2)),
+		claudeAssistantLine("2026-10-20T01:02:00Z", privateSession, "msg_model_3", claudeUsage(3, 0, 0, 3)),
+		claudeAssistantLine("2026-10-20T01:03:00Z", privateSession, "msg_model_4", claudeUsage(4, 0, 0, 4)),
+		claudeAssistantLine("2026-10-20T01:04:00Z", privateSession, "msg_model_5", claudeUsage(5, 0, 0, 5)),
+		claudeAssistantLine("2026-10-20T01:05:00Z", privateSession, "msg_model_6", claudeUsage(6, 0, 0, 6)),
+		claudeAssistantLine("2026-10-20T01:06:00Z", privateSession, "msg_model_7", claudeUsage(7, 0, 0, 7)),
+		claudeAssistantLine("2026-10-20T01:07:00Z", privateSession, "msg_model_8", claudeUsage(8, 0, 0, 8)),
+		claudeAssistantLine("2026-10-20T01:08:00Z", privateSession, "msg_model_9", claudeUsage(9, 0, 0, 9)),
+		claudeAssistantLine("2026-10-20T01:09:00Z", privateSession, "msg_model_10", claudeUsage(10, 0, 0, 10)),
 	}
 	lines[0]["cwd"] = privatePath
 	lines[0]["message"].(map[string]any)["content"] = []map[string]any{{"type": "text", "text": privatePrompt}}
 	lines[0]["message"].(map[string]any)["model"] = "claude-sonnet-4-5"
 	lines[1]["message"].(map[string]any)["model"] = map[string]any{"id": "claude-3-5-haiku-20241022", "display_name": privateDisplay}
-	lines[2]["message"].(map[string]any)["model"] = privateRoute
-	lines[3]["message"].(map[string]any)["model"] = map[string]any{"display_name": privateDisplay}
-	lines[4]["message"].(map[string]any)["model"] = "claude-opus-4-latest"
-	lines[5]["message"].(map[string]any)["model"] = "claude-opc-4-1"
+	// not in any registry: still the recorded identifier, preserved verbatim
+	lines[2]["message"].(map[string]any)["model"] = "claude-sonnet-4-6"
+	// missing model key: unknown
+	// JSON null model: unknown, not an error
+	lines[4]["message"].(map[string]any)["model"] = nil
+	// present-but-malformed models quarantine their lines
+	lines[5]["message"].(map[string]any)["model"] = map[string]any{"display_name": privateDisplay}
+	lines[6]["message"].(map[string]any)["model"] = ""
+	lines[7]["message"].(map[string]any)["model"] = 42
+	lines[8]["message"].(map[string]any)["model"] = oversized
+	lines[9]["message"].(map[string]any)["model"] = "claude-sonnet-4-5\u0001"
 	writeJSONLFile(t, filepath.Join(input, "session.jsonl"), lines)
 
 	res, err := pipeline.Scan(adapter.Options{Source: adapter.ClaudeCodeJSONLSource, Input: input})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.RecordCount != 6 {
+	// The five malformed-model lines are quarantined; the other five export.
+	if res.RecordCount != 5 || res.ValidRecords != 5 {
 		t.Fatalf("unexpected scan result: %#v", res)
 	}
 	models := map[string]string{}
 	for _, record := range res.Records {
 		models[record["recordKey"].(string)] = record["model"].(string)
 	}
-	kept := 0
+	want := map[string]int{
+		"claude-sonnet-4-5":         0,
+		"claude-3-5-haiku-20241022": 0,
+		"claude-sonnet-4-6":         0,
+		"unknown":                   0,
+	}
 	for _, model := range models {
-		switch model {
-		case "claude-sonnet-4-5", "claude-3-5-haiku-20241022", "claude-opus-4-latest":
-			kept++
-		case "unknown":
-		default:
+		if _, ok := want[model]; !ok {
 			t.Fatalf("unexpected model value %q", model)
 		}
+		want[model]++
 	}
-	if kept != 3 {
-		t.Fatalf("expected 3 whitelisted public models, got %d: %#v", kept, models)
+	// exactly one message without a model key and one with null: two unknowns
+	if want["unknown"] != 2 || len(models) != 5 {
+		t.Fatalf("expected one of each collected model plus two unknowns: %#v", models)
+	}
+	if res.Quarantined != 5 {
+		t.Fatalf("expected the five malformed-model lines to be quarantined: %#v", res.Issues)
+	}
+	// The two model-less messages (missing key and null) each carry the
+	// local missing-model diagnostic in addition to the five quarantines.
+	quarantinedLines := map[int]bool{}
+	missingModelLines := map[int]bool{}
+	for _, issue := range res.Issues {
+		switch {
+		case strings.Contains(issue.Reason, "invalid model"):
+			quarantinedLines[issue.Line] = true
+		case strings.Contains(issue.Reason, "model missing"):
+			missingModelLines[issue.Line] = true
+		default:
+			t.Fatalf("unexpected issue reason %q", issue.Reason)
+		}
+	}
+	if len(quarantinedLines) != 5 {
+		t.Fatalf("expected five invalid-model quarantines: %#v", res.Issues)
+	}
+	for _, line := range []int{6, 7, 8, 9, 10} {
+		if !quarantinedLines[line] {
+			t.Fatalf("expected line %d to be quarantined, issues: %#v", line, res.Issues)
+		}
+	}
+	if len(missingModelLines) != 2 || !missingModelLines[4] || !missingModelLines[5] {
+		t.Fatalf("expected missing-model diagnostics for the key-missing and null-model messages: %#v", res.Issues)
 	}
 	for _, record := range res.Records {
 		wire, err := json.Marshal(record)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, marker := range []string{privateSession, privatePrompt, privateDisplay, privateRoute, privatePath, dir, "msg_private_", "claude-opc"} {
+		for _, marker := range []string{privateSession, privatePrompt, privateDisplay, privatePath, dir, "msg_model_", oversized} {
 			if strings.Contains(string(wire), marker) {
 				t.Fatalf("private marker %q leaked in %s", marker, string(wire))
 			}
@@ -455,38 +509,259 @@ func TestClaudeCodeJSONLModelWhitelistAndContentPrivacy(t *testing.T) {
 	}
 }
 
-func claudeCodeModelCases() []struct {
-	raw  string
-	want string
-} {
-	return []struct {
-		raw  string
-		want string
-	}{
-		{"claude-sonnet-4-5", "claude-sonnet-4-5"},
-		{"claude-opus-4-1-20250805", "claude-opus-4-1-20250805"},
-		{"claude-3-5-haiku-latest", "claude-3-5-haiku-latest"},
-		{"claude-haiku-4-5", "claude-haiku-4-5"},
-		{"", "unknown"},
-		{"claude-sonnet-4-5 ", "claude-sonnet-4-5"},
-		{"claude-opus-4-1-2080", "unknown"},     // bad date suffix
-		{"claude-sonnet-4-6", "unknown"},        // not in whitelist
-		{"claude-opus-4-1-2025080a", "unknown"}, // non-digit suffix
-		{"gpt-4o", "unknown"},                   // other vendor
-		{"claude-sonnet-4-5-beta", "unknown"},   // non date/latest suffix
-		{"claude-3-7-sonnet-20250219", "claude-3-7-sonnet-20250219"},
-		{"claude", "unknown"},                   // bare prefix
-		{"claude-", "unknown"},                  // empty suffix
-		{"claude-sonnet-4-5-LATEST", "unknown"}, // case-sensitive suffix
+// TestClaudeCodeJSONLRecordedModelKeptVerbatim locks byte-exact
+// preservation: surrounding whitespace and unlisted identifiers survive
+// untouched, and the object form takes only the id field.
+func TestClaudeCodeJSONLRecordedModelKeptVerbatim(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "verbatim.jsonl")
+	writeRawJSONL(t, path,
+		`{"type":"assistant","timestamp":"2026-10-20T01:00:00Z","sessionId":"s1","message":{"id":"m_pad","model":"  claude-sonnet-4-5  ","usage":{"input_tokens":1,"output_tokens":1}}}`,
+		`{"type":"assistant","timestamp":"2026-10-20T01:01:00Z","sessionId":"s1","message":{"id":"m_obj","model":{"id":"claude-opus-4-1-20250805","display_name":"SYNTHETIC_DISPLAY"},"usage":{"input_tokens":2,"output_tokens":2}}}`,
+		`{"type":"assistant","timestamp":"2026-10-20T01:02:00Z","sessionId":"s1","message":{"id":"m_alias","model":"gateway-label-do-not-rewrite","usage":{"input_tokens":3,"output_tokens":3}}}`,
+	)
+	res, err := pipeline.Scan(adapter.Options{Source: adapter.ClaudeCodeJSONLSource, Input: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RecordCount != 3 || res.InvalidRecords != 0 || res.Quarantined != 0 {
+		t.Fatalf("unexpected scan result: %#v", res)
+	}
+	got := map[string]string{}
+	for _, record := range res.Records {
+		got[record["recordKey"].(string)] = record["model"].(string)
+	}
+	seen := map[string]bool{}
+	for _, model := range got {
+		seen[model] = true
+	}
+	for _, want := range []string{"  claude-sonnet-4-5  ", "claude-opus-4-1-20250805", "gateway-label-do-not-rewrite"} {
+		if !seen[want] {
+			t.Fatalf("expected model %q preserved verbatim, got %#v", want, got)
+		}
 	}
 }
 
-func TestClaudePublicModelWhitelist(t *testing.T) {
-	for _, tc := range claudeCodeModelCases() {
-		if got := adapter.ClaudePublicModel(tc.raw); got != tc.want {
-			t.Fatalf("claudePublicModel(%q) = %q, want %q", tc.raw, got, tc.want)
+// TestClaudeCodeJSONLModelMissingInSnapshotsKeepsIdentifier covers the
+// same-message snapshot-missing case: the model is resolved across every
+// snapshot of a message, so a later snapshot without a model field neither
+// erases the recorded identifier nor blocks the final usage. Resolution is
+// independent of file order, and the record identity never depends on the
+// model value.
+func TestClaudeCodeJSONLModelMissingInSnapshotsKeepsIdentifier(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "sessions")
+	if err := os.MkdirAll(input, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	first := claudeAssistantLine("2026-10-20T01:00:00Z", "s1", "m1", claudeUsage(10, 0, 0, 5))
+	first["message"].(map[string]any)["model"] = "claude-sonnet-4-5"
+	grown := claudeAssistantLine("2026-10-20T01:00:02Z", "s1", "m1", claudeUsage(12, 0, 0, 6))
+	grown["message"].(map[string]any)["model"] = "claude-sonnet-4-5"
+	writeJSONLFile(t, filepath.Join(input, "session.jsonl"), []map[string]any{
+		// first snapshot carries the model
+		first,
+		// representative snapshot (final usage) carries no model at all
+		claudeAssistantLine("2026-10-20T01:00:01Z", "s1", "m1", claudeUsage(11, 0, 0, 5)),
+		grown,
+	})
+	res, err := pipeline.Scan(adapter.Options{Source: adapter.ClaudeCodeJSONLSource, Input: input})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RecordCount != 1 {
+		t.Fatalf("expected one deduplicated record: %#v", res)
+	}
+	record := res.Records[0]
+	if record["model"] != "claude-sonnet-4-5" {
+		t.Fatalf("expected the recorded model to survive model-less snapshots, got %q", record["model"])
+	}
+	if record["input"] != "12" || record["output"] != "6" || record["occurredAt"] != "2026-10-20T01:00:02Z" {
+		t.Fatalf("expected the final usage snapshot and representative: %#v", record)
+	}
+	if res.Quarantined != 0 || len(res.Issues) != 0 {
+		t.Fatalf("model-less snapshots must not be errors: %#v", res.Issues)
+	}
+
+	// The same snapshots split across files in reverse chronological order
+	// resolve identically: the model follows the message, not the file
+	// order or the usage representative.
+	split := filepath.Join(dir, "split")
+	if err := os.MkdirAll(split, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONLFile(t, filepath.Join(split, "a.jsonl"), []map[string]any{
+		claudeAssistantLine("2026-10-20T01:00:01Z", "s1", "m1", claudeUsage(11, 0, 0, 5)),
+		grown,
+	})
+	writeJSONLFile(t, filepath.Join(split, "z.jsonl"), []map[string]any{first})
+	splitRes, err := pipeline.Scan(adapter.Options{Source: adapter.ClaudeCodeJSONLSource, Input: split})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if splitRes.RecordCount != 1 {
+		t.Fatalf("expected one deduplicated record across files: %#v", splitRes)
+	}
+	splitRecord := splitRes.Records[0]
+	if splitRecord["model"] != "claude-sonnet-4-5" {
+		t.Fatalf("expected the recorded model across files, got %q", splitRecord["model"])
+	}
+	if splitRecord["recordKey"] != record["recordKey"] || splitRecord["groupKey"] != record["groupKey"] {
+		t.Fatalf("expected identical identity regardless of file layout: %#v vs %#v", splitRecord, record)
+	}
+
+	// A message whose snapshots never carry a model reports "unknown" (the
+	// explicit missing mapping), and the identity is unchanged: the model
+	// value never enters the record key. The gap is surfaced through one
+	// local, value-free diagnostic at the usage representative, without
+	// quarantining anything.
+	noModel := filepath.Join(dir, "no-model.jsonl")
+	writeJSONLFile(t, noModel, []map[string]any{
+		claudeAssistantLine("2026-10-20T01:00:00Z", "s1", "m1", claudeUsage(10, 0, 0, 5)),
+		claudeAssistantLine("2026-10-20T01:00:02Z", "s1", "m1", claudeUsage(12, 0, 0, 6)),
+	})
+	noModelRes, err := pipeline.Scan(adapter.Options{Source: adapter.ClaudeCodeJSONLSource, Input: noModel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if noModelRes.RecordCount != 1 {
+		t.Fatalf("expected one record without models: %#v", noModelRes)
+	}
+	if noModelRes.Records[0]["model"] != "unknown" {
+		t.Fatalf("expected missing model to map to unknown, got %q", noModelRes.Records[0]["model"])
+	}
+	if noModelRes.Records[0]["recordKey"] != record["recordKey"] {
+		t.Fatalf("expected identity to be independent of the model value: %#v vs %#v", noModelRes.Records[0], record)
+	}
+	if noModelRes.Quarantined != 0 {
+		t.Fatalf("a missing model must not quarantine: %#v", noModelRes)
+	}
+	if len(noModelRes.Issues) != 1 {
+		t.Fatalf("expected exactly one missing-model diagnostic, got %#v", noModelRes.Issues)
+	}
+	missing := noModelRes.Issues[0]
+	if missing.File != noModel || missing.Line != 2 || missing.Reason != "model missing from every snapshot of this message; reporting unknown" {
+		t.Fatalf("expected the value-free diagnostic at the usage representative, got %#v", missing)
+	}
+
+	// A literal recorded "unknown" identifier is data, not a gap: the same
+	// record value is reported, but no missing-model diagnostic fires.
+	literal := filepath.Join(dir, "literal-unknown.jsonl")
+	writeJSONLFile(t, literal, []map[string]any{
+		withClaudeModel(claudeAssistantLine("2026-10-20T01:00:00Z", "s1", "m1", claudeUsage(10, 0, 0, 5)), "unknown"),
+	})
+	literalRes, err := pipeline.Scan(adapter.Options{Source: adapter.ClaudeCodeJSONLSource, Input: literal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if literalRes.RecordCount != 1 || literalRes.Records[0]["model"] != "unknown" {
+		t.Fatalf("expected the literal unknown identifier to be kept: %#v", literalRes.Records)
+	}
+	if literalRes.Quarantined != 0 || len(literalRes.Issues) != 0 {
+		t.Fatalf("a literal unknown model must not be misreported as missing: %#v", literalRes.Issues)
+	}
+}
+
+// TestClaudeCodeJSONLModelConflictReportsUnknownWithoutGuessing covers the
+// same-message model conflict: two different identifiers recorded for one
+// message id are never arbitrated — the conflict is reported, the model
+// becomes "unknown", and the usage dedup semantics and record identity stay
+// exactly as they are.
+func TestClaudeCodeJSONLModelConflictReportsUnknownWithoutGuessing(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "sessions")
+	if err := os.MkdirAll(input, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	conflicting := claudeAssistantLine("2026-10-20T01:00:01Z", "s1", "m1", claudeUsage(12, 0, 0, 6))
+	conflicting["message"].(map[string]any)["model"] = "claude-opus-4-5"
+	// m2 conflicts between two snapshots with EQUAL usage: the second
+	// snapshot does not change the counters, so the conflict handling must
+	// be independent of the usage representative selection.
+	m2first := claudeAssistantLine("2026-10-20T01:01:00Z", "s1", "m2", claudeUsage(7, 0, 0, 4))
+	m2first["message"].(map[string]any)["model"] = "claude-sonnet-4-5"
+	m2second := claudeAssistantLine("2026-10-20T01:01:01Z", "s1", "m2", claudeUsage(7, 0, 0, 4))
+	m2second["message"].(map[string]any)["model"] = "claude-haiku-4-5"
+	writeJSONLFile(t, filepath.Join(input, "session.jsonl"), []map[string]any{
+		// m1: growth plus a conflicting model on the newer snapshot
+		withClaudeModel(claudeAssistantLine("2026-10-20T01:00:00Z", "s1", "m1", claudeUsage(10, 0, 0, 5)), "claude-sonnet-4-5"),
+		conflicting,
+		m2first,
+		m2second,
+	})
+	res, err := pipeline.Scan(adapter.Options{Source: adapter.ClaudeCodeJSONLSource, Input: input})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RecordCount != 2 {
+		t.Fatalf("expected both messages to export despite conflicts: %#v", res)
+	}
+	byInput := map[string]adapter.Record{}
+	for _, record := range res.Records {
+		byInput[record["input"].(string)] = record
+	}
+	m1 := byInput["12"]
+	if m1 == nil || m1["model"] != "unknown" {
+		t.Fatalf("expected conflicted m1 to report unknown, got %#v", m1)
+	}
+	if m1["input"] != "12" || m1["occurredAt"] != "2026-10-20T01:00:01Z" {
+		t.Fatalf("expected usage dedup to stay intact for conflicted m1: %#v", m1)
+	}
+	m2 := byInput["7"]
+	if m2 == nil || m2["model"] != "unknown" {
+		t.Fatalf("expected conflicted m2 to report unknown, got %#v", m2)
+	}
+	if res.Quarantined != 0 {
+		t.Fatalf("conflicting valid models must not quarantine lines: %#v", res)
+	}
+	if len(res.Issues) != 2 {
+		t.Fatalf("expected one conflict diagnostic per message, got %#v", res.Issues)
+	}
+	for _, issue := range res.Issues {
+		if !strings.Contains(issue.Reason, "model conflict") {
+			t.Fatalf("expected a model conflict diagnostic, got %q", issue.Reason)
 		}
 	}
+	if !claudeHasDiagnostic(res.Issues, `"claude-sonnet-4-5"`) || !claudeHasDiagnostic(res.Issues, `"claude-opus-4-5"`) {
+		t.Fatalf("expected the diagnostic to name both conflicting identifiers: %#v", res.Issues)
+	}
+	if !claudeHasDiagnostic(res.Issues, `"claude-haiku-4-5"`) {
+		t.Fatalf("expected the equal-usage conflict to be diagnosed too: %#v", res.Issues)
+	}
+
+	// Control: the same fixture with consistent models keeps the identifier
+	// and yields the same record keys — only the model value differs.
+	control := filepath.Join(dir, "control.jsonl")
+	writeJSONLFile(t, control, []map[string]any{
+		withClaudeModel(claudeAssistantLine("2026-10-20T01:00:00Z", "s1", "m1", claudeUsage(10, 0, 0, 5)), "claude-sonnet-4-5"),
+		withClaudeModel(claudeAssistantLine("2026-10-20T01:00:01Z", "s1", "m1", claudeUsage(12, 0, 0, 6)), "claude-sonnet-4-5"),
+		withClaudeModel(claudeAssistantLine("2026-10-20T01:01:00Z", "s1", "m2", claudeUsage(7, 0, 0, 4)), "claude-sonnet-4-5"),
+		withClaudeModel(claudeAssistantLine("2026-10-20T01:01:01Z", "s1", "m2", claudeUsage(7, 0, 0, 4)), "claude-sonnet-4-5"),
+	})
+	controlRes, err := pipeline.Scan(adapter.Options{Source: adapter.ClaudeCodeJSONLSource, Input: control})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if controlRes.RecordCount != 2 {
+		t.Fatalf("expected both control messages: %#v", controlRes)
+	}
+	controlByInput := map[string]adapter.Record{}
+	for _, record := range controlRes.Records {
+		controlByInput[record["input"].(string)] = record
+	}
+	for _, key := range []string{"12", "7"} {
+		if controlByInput[key]["model"] != "claude-sonnet-4-5" {
+			t.Fatalf("expected consistent control model, got %#v", controlByInput[key])
+		}
+		if controlByInput[key]["recordKey"] != byInput[key]["recordKey"] {
+			t.Fatalf("expected record identity to ignore the model value: %#v vs %#v", controlByInput[key], byInput[key])
+		}
+	}
+}
+
+func withClaudeModel(line map[string]any, model string) map[string]any {
+	line["message"].(map[string]any)["model"] = model
+	return line
 }
 
 func TestClaudeCodeJSONLExportReplayStability(t *testing.T) {
@@ -1076,11 +1351,8 @@ func TestClaudeCodeJSONLQuarantineReportingIsCapped(t *testing.T) {
 	}
 }
 
-// TestClaudeCodeJSONLQuarantinedIntervalIsSkippedWithDiagnostic covers the
-// scope-quarantine skip: a message whose last interval was quarantined by a
-// consent-scope reorganization is neither re-emitted nor re-baselined; the
-// export reports a diagnostic instead, and the message stays frozen until
-// scope recovery re-pends the interval.
+// writeJSONLFile writes synthetic Claude Code session lines as one JSONL
+// fixture file.
 func writeJSONLFile(t *testing.T, path string, lines []map[string]any) {
 	t.Helper()
 	var b strings.Builder

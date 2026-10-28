@@ -26,6 +26,8 @@ func LoadRecords(root string) (adapter.LoadResult, error) {
 		return result, err
 	}
 	records := make(map[string]adapter.Record)
+	modelRecorded := make(map[string]bool)
+	locations := make(map[string]adapter.LineIssue)
 	conflicts := make(map[string]bool)
 	issue := func(file string, line int, reason string) {
 		result.Quarantined++
@@ -92,14 +94,36 @@ func LoadRecords(root string) (adapter.LoadResult, error) {
 			}
 			if rec != nil {
 				key := adapter.StringField(rec, "recordKey")
+				provider := object(row["providerData"])
+				value, exists := provider["requestModelId"]
+				newModelRecorded := exists && value != nil
+				oldModelRecorded := modelRecorded[key]
+				modelRecorded[key] = oldModelRecorded || newModelRecorded
+				if _, exists := locations[key]; !exists {
+					locations[key] = adapter.LineIssue{File: "file:" + adapter.ShortHash(file), Line: lineNo, Reason: "request model not recorded; model reported unknown"}
+				}
 				if !conflicts[key] {
 					if old, ok := records[key]; ok {
-						if !sameUsage(old, rec) {
+						mergedModel, modelOK := mergeRecordedModels(old["model"], rec["model"], oldModelRecorded, newModelRecorded)
+						switch {
+						case !sameUsage(old, rec):
 							delete(records, key)
 							conflicts[key] = true
 							issue(file, lineNo, "conflicting usage for same request")
-						} else if adapter.StringField(rec, "occurredAt") < adapter.StringField(old, "occurredAt") {
-							records[key] = rec
+						case !modelOK:
+							// The same request carries two different
+							// recorded model identifiers; neither may be
+							// silently preferred, so the record is isolated.
+							delete(records, key)
+							conflicts[key] = true
+							issue(file, lineNo, "conflicting model for same request")
+						default:
+							if adapter.StringField(rec, "occurredAt") < adapter.StringField(old, "occurredAt") {
+								rec["model"] = mergedModel
+								records[key] = rec
+							} else {
+								old["model"] = mergedModel
+							}
 						}
 					} else {
 						records[key] = rec
@@ -124,6 +148,12 @@ func LoadRecords(root string) (adapter.LoadResult, error) {
 		}
 		return adapter.StringField(a, "occurredAt") < adapter.StringField(b, "occurredAt")
 	})
+	for _, record := range result.Records {
+		key := adapter.StringField(record, "recordKey")
+		if !modelRecorded[key] && len(result.Issues) < 50 {
+			result.Issues = append(result.Issues, locations[key])
+		}
+	}
 	return result, nil
 }
 
@@ -153,6 +183,51 @@ func readCompleteLine(r *bufio.Reader) (line string, tooLong bool, terminated bo
 func object(value any) map[string]any {
 	m, _ := value.(map[string]any)
 	return m
+}
+
+// mergeRecordedModels merges the model identifiers of two records for the
+// same request (same recordKey). Equal identifiers and the pair
+// recorded/missing are compatible — WorkBuddy may repeat a request's usage
+// on lines that do not repeat its model — and the recorded identifier wins.
+// Two different recorded identifiers conflict: the caller isolates the
+// record instead of silently preferring one side. Values are compared and
+// returned verbatim; nothing is trimmed or rewritten here.
+func mergeRecordedModels(oldValue, newValue any, oldRecorded, newRecorded bool) (any, bool) {
+	oldModel, oldOK := oldValue.(string)
+	newModel, newOK := newValue.(string)
+	if !oldOK || !newOK {
+		return nil, false
+	}
+	switch {
+	case !oldRecorded:
+		return newValue, true
+	case !newRecorded || oldModel == newModel:
+		return oldValue, true
+	default:
+		return nil, false
+	}
+}
+
+// requestModelIdentifier extracts the model identifier WorkBuddy recorded
+// for one request. providerData.requestModelId is the only model field
+// verified in the WorkBuddy session JSONL fixtures and documentation: it
+// names the model the client requested for the call. No response-side
+// model field is verified, so none is read, and the identifier is never
+// resolved to a backend model identity. A missing or null field records no
+// model and reports "unknown". Any present value that fails the shared
+// model validation — an explicit empty or whitespace-only string, a
+// non-string, over 128 bytes, or control characters — quarantines the
+// record instead of silently collapsing to "unknown". Valid identifiers
+// are kept verbatim: no trimming, no rewriting.
+func requestModelIdentifier(provider map[string]any) (string, bool) {
+	value, exists := provider["requestModelId"]
+	if !exists || value == nil {
+		return "unknown", true
+	}
+	if err := adapter.ValidateModel(value); err != nil {
+		return "", false
+	}
+	return value.(string), true
 }
 
 func text(value any) string { return adapter.StringAny(value) }
@@ -303,11 +378,15 @@ func parseRecord(row map[string]any, fallbackSession string) (adapter.Record, st
 	if *prompt == 0 && *output == 0 {
 		return nil, ""
 	}
+	model, validModel := requestModelIdentifier(provider)
+	if !validModel {
+		return nil, "invalid request model identifier"
+	}
 	return adapter.Record{
 		"recordKey": "workbuddy-jsonl:" + adapter.ShortHash(session+"\x00"+id),
 		"groupKey":  nil, "resetKey": nil, "kind": "delta",
 		"occurredAt": occurred.UTC().Format(time.RFC3339Nano),
-		"tool":       "WorkBuddy", "model": "unknown", "input": optionalCount(input),
+		"tool":       "WorkBuddy", "model": model, "input": optionalCount(input),
 		"cacheRead": optionalCount(read), "cacheWrite": optionalCount(write), "output": optionalCount(output),
 		"adapterVersion": "workbuddy-jsonl-v1", "sourceType": adapter.WorkBuddyJSONLSource,
 	}, ""

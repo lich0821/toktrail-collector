@@ -63,8 +63,27 @@
 //     known; both omitted with a positive residual, a missing or unsafe
 //     total, or an explicitly invalid present cache value keep the buckets
 //     null.
-//   - assistant/message model is the safe identifier recorded by DSH;
-//     attempt-only records without a message source report "unknown".
+//   - Model attribution is faithful to the event's own record: only
+//     assistant/message attributes, from message.source.model, and the
+//     recorded value (route alias such as coder/main or explicit id such
+//     as deepseek-chat) is kept VERBATIM — never rewritten, trimmed, or
+//     allowlisted, and never dropped because the recorded provider is
+//     missing (no backend speculation). A missing message/source or an
+//     absent/null model is unattributable and reports "unknown";
+//     assistant/attempt records are always "unknown" (recorded attempts
+//     carry no message source). A model that is present but fails the
+//     shared adapter.ValidateModel wire check (the explicit empty string,
+//     whitespace-only, control characters, over 128 bytes, non-string
+//     JSON) is never silently mapped: the whole turn fails closed and an
+//     issue is reported.
+//   - Raw lines must be valid UTF-8 BEFORE JSON decoding (Go's decoder
+//     silently replaces invalid bytes with U+FFFD, rewriting recorded
+//     values): invalid lines are rejected as malformed, and the affected
+//     turn fails closed through the lifecycle.
+//   - Attempt/retry attribution: a step may legally end with an armed
+//     retry that never started (DSH's settled-by-retry → idle transition),
+//     so the failed attempt's usage is still attributed; a
+//     llm/retry-started after its step ended invalidates the turn.
 //   - recordKey is stable across session.vN generation rollover (identity
 //     derives from the session id and turn, not the file name) and scoped
 //     per session; the same logical events in two different sessions get
@@ -183,6 +202,19 @@ func (f *fx) endSeed() string {
 
 func assistantMessageJSON(seq int, ms int64, turn, step int, usage, model string) string {
 	return fmt.Sprintf(`{"type":"assistant/message","seq":%d,"time":%d,"data":{"turn":%d,"step":%d,"usage":%s,"message":{"source":{"kind":"model","provider":"deepseek","model":%q}}}}`, seq, ms, turn, step, usage, model)
+}
+
+// assistantMessageRawSourceJSON builds an assistant/message event whose
+// message.source is the literal rawSource JSON (used for sources that the
+// typed builder cannot express: empty provider, non-string model, ...).
+func assistantMessageRawSourceJSON(seq int, ms int64, turn, step int, usage, rawSource string) string {
+	return fmt.Sprintf(`{"type":"assistant/message","seq":%d,"time":%d,"data":{"turn":%d,"step":%d,"usage":%s,"message":{"source":%s}}}`, seq, ms, turn, step, usage, rawSource)
+}
+
+// assistantMessageNoSourceJSON builds an assistant/message event with no
+// message key at all.
+func assistantMessageNoSourceJSON(seq int, ms int64, turn, step int, usage string) string {
+	return fmt.Sprintf(`{"type":"assistant/message","seq":%d,"time":%d,"data":{"turn":%d,"step":%d,"usage":%s}}`, seq, ms, turn, step, usage)
 }
 
 // assistantAttemptJSON builds an assistant/attempt event whose stream is a
@@ -310,6 +342,19 @@ const (
 	// Both attempts of the retried lifecycle turn carry cache buckets, so
 	// the collapsed record must sum them (1+10 and 2+20).
 	usageLCAttemptCache = `{"inputTokens":30,"outputTokens":5,"cacheReadTokens":1,"cacheWriteTokens":2,"totalTokens":38}`
+
+	// Model-attribution scenario literals (unique inputs per turn).
+	usageModA = `{"inputTokens":101,"outputTokens":10}`
+	usageModB = `{"inputTokens":102,"outputTokens":10}`
+	usageModC = `{"inputTokens":103,"outputTokens":10}`
+	usageModD = `{"inputTokens":104,"outputTokens":10}`
+	usageModE = `{"inputTokens":105,"outputTokens":10}`
+	usageModF = `{"inputTokens":106,"outputTokens":10}`
+	usageModG = `{"inputTokens":107,"outputTokens":10}`
+	usageModH = `{"inputTokens":108,"outputTokens":10}`
+	usageModI = `{"inputTokens":109,"outputTokens":10}`
+	// Armed-retry step attribution (turn with a never-started retry).
+	usageArmedRetry = `{"inputTokens":40,"outputTokens":4}`
 )
 
 // ---------------------------------------------------------------------------
@@ -791,6 +836,227 @@ func TestLoadUsageValidationAndAttemptAccounting(t *testing.T) {
 	}
 }
 
+// TestLoadModelAttributionFaithful pins historical model attribution: only
+// assistant/message attributes, from message.source.model, and the recorded
+// value (alias or explicit id, whitespace padding included) survives
+// VERBATIM — no allowlist, no trimming, no rewriting, and no dropping a
+// recorded model because its provider is missing. A missing message/source
+// or an absent/null model reports "unknown" while still counting the
+// tokens; a present-but-illegal model (the explicit empty string,
+// whitespace-only, control characters, over 128 bytes, non-string JSON) is
+// never silently mapped and fails the whole turn closed with a reported
+// issue.
+func TestLoadModelAttributionFaithful(t *testing.T) {
+	root := t.TempDir()
+	const id = "a1b2c3d4-0000-4000-8000-0000000000f1"
+
+	fx := newFixture(id, false)
+	msA := fx.messageTurn(0, usageModA, "coder")         // route alias, verbatim
+	msB := fx.messageTurn(1, usageModB, "deepseek-chat") // explicit id, verbatim
+	// A whitespace-padded but otherwise valid recorded value is kept
+	// verbatim too: the shared wire validation never rewrites valid raws.
+	msC := fx.messageTurn(2, usageModC, "  main  ")
+	// assistant/attempt carries no message source in recorded history.
+	msD := fx.attemptLastChunkTurn(3, usageModD)
+
+	msgTurnRawSource := func(turn int, usage, rawSource string) int64 {
+		fx.push(fx.turnStart(turn))
+		fx.push(fx.userMessage(turn))
+		fx.push(fx.stepStart(turn, 0))
+		s, m := fx.next()
+		fx.push(assistantMessageRawSourceJSON(s, m, turn, 0, usage, rawSource))
+		fx.push(fx.stepEnd(turn, 0))
+		fx.turnEnd(turn)
+		return m
+	}
+	msgTurnNoSource := func(turn int, usage string) int64 {
+		fx.push(fx.turnStart(turn))
+		fx.push(fx.userMessage(turn))
+		fx.push(fx.stepStart(turn, 0))
+		s, m := fx.next()
+		fx.push(assistantMessageNoSourceJSON(s, m, turn, 0, usage))
+		fx.push(fx.stepEnd(turn, 0))
+		fx.turnEnd(turn)
+		return m
+	}
+	// A recorded model survives even when the provider is missing: the
+	// model is the event's own record, and no backend is speculated.
+	msE := msgTurnRawSource(4, usageModE, `{"kind":"model","provider":"","model":"deepseek-chat"}`)
+	msG := msgTurnRawSource(6, usageModG, `{"kind":"model","provider":"llm","model":null}`)
+	msH := msgTurnNoSource(7, usageModH)
+
+	// Present-but-illegal models — including the explicit empty string,
+	// which is a present value, not a missing one: the whole turn must
+	// fail closed with a reported issue — never a silent "unknown" and
+	// never a rewritten value.
+	msgTurnRawSource(5, usageModF, `{"kind":"model","provider":"llm","model":""}`)   // explicit empty string
+	fx.messageTurn(8, usageModI, "bad\nmodel")                                       // control character
+	fx.messageTurn(9, usageModI, strings.Repeat("m", 129))                           // over 128 bytes
+	msgTurnRawSource(10, usageModI, `{"kind":"model","provider":"llm","model":123}`) // non-string
+	fx.messageTurn(11, usageModI, "   ")                                             // whitespace-only
+	writePlain(t, sessionFile(root, "--demo--", id, "session.v4.jsonl"), fx.Lines())
+
+	res, err := deepseekharness.Adapter().Load(adapter.Options{Source: dshSourceName, Input: root})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	assertCommonInvariants(t, res.Records)
+	recs := res.Records
+
+	assertRecords(t, recs, []wantRec{
+		{input: "101", output: "10", cacheRead: nil, cacheWrite: nil, unixSec: time.UnixMilli(msA).Unix()},
+		{input: "102", output: "10", cacheRead: nil, cacheWrite: nil, unixSec: time.UnixMilli(msB).Unix()},
+		{input: "103", output: "10", cacheRead: nil, cacheWrite: nil, unixSec: time.UnixMilli(msC).Unix()},
+		{input: "104", output: "10", cacheRead: nil, cacheWrite: nil, unixSec: time.UnixMilli(msD).Unix()},
+		{input: "105", output: "10", cacheRead: nil, cacheWrite: nil, unixSec: time.UnixMilli(msE).Unix()},
+		{input: "107", output: "10", cacheRead: nil, cacheWrite: nil, unixSec: time.UnixMilli(msG).Unix()},
+		{input: "108", output: "10", cacheRead: nil, cacheWrite: nil, unixSec: time.UnixMilli(msH).Unix()},
+	})
+	wantModels := map[string]string{
+		"101": "coder",
+		"102": "deepseek-chat",
+		"103": "  main  ",      // verbatim: padding is part of the recorded value
+		"104": "unknown",       // assistant/attempt never carries a source
+		"105": "deepseek-chat", // provider missing: the recorded model is still kept
+		"107": "unknown",       // null model: nothing recorded to attribute
+		"108": "unknown",       // no message at all
+	}
+	for input, want := range wantModels {
+		rec := recordWithInput(t, recs, input)
+		if got := rec["model"]; got != want {
+			t.Errorf("input %s: model = %#v, want %#v (verbatim)", input, got, want)
+		}
+	}
+	// The illegal-model turns (inputs 106 and 109) must be gone entirely.
+	for _, absent := range []string{"106", "109"} {
+		if hasInput(recs, absent) {
+			t.Errorf("a turn with an illegal recorded model (input %s) must export nothing", absent)
+		}
+	}
+	// ...and the failures must be reported, not silent.
+	invalidModel := 0
+	missingModel := 0
+	for _, issue := range res.Issues {
+		if strings.Contains(issue.Reason, "model reported unknown") {
+			missingModel++
+		}
+		if strings.Contains(issue.Reason, "invalid recorded model") || strings.Contains(issue.Reason, "recorded model is not a JSON string") {
+			invalidModel++
+		}
+	}
+	if missingModel != 3 {
+		t.Errorf("got %d missing-model diagnostics, want 3; issues: %v", missingModel, res.Issues)
+	}
+	if invalidModel != 5 {
+		t.Errorf("got %d invalid-model issues, want 5 (one per illegal turn); issues: %v", invalidModel, res.Issues)
+	}
+	if res.Quarantined == 0 {
+		t.Error("illegal recorded models must be quarantined/reported, not silently mapped")
+	}
+}
+
+// TestLoadRejectsInvalidUTF8Lines pins the pre-decode UTF-8 guard: Go's
+// JSON decoder silently replaces invalid bytes with U+FFFD, which would
+// rewrite a recorded model under a passing validation. Such lines are
+// rejected as malformed before decoding, and the affected turn fails
+// closed through the lifecycle.
+func TestLoadRejectsInvalidUTF8Lines(t *testing.T) {
+	root := t.TempDir()
+	const id = "b2c3d4e5-0000-4000-8000-0000000000f2"
+
+	fx := newFixture(id, false)
+	ms0 := fx.messageTurn(0, usageFull, "coder")
+	// Turn 1: the assistant/message line embeds raw invalid UTF-8 bytes in
+	// the model string. The line is structurally JSON apart from those
+	// bytes, so only the UTF-8 guard can catch it before the decoder
+	// rewrites the model to contain U+FFFD.
+	fx.push(fx.turnStart(1))
+	fx.push(fx.userMessage(1))
+	fx.push(fx.stepStart(1, 0))
+	s, m := fx.next()
+	fx.push(fmt.Sprintf(`{"type":"assistant/message","seq":%d,"time":%d,"data":{"turn":1,"step":0,"usage":{"inputTokens":120,"outputTokens":12},"message":{"source":{"kind":"model","provider":"llm","model":"bad`+"\xff\xfe"+`model"}}}}`, s, m))
+	fx.push(fx.stepEnd(1, 0))
+	fx.turnEnd(1)
+	writePlain(t, sessionFile(root, "--demo--", id, "session.v4.jsonl"), fx.Lines())
+
+	res, err := deepseekharness.Adapter().Load(adapter.Options{Source: dshSourceName, Input: root})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	assertCommonInvariants(t, res.Records)
+	// Only the well-formed turn survives; the corrupted turn's settlement
+	// never happened, so its step/end invalidates the whole turn.
+	assertRecords(t, res.Records, []wantRec{
+		{input: "100", output: "40", cacheRead: "10", cacheWrite: "20", unixSec: time.UnixMilli(ms0).Unix()},
+	})
+	if hasInput(res.Records, "120") {
+		t.Error("the turn whose settlement line had invalid UTF-8 must export nothing")
+	}
+	// The rejection must be reported...
+	found := false
+	for _, issue := range res.Issues {
+		if strings.Contains(issue.Reason, "invalid UTF-8") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("invalid-UTF-8 line was not reported; issues: %v", res.Issues)
+	}
+	// ...and no model may have been silently rewritten to U+FFFD.
+	for _, rec := range res.Records {
+		if model, _ := rec["model"].(string); strings.ContainsRune(model, '�') {
+			t.Errorf("model was silently rewritten to contain U+FFFD: %q", model)
+		}
+	}
+}
+
+// TestLoadStepEndAfterArmedRetry pins attempt/retry attribution for a step
+// whose final attempt failed and whose armed retry never started: DSH's
+// deriveTurnTokenUsage ends such steps legally (settled-by-retry → idle),
+// so the failed attempt's usage must still be attributed. A
+// llm/retry-started that arrives after its step already ended must
+// invalidate the turn instead of reopening the attempt.
+func TestLoadStepEndAfterArmedRetry(t *testing.T) {
+	root := t.TempDir()
+	const id = "c3d4e5f6-0000-4000-8000-0000000000f3"
+
+	fx := newFixture(id, false)
+	// Turn 0: attempt fails, retry is armed, the step ends without the
+	// retry ever starting, and the turn completes. The failed attempt is
+	// the only usage and must be attributed at its own settlement time.
+	fx.push(fx.turnStart(0))
+	fx.push(fx.userMessage(0))
+	fx.push(fx.stepStart(0, 0))
+	s, m := fx.next()
+	fx.push(assistantAttemptJSON(s, m, 0, 0, usageArmedRetry))
+	fx.push(fx.llmRetry(0, 0))
+	fx.push(fx.stepEnd(0, 0))
+	fx.turnEnd(0)
+	// Turn 1: the same shape, but llm/retry-started arrives AFTER step/end.
+	// The step is already closed, so the turn must fail closed.
+	fx.push(fx.turnStart(1))
+	fx.push(fx.userMessage(1))
+	fx.push(fx.stepStart(1, 0))
+	s2, m2 := fx.next()
+	fx.push(assistantAttemptJSON(s2, m2, 1, 0, usageArmedRetry))
+	fx.push(fx.llmRetry(1, 0))
+	fx.push(fx.stepEnd(1, 0))
+	fx.push(fx.llmRetryStarted(1, 0))
+	fx.turnEnd(1)
+	writePlain(t, sessionFile(root, "--demo--", id, "session.v4.jsonl"), fx.Lines())
+
+	recs := loadAll(t, root)
+	assertRecords(t, recs, []wantRec{
+		{input: "40", output: "4", cacheRead: nil, cacheWrite: nil, unixSec: time.UnixMilli(m).Unix()},
+	})
+	if len(recs) != 1 {
+		t.Fatalf("got %d records, want 1 (only the armed-retry turn exports)", len(recs))
+	}
+	if got := recs[0]["model"]; got != "unknown" {
+		t.Errorf("attempt record model = %#v, want unknown", got)
+	}
+}
+
 // TestLoadCacheDerivationFromTotal covers the omitted⟺zero encoding of DSH
 // cache buckets: omitted buckets are proven from the totalTokens residual
 // (total = input + output + cacheRead + cacheWrite), while unprovable or
@@ -1089,7 +1355,11 @@ func TestFilterForExportFirstRepeatAppendAndRollover(t *testing.T) {
 	}
 }
 
-func TestFilterForExportTreatsOldUnknownModelAsKnown(t *testing.T) {
+// TestFilterForExportFailsClosedOnModelDrift pins immutable history with no
+// old-version compatibility branch (there are no real users to upgrade): a
+// stored record whose model differs from the freshly loaded record under a
+// known key is content drift and must fail closed.
+func TestFilterForExportFailsClosedOnModelDrift(t *testing.T) {
 	root := t.TempDir()
 	stateDir := t.TempDir()
 	const id = "mmmmmmmm-0000-4000-8000-00000000000m"
@@ -1100,7 +1370,7 @@ func TestFilterForExportTreatsOldUnknownModelAsKnown(t *testing.T) {
 
 	loaded := loadAll(t, root)
 	if len(loaded) != 1 || adapter.StringField(loaded[0], "model") != "deepseek-chat" {
-		t.Fatalf("fixture did not produce the upgraded model record: %#v", loaded)
+		t.Fatalf("fixture did not produce the model record: %#v", loaded)
 	}
 	old := make(adapter.Record, len(loaded[0]))
 	for k, v := range loaded[0] {
@@ -1109,12 +1379,8 @@ func TestFilterForExportTreatsOldUnknownModelAsKnown(t *testing.T) {
 	old["model"] = "unknown"
 	writeBatchFile(t, stateDir, "old-model-batch", dshSourceName, []adapter.Record{old})
 
-	fresh, err := deepseekharness.Adapter().FilterForExport(adapter.Options{Source: dshSourceName, StateDir: stateDir}, loaded)
-	if err != nil {
-		t.Fatalf("model-only unknown upgrade must not fail export filtering: %v", err)
-	}
-	if len(fresh) != 0 {
-		t.Fatalf("known record re-emitted after model-only upgrade: %#v", fresh)
+	if _, err := deepseekharness.Adapter().FilterForExport(adapter.Options{Source: dshSourceName, StateDir: stateDir}, loaded); err == nil {
+		t.Fatal("FilterForExport accepted model drift under a known key; want fail-closed error")
 	}
 }
 

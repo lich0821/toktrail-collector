@@ -23,8 +23,12 @@
 //     step/start opens an attempt; assistant/message settles it and
 //     assistant/attempt closes it failed (each requires the attempt open);
 //     llm/retry arms a retry only after a finalized attempt and
-//     llm/retry-started reopens it; step/end requires a finalized attempt;
-//     turn/end requires every step finalized and ended. Any violation
+//     llm/retry-started reopens it while its step is still open (a retry
+//     never starts after step/end); step/end requires a finalized attempt
+//     and legally closes a step whose armed retry never started (the DSH
+//     state machine's settled-by-retry → idle transition, so a failed
+//     attempt's usage stays attributed); turn/end requires every step
+//     finalized and ended. Any violation
 //     (duplicate settlement, settlement without step/start, events outside
 //     the turn boundaries, ...) invalidates the WHOLE turn — partial turns
 //     are never exported, mirroring token-meter returning undefined.
@@ -61,10 +65,22 @@
 //     is generation 0; names with leading zeros or other suffixes are not
 //     canonical) per session directory is scanned. When the same
 //     generation exists both raw and .zstd, the raw file wins.
-//   - The model is the safe identifier recorded by DSH on assistant/message
-//     events (for example route aliases such as main/coder or explicit model
-//     ids). Events without message source, such as assistant/attempt, report
-//     "unknown".
+//   - The model is the value the event itself recorded, kept VERBATIM:
+//     only assistant/message attributes (from message.source.model), and
+//     a route alias such as main/coder or an explicit model id survives
+//     unchanged — TokTrail maintains no allowlist, never rewrites a valid
+//     value, and never drops a recorded model because its provider is
+//     missing (no backend speculation). Not reliably attributable and
+//     reported as "unknown": assistant/attempt (recorded history shows
+//     attempt events carry no message source), a missing message or
+//     source, and an absent or JSON-null model. A model that is PRESENT
+//     but fails the shared adapter.ValidateModel wire check (the explicit
+//     empty string, whitespace-only, control characters, over 128 bytes,
+//     non-string JSON) is never silently mapped: the whole turn fails
+//     closed and the value is reported as an issue. Raw lines are
+//     validated as UTF-8 BEFORE JSON decoding — Go's decoder silently
+//     replaces invalid bytes with U+FFFD, which would rewrite the
+//     recorded model — and invalid lines are rejected as malformed.
 //   - The recordKey is "deepseek-harness:" + ShortHash(sessionID + "|" +
 //     seq) and the groupKey is "dsh-session:" + ShortHash(sessionID):
 //     stable across rescans and generation rotation, scoped per session,
@@ -87,6 +103,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/klauspost/compress/zstd"
 
@@ -368,10 +385,15 @@ type assistantMessage struct {
 	Source *msgSource `json:"source"`
 }
 
+// msgSource is the message.source object of an assistant/message event.
+// Model stays raw JSON so a non-string value can be inspected and reported
+// without failing the whole event decode. Recorded sources also carry
+// other keys (provider, replayState, ...); provider in particular does NOT
+// gate model attribution — when an event records a model, that model is
+// the event's recorded value regardless of its provider, and speculating
+// about the backend from a missing provider is out of scope.
 type msgSource struct {
-	Kind     string `json:"kind"`
-	Provider string `json:"provider"`
-	Model    string `json:"model"`
+	Model json.RawMessage `json:"model"`
 }
 
 // streamEntry is one entry of an event's compact stream. DSH writes usage
@@ -440,6 +462,13 @@ func loadSessionFile(path string) ([]adapter.Record, []adapter.LineIssue, int, e
 		addIssue(1, "empty session file")
 		return nil, issues, quarantined, nil
 	}
+	if !utf8.ValidString(headerLine) {
+		// Go's JSON decoder silently replaces invalid UTF-8 bytes with
+		// U+FFFD; rejecting the raw line first keeps recorded ids (and any
+		// model value) from being rewritten under us.
+		addIssue(1, "session header is not valid UTF-8")
+		return nil, issues, quarantined, nil
+	}
 	hdr := parseHeader(headerLine)
 	if hdr == nil {
 		addIssue(1, "first line is not a session header")
@@ -479,6 +508,10 @@ func loadSessionFile(path string) ([]adapter.Record, []adapter.LineIssue, int, e
 		line   int
 		turn   int64
 		record adapter.Record
+		// diag is the value-free reason carried when the record's model is
+		// unattributable ("unknown"); it becomes a local LineIssue only if
+		// the record is actually emitted.
+		diag string
 	}
 	var pending []pendingRecord
 	cut := -1 // 1-based file line through which everything is inherited
@@ -495,6 +528,14 @@ func loadSessionFile(path string) ([]adapter.Record, []adapter.LineIssue, int, e
 			break
 		}
 		lineNo++
+		if !utf8.ValidString(line) {
+			// Same pre-decode guard as the header: an invalid-UTF-8 line
+			// must be rejected as malformed, never decoded with silent
+			// U+FFFD rewrites. The affected turn then fails closed through
+			// the lifecycle (its settlement never happened).
+			addIssue(lineNo, "malformed JSON event line (invalid UTF-8)")
+			continue
+		}
 		var ev event
 		if err := json.Unmarshal([]byte(line), &ev); err != nil {
 			addIssue(lineNo, "malformed JSON event line")
@@ -595,14 +636,14 @@ func loadSessionFile(path string) ([]adapter.Record, []adapter.LineIssue, int, e
 						continue
 					}
 				}
-				rec, reason := parseSettlement(ev, ad, hdr.ID)
+				rec, reason, diag := parseSettlement(ev, ad, hdr.ID)
 				if rec == nil {
 					if reason != "" {
 						invalidate(t, lineNo, reason)
 					}
 					continue
 				}
-				pending = append(pending, pendingRecord{line: lineNo, turn: n, record: rec})
+				pending = append(pending, pendingRecord{line: lineNo, turn: n, record: rec, diag: diag})
 			case "llm/retry":
 				if st.state != "finishClosed" || st.retryArmed {
 					invalidate(t, lineNo, "llm/retry without a finalized attempt")
@@ -610,14 +651,18 @@ func loadSessionFile(path string) ([]adapter.Record, []adapter.LineIssue, int, e
 					st.retryArmed = true
 				}
 			case "llm/retry-started":
-				if !st.retryArmed || (st.state != "finishClosed" && st.state != "settled") {
+				if st.ended || !st.retryArmed || (st.state != "finishClosed" && st.state != "settled") {
 					invalidate(t, lineNo, "llm/retry-started without an armed retry")
 				} else {
 					st.state = "open"
 					st.retryArmed = false
 				}
 			case "step/end":
-				if (st.state != "finishClosed" && st.state != "settled") || st.ended || st.retryArmed {
+				// A step may end with an armed retry that never started:
+				// DSH's state machine ends such steps legally
+				// (settled-by-retry → idle), so the failed attempt's usage
+				// stays attributed.
+				if (st.state != "finishClosed" && st.state != "settled") || st.ended {
 					invalidate(t, lineNo, "step/end without a finalized attempt")
 				} else {
 					st.ended = true
@@ -648,6 +693,14 @@ func loadSessionFile(path string) ([]adapter.Record, []adapter.LineIssue, int, e
 			// Inherited prefix: already counted in the owning session's log.
 			continue
 		}
+		if p.diag != "" {
+			// Local, value-free diagnostic for an emitted record whose
+			// model is unattributable: the usage still exports (nothing is
+			// quarantined), but the reason stays visible to the operator.
+			if len(issues) < maxIssues {
+				issues = append(issues, adapter.LineIssue{File: path, Line: p.line, Reason: p.diag})
+			}
+		}
 		records = append(records, p.record)
 	}
 	return records, issues, quarantined, nil
@@ -669,8 +722,17 @@ func numberInt(n *json.Number) (int64, bool) {
 // carries a valid usage sample, or returns nil with an optional issue
 // reason. Only assistant/message and assistant/attempt reach this function;
 // llm/retry closes attempts whose sample was already finalized by a prior
-// assistant event, so counting its stream would double count.
-func parseSettlement(ev event, data assistantData, sessionID string) (adapter.Record, string) {
+// assistant event, so counting its stream would double count. The model is
+// attributed by recordedModel (the event's own recorded value, verbatim):
+// an illegal recorded model returns a reason and fails the whole turn
+// closed; an unattributable model yields "unknown" plus a value-free diag
+// that becomes a local LineIssue when the record is emitted.
+func parseSettlement(ev event, data assistantData, sessionID string) (adapter.Record, string, string) {
+	attribution := recordedModel(ev.Type, data.Message)
+	if attribution.fatal != "" {
+		return nil, attribution.fatal, ""
+	}
+	model := attribution.model
 	var sample json.RawMessage
 	if ev.Type == "assistant/message" {
 		// Direct data.usage wins; explicit null falls back to the stream
@@ -684,23 +746,19 @@ func parseSettlement(ev event, data assistantData, sessionID string) (adapter.Re
 		sample = lastUsageChunk(data.Stream)
 	}
 	if sample == nil {
-		return nil, "missing usage sample"
+		return nil, "missing usage sample", ""
 	}
 	counts, ok, reason := evaluateSample(sample)
 	if !ok {
-		return nil, reason
+		return nil, reason, ""
 	}
 	if allMissingOrZero(counts.input, counts.cacheRead, counts.cacheWrite, counts.output) {
 		// Nothing reportable after derivation; no zero record is emitted.
-		return nil, ""
+		return nil, "", ""
 	}
 	// reasoningTokens is a subset of outputTokens; neither it nor
 	// totalTokens is uploaded (totalTokens was consumed above to prove the
 	// omitted cache buckets).
-	model := "unknown"
-	if ev.Type == "assistant/message" && data.Message != nil && data.Message.Source != nil {
-		model = adapter.DeepSeekHarnessRecordedModel(data.Message.Source.Model)
-	}
 	localID := sessionID + "|" + strconv.FormatInt(ev.Seq, 10)
 	return adapter.Record{
 		"recordKey":      recordKeyDomain + ":" + adapter.ShortHash(localID),
@@ -716,7 +774,72 @@ func parseSettlement(ev event, data assistantData, sessionID string) (adapter.Re
 		"output":         optCount(counts.output),
 		"adapterVersion": adapterVersion,
 		"sourceType":     adapter.DeepSeekHarnessSource,
-	}, ""
+	}, "", attribution.diag
+}
+
+// jsonString decodes a raw JSON value that must be a string. ok is false
+// for any non-string value (number, boolean, object, array); a JSON null
+// or an absent key yields ("", false) as well.
+func jsonString(raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 || raw[0] != '"' {
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", false
+	}
+	return s, true
+}
+
+// modelAttribution is the outcome of attributing one settlement's model.
+type modelAttribution struct {
+	// model is the attributed value; "unknown" when unattributable.
+	model string
+	// fatal is non-empty when the recorded model is present but illegal:
+	// the caller fails the whole turn closed and reports it.
+	fatal string
+	// diag is a value-free reason carried when model == "unknown"; it
+	// becomes a local LineIssue if the record is emitted.
+	diag string
+}
+
+// recordedModel attributes the model of one attempt-closing event from the
+// value the event itself recorded, keeping it verbatim.
+//
+//   - assistant/attempt never attributes: deriveTurnTokenUsage closes
+//     attempts without a route, and recorded history shows attempt events
+//     carry no message source at all.
+//   - assistant/message attributes from message.source.model only: a
+//     missing or JSON-null model is not reliably attributable ("unknown";
+//     the usage still counts). The recorded provider never gates the
+//     attribution — when the event records a model, that model IS the
+//     event's recorded value, and a missing provider must not drop it.
+//   - A non-empty model string is kept VERBATIM — route aliases (main,
+//     coder, ...) and explicit model ids alike; there is no allowlist and
+//     no rewriting.
+//   - A model that is present but fails the shared wire validation
+//     (adapter.ValidateModel: the explicit empty string, whitespace-only,
+//     control characters, over 128 bytes, non-string JSON) must not be
+//     silently rewritten to "unknown": a fatal reason is returned so the
+//     caller fails the whole turn closed and reports the value.
+func recordedModel(evType string, message *assistantMessage) modelAttribution {
+	if evType != "assistant/message" {
+		return modelAttribution{model: "unknown", diag: evType + " event carries no message source; model reported unknown"}
+	}
+	if message == nil || message.Source == nil {
+		return modelAttribution{model: "unknown", diag: "assistant/message event has no message source; model reported unknown"}
+	}
+	if len(message.Source.Model) == 0 || isJSONNull(message.Source.Model) {
+		return modelAttribution{model: "unknown", diag: "assistant/message event has no recorded model; model reported unknown"}
+	}
+	model, isString := jsonString(message.Source.Model)
+	if !isString {
+		return modelAttribution{model: "unknown", fatal: "recorded model is not a JSON string"}
+	}
+	if err := adapter.ValidateModel(model); err != nil {
+		return modelAttribution{model: "unknown", fatal: "invalid recorded model: " + err.Error()}
+	}
+	return modelAttribution{model: model}
 }
 
 // lastUsageChunk returns the usage payload of the last usage entry in the

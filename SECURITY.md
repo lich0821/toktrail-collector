@@ -35,7 +35,8 @@ TokTrail Collector is local-first:
 - Scheduled collection reads only explicitly granted local paths.
 - A scheduled run with no enabled source grants performs no scan and no network request.
 - Uploads require a bound device credential and a fresh server-side consent preflight.
-- The collector must not upload prompts, message bodies, raw session IDs, absolute paths, or private model route names.
+- The collector must not upload prompts, message bodies, raw session IDs, raw message IDs, or absolute paths.
+- Recorded model identifiers, including private names and local aliases, are uploaded when attribution is reliable. They are validated but not rewritten or resolved to backend identities. Public disclosure is controlled by the leaderboard; upload consent and public consent remain separate.
 - Release artifacts are verified with an Ed25519-signed manifest and SHA-256 checks before installation.
 
 ## Disclosure expectations

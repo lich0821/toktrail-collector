@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 const MaxLineBytes = 16 * 1024 * 1024
@@ -76,6 +77,9 @@ func WalkLines(path string, fn func(Line) error) error {
 }
 
 func DecodeObject(line string) (map[string]any, error) {
+	if !utf8.ValidString(line) {
+		return nil, errors.New("invalid UTF-8 in JSON")
+	}
 	raw := map[string]any{}
 	decoder := json.NewDecoder(strings.NewReader(line))
 	// UseNumber keeps integer counters as json.Number so values above 2^53

@@ -13,10 +13,10 @@ Collector 的设计目标是：即使没有账号，本地检查仍然可用。`
 - Codex session JSONL（`codex-jsonl`）。
 - Claude Code session JSONL（`claude-code-jsonl`）。
 - DeepSeek Harness session JSONL（`deepseek-harness`）。
-- WorkBuddy AI session JSONL（`workbuddy-jsonl`）：仅被动读取 JSONL；模型名一律上报为 `unknown`。
+- WorkBuddy AI session JSONL（`workbuddy-jsonl`）：仅被动读取 JSONL。
 - 用于集成与兼容测试的合成/自由格式 `usage-json`。
 
-Collector 上传 Token 使用计数和稳定的隐私安全记录标识。它不得上传 prompt、消息正文、原始 session ID、原始 message ID、本地绝对路径或私有模型路由名。
+Collector 上传 Token 使用计数、稳定的隐私安全记录标识，以及下文说明的各采集源模型标识。它不得上传 prompt、消息正文、原始 session ID、原始 message ID 或本地绝对路径。
 
 ## 隐私与授权模型
 
@@ -33,7 +33,7 @@ TokTrail Collector 将三类权限分开：
 - 没有任何 source grant 时，计划任务不扫描也不联网。
 - `sync` 上传前会先调用 `GET /v1/devices/self`，并把当次快照中的 consent revision 随 ingest 请求提交。
 - 未知 Token 计数保持未知，不会被静默转成 0。
-- 私有模型路由名会折叠为 `unknown`，除非命中公开 allowlist。
+- 可可靠归属的历史模型标识会原样保留并上传，包括私有名称和本地别名；缺失或归属不明确时使用 `unknown`。非法标识会报告，不会静默改写。标识应为非空 UTF-8 字符串，不超过 128 字节且不含控制字符。Collector 不推测别名背后的模型；公开展示由 leaderboard 控制。
 
 ## 仓库结构
 
@@ -124,7 +124,7 @@ WorkBuddy 说明：
 
 - 该 source 仅被动读取 JSONL：只读 WorkBuddy 追加写入的 session JSONL 文件，绝不写入。
 - 不覆盖 WorkBuddy 的 SQLite 历史库；只存在于 SQLite 中的用量不会被采集。
-- 出于隐私考虑，本适配器不上传 WorkBuddy 记录中的模型标识，`model` 一律上报为 `unknown`。
+- 可以可靠归属的历史请求模型标识会随用量上传，但不代表已验证其后端模型身份。
 - 默认目录是 `~/.workbuddy-ai/projects`（新版 WorkBuddy AI）。旧版 WorkBuddy 使用 `~/.workbuddy/projects`；旧目录没有自动回退，需显式授权，例如 `toktrail sources enable --source workbuddy-jsonl --input ~/.workbuddy/projects`。
 - `connect` 会按服务端授权列表重新应用 grants，并禁用不在列表中的手动授权。旧目录 `~/.workbuddy/projects` 的显式授权需在 `connect` 之后（重新）添加，且每次重新 connect 后需重新检查。
 

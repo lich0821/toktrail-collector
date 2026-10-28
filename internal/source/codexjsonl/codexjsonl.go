@@ -12,6 +12,23 @@ import (
 
 const codexTool = "Codex"
 
+// maxCodexModelIssues caps the model diagnostics for one whole scan (all
+// files combined), so pathological inputs cannot grow the issue list
+// without bound; every affected record still carries "unknown".
+const maxCodexModelIssues = 50
+
+// codexIssueLog collects model diagnostics under one scan-wide cap.
+type codexIssueLog struct {
+	issues []adapter.LineIssue
+}
+
+func (l *codexIssueLog) add(file string, line int, reason string) {
+	if len(l.issues) >= maxCodexModelIssues {
+		return
+	}
+	l.issues = append(l.issues, adapter.LineIssue{File: file, Line: line, Reason: reason})
+}
+
 type codexUsage struct {
 	Input      uint64
 	CacheRead  uint64
@@ -25,16 +42,49 @@ type codexObservation struct {
 	Line      int
 }
 
+// codexTurnContext is one turn_context line: the model Codex recorded for
+// the turn that line opens. Model is nil when the line records no model
+// (absent key, null, or a payload-less line); such a turn still marks a
+// boundary, because tokens consumed inside it cannot be attributed to any
+// recorded model.
+type codexTurnContext struct {
+	Timestamp time.Time
+	Line      int
+	Model     *string
+}
+
+// codexEvent merges token_count observations and turn_context boundaries
+// into one stream so that delta intervals and model attribution always
+// share a single ordering.
+type codexEvent struct {
+	Timestamp   time.Time
+	Line        int
+	Observation *codexObservation
+	TurnContext *codexTurnContext
+}
+
+// LoadRecords returns every Codex session record under path. It keeps the
+// historical records-only signature for direct callers; the adapter's Load
+// uses loadRecords so scan also surfaces the local model diagnostics.
 func LoadRecords(path string) ([]adapter.Record, error) {
-	paths, err := jsonl.Files(path, jsonl.Options{})
+	loaded, err := loadRecords(path)
 	if err != nil {
 		return nil, err
 	}
+	return loaded.Records, nil
+}
+
+func loadRecords(path string) (adapter.LoadResult, error) {
+	paths, err := jsonl.Files(path, jsonl.Options{})
+	if err != nil {
+		return adapter.LoadResult{}, err
+	}
 	var records []adapter.Record
+	log := &codexIssueLog{}
 	for _, file := range paths {
-		fileRecords, err := loadCodexJSONLFile(file)
+		fileRecords, err := loadCodexJSONLFile(file, log)
 		if err != nil {
-			return nil, err
+			return adapter.LoadResult{}, err
 		}
 		records = append(records, fileRecords...)
 	}
@@ -46,67 +96,215 @@ func LoadRecords(path string) ([]adapter.Record, error) {
 		}
 		return a < b
 	})
-	return records, nil
+	return adapter.LoadResult{Records: records, Issues: log.issues}, nil
 }
 
-func loadCodexJSONLFile(path string) ([]adapter.Record, error) {
-	var observations []codexObservation
+// loadCodexJSONLFile converts one Codex session file into per-interval delta
+// records, reporting model diagnostics into the scan-wide log. Each record's
+// model is attributed from the turn_context lines of the same file: a delta
+// between two token_count events is attributed to a model only when every
+// turn that could have consumed those tokens — the turn active when the
+// interval opened plus every turn opened inside it — recorded that same
+// single model. Missing models and model switches inside an interval are
+// ambiguity and record "unknown"; the interval is never attributed to only
+// the model recorded at its end. A turn that literally recorded the model
+// "unknown" is exact attribution and is never reported as a diagnostic.
+// Unattributed deltas yield one diagnostic each, anchored at the closing
+// token_count line; the reason names the cause (missing model, model
+// switch) but never includes a recorded model value.
+func loadCodexJSONLFile(path string, log *codexIssueLog) ([]adapter.Record, error) {
+	var events []codexEvent
 	if err := jsonl.WalkLines(path, func(line jsonl.Line) error {
-		obs, ok, err := parseCodexObservation(line.Text, line.Number)
+		raw, err := jsonl.DecodeObject(line.Text)
+		if err != nil {
+			return fmt.Errorf("%s:%d: %w", line.File, line.Number, err)
+		}
+		obs, ok, err := parseCodexObservation(raw, line.Number)
 		if err != nil {
 			return fmt.Errorf("%s:%d: %w", line.File, line.Number, err)
 		}
 		if ok {
-			observations = append(observations, obs)
+			events = append(events, codexEvent{Timestamp: obs.Timestamp, Line: obs.Line, Observation: &obs})
+			return nil
+		}
+		if adapter.StringAny(raw["type"]) == "turn_context" {
+			turn, err := parseCodexTurnContext(raw, line.Number)
+			if err != nil {
+				return fmt.Errorf("%s:%d: %w", line.File, line.Number, err)
+			}
+			events = append(events, codexEvent{Timestamp: turn.Timestamp, Line: turn.Line, TurnContext: &turn})
 		}
 		return nil
 	}); err != nil {
 		return nil, err
 	}
-	if len(observations) < 2 {
+	sort.Slice(events, func(i, j int) bool {
+		if events[i].Timestamp.Equal(events[j].Timestamp) {
+			return events[i].Line < events[j].Line
+		}
+		return events[i].Timestamp.Before(events[j].Timestamp)
+	})
+	observations := 0
+	turnsInFile := 0
+	for idx := range events {
+		if events[idx].Observation != nil {
+			observations++
+		}
+		if events[idx].TurnContext != nil {
+			turnsInFile++
+		}
+	}
+	if observations < 2 {
 		return nil, nil
 	}
-	sort.Slice(observations, func(i, j int) bool {
-		if observations[i].Timestamp.Equal(observations[j].Timestamp) {
-			return observations[i].Line < observations[j].Line
-		}
-		return observations[i].Timestamp.Before(observations[j].Timestamp)
-	})
 	groupKey := "codex-session:" + adapter.ShortHash(path)
-	records := make([]adapter.Record, 0, len(observations)-1)
-	prev := observations[0]
-	for idx := 1; idx < len(observations); idx++ {
-		cur := observations[idx]
-		delta, ok := codexDelta(prev.Usage, cur.Usage)
-		if !ok {
-			prev = cur
+	records := make([]adapter.Record, 0, observations-1)
+	// currentModel is the model of the turn open at the current stream
+	// position: nil before the first turn_context and for turns that record
+	// no model.
+	var currentModel *string
+	var prev *codexObservation
+	// span accumulates every model that may have consumed the tokens of the
+	// open interval (prev, next observation].
+	var span codexModelSpan
+	for idx := range events {
+		ev := events[idx]
+		if ev.TurnContext != nil {
+			currentModel = ev.TurnContext.Model
+			if prev != nil {
+				span.add(ev.TurnContext.Model)
+			}
 			continue
 		}
-		records = append(records, adapter.Record{
-			"recordKey":      fmt.Sprintf("codex-jsonl:%s:%d", adapter.ShortHash(path), cur.Line),
-			"groupKey":       groupKey,
-			"resetKey":       nil,
-			"kind":           "delta",
-			"occurredAt":     cur.Timestamp.UTC().Format(time.RFC3339),
-			"tool":           codexTool,
-			"model":          "unknown",
-			"input":          fmt.Sprintf("%d", delta.Input),
-			"cacheRead":      fmt.Sprintf("%d", delta.CacheRead),
-			"cacheWrite":     fmt.Sprintf("%d", delta.CacheWrite),
-			"output":         fmt.Sprintf("%d", delta.Output),
-			"adapterVersion": "codex-jsonl-v1",
-			"sourceType":     adapter.CodexJSONLSource,
-		})
-		prev = cur
+		if prev != nil {
+			if delta, ok := codexDelta(prev.Usage, ev.Observation.Usage); ok {
+				if !span.attributable() {
+					log.add(path, ev.Observation.Line, span.diagnostic(turnsInFile > 0))
+				}
+				records = append(records, adapter.Record{
+					"recordKey":      fmt.Sprintf("codex-jsonl:%s:%d", adapter.ShortHash(path), ev.Observation.Line),
+					"groupKey":       groupKey,
+					"resetKey":       nil,
+					"kind":           "delta",
+					"occurredAt":     ev.Observation.Timestamp.UTC().Format(time.RFC3339),
+					"tool":           codexTool,
+					"model":          span.resolved(),
+					"input":          fmt.Sprintf("%d", delta.Input),
+					"cacheRead":      fmt.Sprintf("%d", delta.CacheRead),
+					"cacheWrite":     fmt.Sprintf("%d", delta.CacheWrite),
+					"output":         fmt.Sprintf("%d", delta.Output),
+					"adapterVersion": "codex-jsonl-v1",
+					"sourceType":     adapter.CodexJSONLSource,
+				})
+			}
+		}
+		prev = ev.Observation
+		span = codexModelSpan{}
+		span.add(currentModel)
 	}
 	return records, nil
 }
 
-func parseCodexObservation(line string, lineNo int) (codexObservation, bool, error) {
-	raw, err := jsonl.DecodeObject(line)
-	if err != nil {
-		return codexObservation{}, false, err
+// codexModelSpan accumulates every model that may have consumed the tokens
+// of one open delta interval: the turn active when the interval opened plus
+// every turn opened inside it. Codex reports cumulative counters, so the
+// delta between two token_count events can straddle the tail of one turn
+// and the head of the next; the interval is attributable only when every
+// contributor recorded the same single model. A missing model or a model
+// switch inside the interval is ambiguity: the delta reports "unknown"
+// rather than guessing — in particular, the interval is never attributed to
+// only the model recorded at its end.
+type codexModelSpan struct {
+	unknown bool
+	models  []string
+}
+
+func (s *codexModelSpan) add(model *string) {
+	if model == nil {
+		s.unknown = true
+		return
 	}
+	for _, seen := range s.models {
+		if seen == *model {
+			return
+		}
+	}
+	s.models = append(s.models, *model)
+}
+
+// attributable reports whether the interval resolved to one exact recorded
+// model. A turn that literally recorded the model "unknown" still counts as
+// attributable: the attribution is exact, the value merely is "unknown", so
+// it must not be misreported as a missing-model or ambiguity diagnostic.
+func (s *codexModelSpan) attributable() bool {
+	return !s.unknown && len(s.models) == 1
+}
+
+// resolved returns the model to record for a closed interval: the single
+// recorded model when every contributor agrees, otherwise "unknown".
+func (s *codexModelSpan) resolved() string {
+	if s.attributable() {
+		return s.models[0]
+	}
+	return "unknown"
+}
+
+// diagnostic explains why an interval resolved to "unknown". It names the
+// cause — a missing recorded model or a model switch inside the interval —
+// but never includes any recorded model value, so the reason stays safe to
+// display locally alongside the file and line.
+func (s *codexModelSpan) diagnostic(turnsInFile bool) string {
+	reasons := make([]string, 0, 2)
+	if len(s.models) > 1 {
+		reasons = append(reasons, "model switch within interval")
+	}
+	if s.unknown {
+		if turnsInFile {
+			reasons = append(reasons, "no recorded model in effect")
+		} else {
+			reasons = append(reasons, "no turn_context in file")
+		}
+	}
+	if len(reasons) == 0 {
+		reasons = append(reasons, "model not attributable")
+	}
+	return "token_count delta recorded with model unknown: " + strings.Join(reasons, "; ")
+}
+
+// parseCodexTurnContext reads the model recorded for the turn one
+// turn_context line opens. The recorded value is preserved verbatim: the
+// shared adapter.ValidateModel only checks the wire shape (nonempty UTF-8,
+// at most 128 bytes, no control characters) and never rewrites it. A
+// missing model is not an error — the turn marks a boundary whose tokens
+// report "unknown" — while a present but invalid model fails closed so
+// nothing is silently remapped.
+func parseCodexTurnContext(raw map[string]any, lineNo int) (codexTurnContext, error) {
+	timestamp, err := time.Parse(time.RFC3339, adapter.StringAny(raw["timestamp"]))
+	if err != nil {
+		return codexTurnContext{}, fmt.Errorf("invalid timestamp: %w", err)
+	}
+	turn := codexTurnContext{Timestamp: timestamp, Line: lineNo}
+	payloadVal, hasPayload := raw["payload"]
+	if !hasPayload || payloadVal == nil {
+		return turn, nil
+	}
+	payload, ok := payloadVal.(map[string]any)
+	if !ok {
+		return codexTurnContext{}, errors.New("turn_context malformed payload")
+	}
+	modelVal, present := payload["model"]
+	if !present || modelVal == nil {
+		return turn, nil
+	}
+	if err := adapter.ValidateModel(modelVal); err != nil {
+		return codexTurnContext{}, fmt.Errorf("turn_context model: %w", err)
+	}
+	model, _ := modelVal.(string)
+	turn.Model = &model
+	return turn, nil
+}
+
+func parseCodexObservation(raw map[string]any, lineNo int) (codexObservation, bool, error) {
 	payload, _ := raw["payload"].(map[string]any)
 	if adapter.StringAny(payload["type"]) != "token_count" {
 		return codexObservation{}, false, nil
@@ -181,8 +379,7 @@ func codexDelta(prev, cur codexUsage) (codexUsage, bool) {
 
 func Adapter() adapter.Adapter {
 	return adapter.Adapter{Source: adapter.CodexJSONLSource, Description: "Codex session JSONL", Load: func(opt adapter.Options) (adapter.LoadResult, error) {
-		records, err := LoadRecords(opt.Input)
-		return adapter.LoadResult{Records: records}, err
+		return loadRecords(opt.Input)
 	}, FilterForExport: func(opt adapter.Options, records []adapter.Record) ([]adapter.Record, error) {
 		if strings.TrimSpace(opt.StateDir) == "" {
 			return records, nil

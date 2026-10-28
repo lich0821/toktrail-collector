@@ -7,12 +7,16 @@ import (
 	"os"
 	"strings"
 	"toktrail-collector/internal/source/adapter"
+	"unicode/utf8"
 )
 
 func LoadRecords(path string) ([]adapter.Record, error) {
 	b, err := os.ReadFile(strings.TrimSpace(path))
 	if err != nil {
 		return nil, err
+	}
+	if !utf8.Valid(b) {
+		return nil, errors.New("invalid UTF-8 in JSON")
 	}
 	var raw any
 	if err := json.Unmarshal(b, &raw); err != nil {

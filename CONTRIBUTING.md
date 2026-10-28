@@ -34,7 +34,7 @@ Adapters and sync code must preserve these invariants:
 - Do not upload prompts or message bodies.
 - Do not upload raw session IDs or message IDs.
 - Do not upload absolute local paths.
-- Do not upload private model route names or internal gateway identifiers.
+- Preserve each source's recorded model identifier without a public allowlist, including local route aliases. Report missing or ambiguous attribution as `unknown`; reject malformed identifiers. Do not infer backend identities or add gateway metadata. Public disclosure is controlled by the leaderboard.
 - Unknown token counters must stay unknown; do not silently coerce unknown values to zero.
 - Uploads must happen only after device binding and a fresh server-side consent preflight.
 - Local read grants, upload consent, and public leaderboard consent remain separate.

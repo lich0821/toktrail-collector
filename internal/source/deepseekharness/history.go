@@ -17,38 +17,10 @@ import (
 // ACK and scope quarantine: the existing immutable files are read rather
 // than introducing a second index whose crash recovery could diverge from
 // the export WAL. Stored content for a known key must be byte-identical to
-// the freshly loaded record, except for the v1 compatibility upgrade from
-// model=unknown to a recorded DSH model id; every other drift fails closed
-// instead of silently overwriting immutable history.
-func sameDSHRecordAllowingModelUpgrade(a, b []byte) bool {
-	var left, right adapter.Record
-	if err := json.Unmarshal(a, &left); err != nil {
-		return false
-	}
-	if err := json.Unmarshal(b, &right); err != nil {
-		return false
-	}
-	lm := adapter.StringField(left, "model")
-	rm := adapter.StringField(right, "model")
-	if lm == rm {
-		return false
-	}
-	if lm != "unknown" && rm != "unknown" {
-		return false
-	}
-	left["model"] = "unknown"
-	right["model"] = "unknown"
-	lc, err := json.Marshal(left)
-	if err != nil {
-		return false
-	}
-	rc, err := json.Marshal(right)
-	if err != nil {
-		return false
-	}
-	return bytes.Equal(lc, rc)
-}
-
+// the freshly loaded record; any drift fails closed instead of silently
+// overwriting immutable history. (There is deliberately no old-version
+// model upgrade path: with no real users there is nothing to upgrade, and
+// a model difference under a known key is content drift.)
 func filterKnownDSHRecords(stateDir string, records []adapter.Record) ([]adapter.Record, error) {
 	known := make(map[string][]byte)
 	remember := func(raw []byte) error {
@@ -67,9 +39,7 @@ func filterKnownDSHRecords(stateDir string, records []adapter.Record) ([]adapter
 			return err
 		}
 		if prev, ok := known[key]; ok && !bytes.Equal(prev, canonical) {
-			if !sameDSHRecordAllowingModelUpgrade(prev, canonical) {
-				return fmt.Errorf("stored DeepSeek Harness record %s has conflicting content", key)
-			}
+			return fmt.Errorf("stored DeepSeek Harness record %s has conflicting content", key)
 		}
 		known[key] = canonical
 		return nil
@@ -127,7 +97,7 @@ func filterKnownDSHRecords(stateDir string, records []adapter.Record) ([]adapter
 			return nil, err
 		}
 		if prior, ok := known[key]; ok {
-			if !bytes.Equal(prior, canonical) && !sameDSHRecordAllowingModelUpgrade(prior, canonical) {
+			if !bytes.Equal(prior, canonical) {
 				return nil, fmt.Errorf("DeepSeek Harness record %s changed after export; refusing to overwrite immutable history", key)
 			}
 			continue

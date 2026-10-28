@@ -3,6 +3,7 @@ package syncclient
 import (
 	"encoding/json"
 	"fmt"
+	"unicode/utf8"
 
 	"toktrail-collector/internal/source/adapter"
 )
@@ -33,12 +34,15 @@ func (e *privacyGateError) Error() string {
 // before the batch is even marked as attempted.
 func requireUploadPrivacy(batch BatchRequest) error {
 	for idx, raw := range batch.Records {
+		if !utf8.Valid(raw) {
+			return &privacyGateError{BatchID: batch.BatchID, Reason: fmt.Sprintf("record %d contains invalid UTF-8", idx)}
+		}
 		var record adapter.Record
 		if err := json.Unmarshal(raw, &record); err != nil || record == nil {
 			return &privacyGateError{BatchID: batch.BatchID, Reason: fmt.Sprintf("record %d is not a record object", idx)}
 		}
 		if !adapter.RecordIsUploadSafe(record) {
-			return &privacyGateError{BatchID: batch.BatchID, Reason: fmt.Sprintf("record %d carries fields or a model outside the upload whitelist", idx)}
+			return &privacyGateError{BatchID: batch.BatchID, Reason: fmt.Sprintf("record %d carries extra fields or an invalid model", idx)}
 		}
 	}
 	return nil

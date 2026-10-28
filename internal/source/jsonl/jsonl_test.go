@@ -45,4 +45,7 @@ func TestSharedHelpers(t *testing.T) {
 	if _, err := DecodeObject(`{} {}`); err == nil {
 		t.Fatal("expected trailing JSON data to fail")
 	}
+	if _, err := DecodeObject("{\"model\":\"" + string([]byte{0xff}) + "\"}"); err == nil {
+		t.Fatal("expected invalid UTF-8 to fail before JSON decoding")
+	}
 }
