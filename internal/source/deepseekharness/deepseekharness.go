@@ -61,7 +61,10 @@
 //     is generation 0; names with leading zeros or other suffixes are not
 //     canonical) per session directory is scanned. When the same
 //     generation exists both raw and .zstd, the raw file wins.
-//   - The model is always "unknown"; local route aliases are not uploaded.
+//   - The model is the safe identifier recorded by DSH on assistant/message
+//     events (for example route aliases such as main/coder or explicit model
+//     ids). Events without message source, such as assistant/attempt, report
+//     "unknown".
 //   - The recordKey is "deepseek-harness:" + ShortHash(sessionID + "|" +
 //     seq) and the groupKey is "dsh-session:" + ShortHash(sessionID):
 //     stable across rescans and generation rotation, scoped per session,
@@ -695,6 +698,9 @@ func parseSettlement(ev event, data assistantData, sessionID string) (adapter.Re
 	// totalTokens is uploaded (totalTokens was consumed above to prove the
 	// omitted cache buckets).
 	model := "unknown"
+	if ev.Type == "assistant/message" && data.Message != nil && data.Message.Source != nil {
+		model = adapter.DeepSeekHarnessRecordedModel(data.Message.Source.Model)
+	}
 	localID := sessionID + "|" + strconv.FormatInt(ev.Seq, 10)
 	return adapter.Record{
 		"recordKey":      recordKeyDomain + ":" + adapter.ShortHash(localID),

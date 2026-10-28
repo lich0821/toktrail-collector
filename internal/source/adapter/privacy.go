@@ -9,6 +9,7 @@ import (
 const (
 	codexTool      = "Codex"
 	claudeCodeTool = "Claude Code"
+	dshTool        = "DeepSeek Harness"
 )
 
 // usageJSONExportFields is the exact field whitelist of the server ingest
@@ -71,6 +72,8 @@ func publicModelForTool(tool, model string) string {
 			return id
 		}
 		return "unknown"
+	case dshTool:
+		return DeepSeekHarnessRecordedModel(id)
 	default:
 		return "unknown"
 	}
@@ -143,6 +146,24 @@ func RecordIsUploadSafe(record Record) bool {
 		}
 	}
 	return true
+}
+
+// DeepSeekHarnessRecordedModel keeps the model identifier recorded by DSH when
+// it is safe for the wire schema. DSH logs persist route aliases and model ids;
+// unlike Codex/Claude, TokTrail cannot maintain a complete public allowlist for
+// those local aliases, so malformed/control-bearing values collapse to unknown
+// while ordinary recorded ids such as main, coder, and deepseek-flash survive.
+func DeepSeekHarnessRecordedModel(raw string) string {
+	id := strings.TrimSpace(raw)
+	if id == "" || len(id) > 128 {
+		return "unknown"
+	}
+	for _, r := range id {
+		if r < 0x20 || r == 0x7f {
+			return "unknown"
+		}
+	}
+	return id
 }
 
 // claudePublicModels is the exact whitelist of public Claude model ids the

@@ -42,5 +42,30 @@ func TestSanitizeUsageJSONRecordDoesNotMutateInput(t *testing.T) {
 	}
 }
 
+func TestDeepSeekHarnessRecordedModelProjection(t *testing.T) {
+	if got := DeepSeekHarnessRecordedModel(" deepseek-flash "); got != "deepseek-flash" {
+		t.Fatalf("model = %q, want deepseek-flash", got)
+	}
+	if got := DeepSeekHarnessRecordedModel("bad\nmodel"); got != "unknown" {
+		t.Fatalf("control-bearing model must collapse to unknown, got %q", got)
+	}
+	record := Record{
+		"recordKey":      "dsh-key",
+		"kind":           "delta",
+		"occurredAt":     "2026-10-20T01:00:00Z",
+		"tool":           "DeepSeek Harness",
+		"model":          "deepseek-flash",
+		"input":          "10",
+		"cacheRead":      "0",
+		"cacheWrite":     "0",
+		"output":         "5",
+		"adapterVersion": "test",
+		"sourceType":     "deepseek-harness",
+	}
+	if !RecordIsUploadSafe(record) {
+		t.Fatalf("DSH recorded model should be upload-safe: %#v", record)
+	}
+}
+
 // TestExportWritesOnlyWhitelistedFields asserts the on-disk batch payload —
 // the artifact sync uploads verbatim — contains only protocol fields.

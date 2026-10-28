@@ -63,8 +63,8 @@
 //     known; both omitted with a positive residual, a missing or unsafe
 //     total, or an explicitly invalid present cache value keep the buckets
 //     null.
-//   - model is always "unknown": DSH persists provider-internal route
-//     aliases in message.source.model and no model string leaves the device.
+//   - assistant/message model is the safe identifier recorded by DSH;
+//     attempt-only records without a message source report "unknown".
 //   - recordKey is stable across session.vN generation rollover (identity
 //     derives from the session id and turn, not the file name) and scoped
 //     per session; the same logical events in two different sessions get
@@ -402,11 +402,8 @@ func assertCommonInvariants(t *testing.T, recs []adapter.Record) {
 		if got := adapter.StringField(rec, "tool"); got != dshToolName {
 			t.Errorf("tool = %q, want %q", got, dshToolName)
 		}
-		// Model strings never leave the device: DSH persists
-		// provider-internal route aliases, so every record reports
-		// "unknown" even though the fixtures carry model names.
-		if got := adapter.StringField(rec, "model"); got != "unknown" {
-			t.Errorf("model = %q, want \"unknown\" (no model string may leave the device)", got)
+		if got := adapter.StringField(rec, "model"); got == "" {
+			t.Errorf("model is empty: %v", rec)
 		}
 		// Privacy: every record must project onto the upload whitelist
 		// unchanged (no message bodies, no extra keys, public models
@@ -781,6 +778,12 @@ func TestLoadUsageValidationAndAttemptAccounting(t *testing.T) {
 		{input: "33", output: "3", cacheRead: nil, cacheWrite: nil, unixSec: time.UnixMilli(ms8).Unix()},
 		{input: "210", output: "21", cacheRead: nil, cacheWrite: nil, unixSec: time.UnixMilli(ms9).Unix()},
 	})
+	if got := adapter.StringField(recordWithInput(t, recs, "100"), "model"); got != "deepseek-chat" {
+		t.Fatalf("message model = %q, want deepseek-chat", got)
+	}
+	if got := adapter.StringField(recordWithInput(t, recs, "30"), "model"); got != "unknown" {
+		t.Fatalf("attempt model = %q, want unknown", got)
+	}
 	for _, absent := range []string{"-100", "300", "9007199254740993", "999", "280"} {
 		if hasInput(recs, absent) {
 			t.Errorf("invalid or shadowed usage sample (input %s) must produce no record", absent)
@@ -1083,6 +1086,35 @@ func TestFilterForExportFirstRepeatAppendAndRollover(t *testing.T) {
 	writeBatchFile(t, stateDir, "b3", dshSourceName, []adapter.Record{tampered})
 	if _, err := deepseekharness.Adapter().FilterForExport(adapter.Options{Source: dshSourceName, StateDir: stateDir}, loaded); err == nil {
 		t.Fatal("FilterForExport accepted a changed record under a known key; want fail-closed error")
+	}
+}
+
+func TestFilterForExportTreatsOldUnknownModelAsKnown(t *testing.T) {
+	root := t.TempDir()
+	stateDir := t.TempDir()
+	const id = "mmmmmmmm-0000-4000-8000-00000000000m"
+
+	fx := newFixture(id, false)
+	fx.messageTurn(0, usageFull, "deepseek-chat")
+	writePlain(t, sessionFile(root, "--demo--", id, "session.v4.jsonl"), fx.Lines())
+
+	loaded := loadAll(t, root)
+	if len(loaded) != 1 || adapter.StringField(loaded[0], "model") != "deepseek-chat" {
+		t.Fatalf("fixture did not produce the upgraded model record: %#v", loaded)
+	}
+	old := make(adapter.Record, len(loaded[0]))
+	for k, v := range loaded[0] {
+		old[k] = v
+	}
+	old["model"] = "unknown"
+	writeBatchFile(t, stateDir, "old-model-batch", dshSourceName, []adapter.Record{old})
+
+	fresh, err := deepseekharness.Adapter().FilterForExport(adapter.Options{Source: dshSourceName, StateDir: stateDir}, loaded)
+	if err != nil {
+		t.Fatalf("model-only unknown upgrade must not fail export filtering: %v", err)
+	}
+	if len(fresh) != 0 {
+		t.Fatalf("known record re-emitted after model-only upgrade: %#v", fresh)
 	}
 }
 
