@@ -454,6 +454,104 @@ func TestUninstallIdempotentAndToleratesCommandErrors(t *testing.T) {
 	}
 }
 
+// plistAtBootoutRunner records whether the plist file still exists at the
+// moment the launchctl bootout runs, proving the deactivate command runs
+// before the owned file is removed.
+type plistAtBootoutRunner struct {
+	recordingRunner
+	plist              string
+	ranBootout         bool
+	sawPlistAtBootout  bool
+	bootoutServiceArgs []string
+}
+
+func (r *plistAtBootoutRunner) Run(name string, args ...string) error {
+	_, err := r.RunOutput(name, args...)
+	return err
+}
+
+func (r *plistAtBootoutRunner) RunOutput(name string, args ...string) ([]byte, error) {
+	if name == "launchctl" && len(args) > 0 && args[0] == "bootout" {
+		r.ranBootout = true
+		r.bootoutServiceArgs = args
+		if _, statErr := os.Stat(r.plist); statErr == nil {
+			r.sawPlistAtBootout = true
+		}
+	}
+	return r.recordingRunner.RunOutput(name, args...)
+}
+
+func TestRenderUninstallLaunchdBootoutUsesExactServiceTarget(t *testing.T) {
+	cfg, _, _ := testConfig(t)
+	cfg.Platform = "darwin"
+	plan, err := RenderUninstall(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.UninstallCommands) != 1 {
+		t.Fatalf("expected exactly one uninstall command, got %#v", plan.UninstallCommands)
+	}
+	cmd := plan.UninstallCommands[0]
+	if cmd.Name != "launchctl" {
+		t.Fatalf("expected launchctl, got %s", cmd.Name)
+	}
+	want := fmt.Sprintf("gui/%d/%s", os.Getuid(), plan.TaskName)
+	if len(cmd.Args) != 2 || cmd.Args[0] != "bootout" || cmd.Args[1] != want {
+		t.Fatalf("bootout must take the exact service-target %q as a single argument, got %#v", want, cmd.Args)
+	}
+	// The label must never be passed as a separate operand: launchctl
+	// bootout rejects unknown extra arguments.
+	for _, arg := range cmd.Args {
+		if arg == plan.TaskName {
+			t.Fatalf("label must be embedded in the service-target, not passed separately: %#v", cmd.Args)
+		}
+	}
+	// The install plan's uninstall path must target the same form.
+	installPlan := planOrFatal(t, cfg)
+	for _, c := range installPlan.UninstallCommands {
+		if c.Name != "launchctl" || len(c.Args) < 2 || c.Args[0] != "bootout" {
+			continue
+		}
+		if !containsArg(c.Args, want) {
+			t.Fatalf("install plan uninstall commands must also target %q, got %#v", want, c.Args)
+		}
+	}
+}
+
+func TestLaunchdUninstallDeactivatesBeforeRemovingPlist(t *testing.T) {
+	cfg, _, _ := testConfig(t)
+	cfg.Platform = "darwin"
+	// Simulated install: fake runner, files land in the temp home only.
+	plan := installOrFatal(t, cfg, &recordingRunner{})
+	plistPath := filepath.Join(cfg.HomeDir, "Library", "LaunchAgents", plan.TaskName+".plist")
+	if _, statErr := os.Stat(plistPath); statErr != nil {
+		t.Fatalf("simulated install must write the plist: %v", statErr)
+	}
+
+	runner := &plistAtBootoutRunner{plist: plistPath}
+	if _, err := Uninstall(UninstallOptions{Config: cfg, Runner: runner}); err != nil {
+		t.Fatalf("uninstall failed: %v", err)
+	}
+	if !runner.ranBootout {
+		t.Fatalf("uninstall must attempt the launchctl bootout deactivate command: %v", runner.runs)
+	}
+	if !runner.sawPlistAtBootout {
+		t.Fatal("bootout must run while the plist still exists (deactivate before remove)")
+	}
+	if _, statErr := os.Stat(plistPath); !os.IsNotExist(statErr) {
+		t.Fatalf("plist must be removed by uninstall: %v", statErr)
+	}
+	// The executed bootout must have used the exact service-target.
+	want := fmt.Sprintf("gui/%d/%s", os.Getuid(), plan.TaskName)
+	if len(runner.bootoutServiceArgs) != 2 || runner.bootoutServiceArgs[1] != want {
+		t.Fatalf("executed bootout must target %q exactly, got %#v", want, runner.bootoutServiceArgs)
+	}
+	// Uninstall must stay idempotent once everything is gone.
+	if _, err := Uninstall(UninstallOptions{Config: cfg, Runner: &recordingRunner{}}); err != nil {
+		t.Fatalf("idempotent uninstall failed: %v", err)
+	}
+}
+
 func TestUninstallRefusesForeignFiles(t *testing.T) {
 	cfg, _, _ := testConfig(t)
 	cfg.Platform = "darwin"

@@ -76,10 +76,13 @@ func renderLaunchdInstall(cfg TaskConfig, plan Plan) (Plan, error) {
 func renderLaunchdUninstall(cfg TaskConfig, plan Plan) (Plan, error) {
 	plist := launchdPath(cfg, plan.TaskName)
 	uid := os.Getuid()
+	guiTarget := fmt.Sprintf("gui/%d", uid)
+	// bootout requires "gui/<uid>/<label>" as a single service-target;
+	// after a separate domain-target, launchctl treats the label as a plist path.
 	plan.UninstallCommands = []Command{
 		{
 			Name:       "launchctl",
-			Args:       []string{"bootout", fmt.Sprintf("gui/%d", uid), plan.TaskName},
+			Args:       []string{"bootout", guiTarget + "/" + plan.TaskName},
 			Purpose:    "unload the LaunchAgent",
 			BestEffort: true,
 		},
