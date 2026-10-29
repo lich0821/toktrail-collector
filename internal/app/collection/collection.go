@@ -1,7 +1,13 @@
 // Package collection implements the periodic collection entry
 // (`toktrail periodic`): export new local observations through the existing
 // exportcommit WAL, then drain a bounded number of pending outbox batches
-// through the existing syncclient.
+// through the existing syncclient. When the pending queue runs empty while
+// the quarantine store still holds records, the drain performs one
+// recovery round through the same syncclient — under its fresh-consent
+// preflight and local-grant gate, never a local scope decision — so
+// records the current authorization allows again are re-pended and drained
+// even on a device with no new data. Quarantined records the current
+// authorization still excludes stay put without failing the run.
 //
 // Guarantees:
 //   - One process lock (internal/local/runlock) covers the entire run; a second
@@ -19,6 +25,10 @@
 //     existing bound device, exactly like explicit `toktrail sync`, and the
 //     server preflight re-checks fresh consent before every batch.
 //   - No secrets appear in command arguments, output, or errors.
+//   - A server receipt that rejects records (partially or in full) never
+//     reads as full sync success: the drain keeps every accepted record
+//     counted and confirmed, counts the rejected ones explicitly, and the
+//     run fails with ErrRecordsRejected instead of returning nil.
 package collection
 
 import (
@@ -38,6 +48,7 @@ import (
 	"toktrail-collector/internal/local/exportcommit"
 	"toktrail-collector/internal/local/grants"
 	"toktrail-collector/internal/local/outbox"
+	"toktrail-collector/internal/local/quarantine"
 	"toktrail-collector/internal/local/runlock"
 	"toktrail-collector/internal/local/statedir"
 	"toktrail-collector/internal/source/adapter"
@@ -50,6 +61,18 @@ import (
 // cannot make a scheduled task run unbounded; the next scheduled run
 // continues where this one stopped.
 const DefaultMaxSyncBatches = 5
+
+// ErrRecordsRejected reports a settled-but-incomplete upload: a drained
+// batch's server receipt counted rejected records even though the upload
+// round itself succeeded (synccmd.Run returned nil). By that point the
+// syncclient has already reconciled the receipt durably — accepted records
+// are confirmed with their baselines advanced and the batch is marked
+// synced in the outbox — so the accepted part of the run is real and stays
+// counted in Result. The rejected part means the run is NOT a full sync
+// success: Run returns this sentinel (wrapped with the counts) instead of
+// a nil error, and the rejected records are settled per record (they are
+// never blindly resent as-is).
+var ErrRecordsRejected = errors.New("records_rejected")
 
 type Options struct {
 	StateDir   string
@@ -112,6 +135,18 @@ type Result struct {
 	SyncedBatches int
 	SyncedRecords int
 	syncedTools   map[string]bool
+	// RejectedBatches counts drained batches whose server receipt
+	// reported at least one rejected record. Those batches are terminal
+	// (the syncclient already reconciled the receipt: accepted records
+	// confirmed, batch marked synced), so they are also counted in
+	// SyncedBatches; the rejected part is carried separately here so it
+	// can never silently read as accepted data.
+	RejectedBatches int
+	// RejectedRecords counts records the server rejected across drained
+	// batches this run. Non-zero means the run is not a complete sync
+	// even though every upload round itself succeeded; Run surfaces
+	// ErrRecordsRejected alongside the accepted counts.
+	RejectedRecords int
 	// Recovered counts quarantine records re-pended during the drain.
 	Recovered int
 	// Quarantined counts records currently in the quarantine store after
@@ -396,22 +431,143 @@ func toolForSource(source string) string {
 	return ""
 }
 
-func drain(ctx context.Context, res *Result, opt Options) error {
+// drain uploads pending outbox batches up to the bound and, when the
+// pending queue runs empty while the quarantine store still holds records,
+// performs one recovery round through the syncclient so records that the
+// current authorization allows again are re-pended and drained in the same
+// run. The recovery round goes through the normal sync path — bound
+// device, fresh server-consent preflight, no ingest POST — so it never
+// evaluates the scope locally and never bypasses the server's
+// authorization.
+//
+// Authorization model (the same as the pending-batch drain, plus the
+// syncclient's recovery gate): local grants gate READING (which inputs the
+// export phase scans), while SENDING is authorized by the server's live
+// consent scope, re-checked fresh on every round and enforced again
+// server-side at ingest. Quarantine recovery additionally requires an
+// enabled local grant for the record's (source, input) once the device has
+// a configured grant store — the syncclient enforces that on every
+// recovery path, so a grant the user disabled or connect closed keeps its
+// quarantined records held even when the server scope would allow them
+// again. A device that never configured grants keeps the historical
+// grant-agnostic recovery, matching the manual sync path.
+//
+// Partial receipts: synccmd.Run can succeed (nil error) with a receipt
+// that rejected some or all of the batch's records — the syncclient has
+// already reconciled such a receipt (accepted records confirmed, rejected
+// messages settled per record, batch marked synced), so the drain neither
+// retries nor rolls anything back. The accepted part stays counted; the
+// rejected part is counted separately and the drain epilogue turns an
+// otherwise-clean run into ErrRecordsRejected so a partial or fully
+// rejected batch can never be reported as full sync success.
+func drain(ctx context.Context, res *Result, opt Options) (err error) {
 	stateDir := strings.TrimSpace(opt.StateDir)
 	maxBatches := opt.MaxBatches
 	if maxBatches <= 0 {
 		maxBatches = DefaultMaxSyncBatches
 	}
+	// firstRejectedBatch remembers the first batch whose receipt carried
+	// rejected records, for the epilogue's diagnosis message.
+	firstRejectedBatch := ""
+	// Epilogue: settled rejections must never read as full sync success.
+	// A receipt with rejected records arrives with a nil synccmd.Run
+	// error, so without this check the drain would return nil and the
+	// caller could mistake the run for a fully successful sync. Real
+	// errors (upload failures, recovery failures) always win unchanged;
+	// only an otherwise-clean drain is converted into the sentinel.
+	defer func() {
+		if err != nil || res.RejectedRecords == 0 {
+			return
+		}
+		detail := ""
+		if firstRejectedBatch != "" {
+			detail = fmt.Sprintf(" (first rejected batch: %s)", firstRejectedBatch)
+		}
+		err = fmt.Errorf("%w: the server rejected %d record(s) across %d drained batch(es)%s; accepted records were confirmed and kept, rejected records are settled per record and are not resent as-is",
+			ErrRecordsRejected, res.RejectedRecords, res.RejectedBatches, detail)
+	}()
 	ledger := outbox.New(stateDir)
-	for i := 0; i < maxBatches; i++ {
+	// uploads bounds the drain by attempted batch uploads. A quarantine
+	// recovery round sends no batch and therefore never consumes an upload
+	// slot: a run whose only work is recovery still drains what it
+	// recovered, whatever the batch bound is.
+	uploads := 0
+	recoveryAttempted := false
+	for uploads < maxBatches {
 		entry, ok, err := ledger.NextPending()
 		if err != nil {
 			return err
 		}
 		if !ok {
-			// Nothing pending and nothing quarantined: no network at all.
+			entries, qErr := quarantine.New(stateDir).Load()
+			if qErr != nil {
+				return qErr
+			}
+			// No upload is in flight, so the store's current size is the
+			// authoritative post-drain quarantine count.
+			res.Quarantined = len(entries)
+			if len(entries) == 0 || recoveryAttempted {
+				// Nothing pending and nothing (more) recoverable this run:
+				// the drain is complete. With an empty quarantine store
+				// this path performs no network at all.
+				return nil
+			}
+			// Empty pending queue but quarantined records: without a round
+			// here a device with no new data would never recover them —
+			// recovery only runs inside the syncclient, which the drain
+			// otherwise calls exclusively while a pending batch exists.
+			// Attempted at most once per drain: records the fresh snapshot
+			// still excludes cannot become recoverable within the same
+			// run (recovery requires a strictly newer consent revision
+			// and, where grants are configured, an enabled local grant).
+			recoveryAttempted = true
+			// synccmd.Run re-checks device binding and fetches a fresh
+			// server-consent snapshot before deciding; it never binds.
+			syncResult, err := synccmd.Run(ctx, statedir.New(stateDir), synccmd.Options{
+				StateDir:   stateDir,
+				ServerURL:  opt.ServerURL,
+				HTTPClient: opt.HTTPClient,
+			})
+			res.Recovered += syncResult.Recovered
+			if err != nil {
+				// A failed round still leaves consistent recovery state
+				// (replayed journals apply atomically), so reload the
+				// authoritative count instead of trusting either the
+				// pre-round snapshot or the zeroed error result.
+				count, qErr := quarantineStoreCount(stateDir)
+				if qErr != nil {
+					return qErr
+				}
+				res.Quarantined = count
+				if errors.Is(err, synccmd.ErrQuarantineHeld) {
+					// Quarantined records the current authorization still
+					// excludes — the live consent scope, or on a grant-
+					// configured device a disabled or closed local
+					// (source, input) grant — are a normal steady state,
+					// not a run failure: they stay recoverable until the
+					// authorization widens again.
+					return nil
+				}
+				remaining, countErr := countPending(ledger)
+				if countErr != nil {
+					return countErr
+				}
+				res.PendingRemaining = remaining
+				res.DrainStopped = fmt.Sprintf("quarantine recovery round failed: %v", err)
+				return err
+			}
+			res.Quarantined = syncResult.Quarantined
+			if syncResult.Recovered > 0 {
+				// The recovered records are pending batches now; continue
+				// so this run also drains them.
+				continue
+			}
+			// Defensive: the syncclient only succeeds the recovery round
+			// when something was recovered; if that ever changes, finish
+			// cleanly instead of spinning.
 			return nil
 		}
+		uploads++
 		// synccmd.Run re-checks device binding and fresh server consent
 		// (preflight self GET) before every upload. It never binds.
 		syncResult, err := synccmd.Run(ctx, statedir.New(stateDir), synccmd.Options{
@@ -454,6 +610,20 @@ func drain(ctx context.Context, res *Result, opt Options) error {
 		if syncResult.Receipt.BatchID != "" {
 			res.SyncedBatches++
 			res.SyncedRecords += syncResult.Receipt.AcceptedRecords
+			if syncResult.Receipt.RejectedRecords > 0 {
+				// A partial or fully rejected receipt with a nil error:
+				// the syncclient already reconciled it (accepted records
+				// confirmed, batch marked synced), so the accepted part
+				// stays counted above and the drain keeps going — later
+				// batches must not lose their chance to upload. The
+				// rejected part is recorded here and surfaced by the
+				// drain epilogue, never as full sync success.
+				res.RejectedBatches++
+				res.RejectedRecords += syncResult.Receipt.RejectedRecords
+				if firstRejectedBatch == "" {
+					firstRejectedBatch = syncResult.Receipt.BatchID
+				}
+			}
 			if tool := toolForSource(entry.Source); tool != "" && syncResult.Receipt.AcceptedRecords > 0 {
 				if res.syncedTools == nil {
 					res.syncedTools = map[string]bool{}
@@ -494,6 +664,16 @@ func countPending(ledger outbox.Store) (int, error) {
 		}
 	}
 	return count, nil
+}
+
+// quarantineStoreCount reports how many records currently sit in the
+// quarantine store.
+func quarantineStoreCount(stateDir string) (int, error) {
+	entries, err := quarantine.New(stateDir).Load()
+	if err != nil {
+		return 0, err
+	}
+	return len(entries), nil
 }
 
 // newBatchID builds a unique local batch id: timestamp plus a short random

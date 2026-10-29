@@ -6,12 +6,43 @@ import (
 	"strings"
 	"time"
 
+	"toktrail-collector/internal/local/filtertxn"
 	"toktrail-collector/internal/local/managedconsent"
 	"toktrail-collector/internal/local/progress"
 	"toktrail-collector/internal/local/quarantine"
 	"toktrail-collector/internal/local/statedir"
 	"toktrail-collector/internal/source/adapter"
 )
+
+// recoverPendingFilterTxn completes any history-filter transaction an
+// earlier crash left half-applied — including when the current call has no
+// cutoff or nothing to skip (e.g. the cutoff widened between runs and the
+// interrupted transaction still has to complete). It must run BEFORE any
+// adapter loads cutoff-governed state (Claude message baselines, the
+// quarantine store): records computed against a half-applied transaction
+// would either re-emit intervals the transaction already handles or trip
+// the adapter's progress-integrity gates. Only mutating flows (export)
+// recover; Scan and Preview stay read-only by contract (diagnostic.Privacy
+// promises no state mutation), so a pending journal converges at the next
+// export.
+//
+// Serialization: like exportcommit's journal, the filter journal is a
+// single per-state-directory slot whose create→apply→remove cycle is not
+// intra-process locked. Callers already serialize state-directory access
+// with the runlock (collection and the CLI commands acquire it around every
+// export); pipeline must not acquire the runlock itself because collection
+// holds it across PrepareExport. Recovery and commit are idempotent, so a
+// replay under the runlock is always safe.
+func recoverPendingFilterTxn(stateDir string) error {
+	stateDir = strings.TrimSpace(stateDir)
+	if stateDir == "" {
+		return nil
+	}
+	if _, err := filtertxn.Recover(stateDir); err != nil {
+		return fmt.Errorf("recover pending history-filter transaction: %w", err)
+	}
+	return nil
+}
 
 // FilterHistoryCutoff drops records whose occurredAt timestamp is strictly before the
 // configured HistoryFrom cutoff (either provided in opt or loaded from opt.StateDir).
@@ -22,21 +53,39 @@ import (
 //  2. Skipped records are quarantined with quarantine.ReasonBeforeHistoryFrom so that
 //     adapters (like codex-jsonl) and sync reconciliation recognize them as known/handled
 //     and do not re-emit them in subsequent runs.
+//
+// Both writes are ONE crash-safe transaction (filtertxn): the full intent is journaled
+// before any store is touched, the quarantine half is applied before the baseline half,
+// and any interruption is replayed to completion by the next run. Writing the baseline
+// first (the pre-transaction order) was a permanent-loss window: a crash before the
+// quarantine write suppressed re-emission of the skipped intervals, so the quarantine
+// entries could never be re-created and widening the history window later could not
+// recover the records.
+//
+// PrepareExport recovers a pending transaction BEFORE the adapter loads records, so
+// this function's own recovery is a no-op there; it is kept so direct callers of
+// FilterHistoryCutoff converge too.
 func FilterHistoryCutoff(opt adapter.Options, records []adapter.Record, updates []progress.MessagePendingUpdate) ([]adapter.Record, []progress.MessagePendingUpdate, error) {
+	if err := recoverPendingFilterTxn(opt.StateDir); err != nil {
+		return nil, nil, err
+	}
+
+	stateDir := strings.TrimSpace(opt.StateDir)
+
 	cutoff := opt.HistoryFrom
-	if cutoff == nil && strings.TrimSpace(opt.StateDir) != "" {
+	if cutoff == nil && stateDir != "" {
 		// Legacy fallback: without an applied server grant view, the
 		// bind-time state cutoff governs when the caller passed none.
 		// Under the grant protocol the server-confirmed effective cutoff is
 		// authoritative — including an explicit nil (unlimited), which must
 		// NOT fall back to the bind-time cutoff, or a server-side widening
 		// to unlimited could never take effect.
-		managed, seen, err := managedconsent.New(opt.StateDir).Load()
+		managed, seen, err := managedconsent.New(stateDir).Load()
 		if err != nil {
 			return nil, nil, fmt.Errorf("load managed consent overlay: %w", err)
 		}
 		if !seen {
-			st, err := statedir.New(opt.StateDir).Load()
+			st, err := statedir.New(stateDir).Load()
 			if err != nil {
 				return nil, nil, fmt.Errorf("load history cutoff: %w", err)
 			}
@@ -86,56 +135,68 @@ func FilterHistoryCutoff(opt adapter.Options, records []adapter.Record, updates 
 		}
 	}
 
-	stateDir := strings.TrimSpace(opt.StateDir)
-	if stateDir != "" {
-		// The revision the history scope was applied under: recovery of
-		// these entries requires a strictly newer revision, so the real
-		// current revision must be recorded — a zero revision would let a
-		// future unchanged revision wrongly recover records that are still
-		// before the live cutoff.
-		quarantineRevision := int64(0)
-		if managed, seen, err := managedconsent.New(stateDir).Load(); err == nil && seen {
-			quarantineRevision = managed.ConsentRevision
-		} else if err != nil {
-			return nil, nil, fmt.Errorf("load managed consent overlay: %w", err)
-		} else if st, serr := statedir.New(stateDir).Load(); serr == nil {
-			quarantineRevision = st.ConsentRevision
-		}
-		// Advance baseline for skipped message intervals so they don't replay deltas from 0
-		if len(skippedUpdates) > 0 {
-			if err := progress.New(stateDir).EstablishConfirmedBaseline(opt.Source, skippedUpdates); err != nil {
-				return nil, nil, fmt.Errorf("confirm skipped history baseline: %w", err)
-			}
-		}
+	if stateDir == "" {
+		// Without a state directory nothing can be persisted: skipped
+		// records are only dropped from the batch.
+		return kept, keptUpdates, nil
+	}
 
-		// Quarantine skipped records with ReasonBeforeHistoryFrom
-		entries := make([]quarantine.Entry, 0, len(skipped))
-		now := time.Now().UTC()
-		for _, r := range skipped {
-			key := adapter.StringField(r, "recordKey")
-			if key == "" {
-				continue
-			}
-			raw, err := json.Marshal(r)
-			if err != nil {
-				continue
-			}
-			entries = append(entries, quarantine.Entry{
-				Source:          opt.Source,
-				Input:           opt.Input,
-				RecordKey:       key,
-				Record:          raw,
-				OriginBatchID:   opt.BatchID,
-				Reason:          quarantine.ReasonBeforeHistoryFrom,
-				QuarantinedAt:   now,
-				ConsentRevision: quarantineRevision,
-			})
+	// The revision the history scope was applied under: recovery of
+	// these entries requires a strictly newer revision, so the real
+	// current revision must be recorded — a zero revision would let a
+	// future unchanged revision wrongly recover records that are still
+	// before the live cutoff. An unreadable device state therefore fails
+	// closed instead of silently persisting revision 0.
+	quarantineRevision := int64(0)
+	if managed, seen, err := managedconsent.New(stateDir).Load(); err == nil && seen {
+		quarantineRevision = managed.ConsentRevision
+	} else if err != nil {
+		return nil, nil, fmt.Errorf("load managed consent overlay: %w", err)
+	} else if st, serr := statedir.New(stateDir).Load(); serr != nil {
+		return nil, nil, fmt.Errorf("load quarantine consent revision: %w", serr)
+	} else {
+		quarantineRevision = st.ConsentRevision
+	}
+
+	// Quarantine skipped records with ReasonBeforeHistoryFrom and advance
+	// the Claude baseline for their message intervals in one journaled
+	// transaction, so a crash between the two writes is replayed to
+	// completion instead of losing the recoverable quarantine entries.
+	entries := make([]quarantine.Entry, 0, len(skipped))
+	now := time.Now().UTC()
+	for _, r := range skipped {
+		key := adapter.StringField(r, "recordKey")
+		if key == "" {
+			continue
 		}
-		if len(entries) > 0 {
-			if err := quarantine.New(stateDir).Append(entries); err != nil {
-				return nil, nil, fmt.Errorf("quarantine skipped history: %w", err)
-			}
+		raw, err := json.Marshal(r)
+		if err != nil {
+			continue
 		}
+		entries = append(entries, quarantine.Entry{
+			Source:          opt.Source,
+			Input:           opt.Input,
+			RecordKey:       key,
+			Record:          raw,
+			OriginBatchID:   opt.BatchID,
+			Reason:          quarantine.ReasonBeforeHistoryFrom,
+			QuarantinedAt:   now,
+			ConsentRevision: quarantineRevision,
+		})
+	}
+	if len(entries) == 0 && len(skippedUpdates) == 0 {
+		return kept, keptUpdates, nil
+	}
+	journal := filtertxn.Journal{
+		Schema:     filtertxn.SchemaVersion,
+		Source:     opt.Source,
+		Input:      opt.Input,
+		Quarantine: entries,
+		Baselines:  skippedUpdates,
+		CreatedAt:  now,
+	}
+	if err := filtertxn.Commit(stateDir, journal); err != nil {
+		return nil, nil, fmt.Errorf("commit history-filter transaction: %w", err)
 	}
 
 	return kept, keptUpdates, nil

@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"toktrail-collector/internal/app/collection"
 	"toktrail-collector/internal/app/cursorsync"
 	"toktrail-collector/internal/bind"
 	"toktrail-collector/internal/local/cursorsource"
@@ -24,14 +23,27 @@ import (
 )
 
 // Run coordinates the full connect orchestration:
-// 1. Fetching server configuration via one-time ticket over HTTPS / loopback HTTP.
-// 2. Binding device credentials (or skipping if already bound for this ticket/url receipt).
+//  1. Fetching server configuration via one-time ticket over HTTPS / loopback HTTP.
+//  2. Binding device credentials (or skipping if already bound for this ticket/url receipt).
 //  3. Probing locally available sources based on server-specified tool list and local disk existence.
 //  4. Configuring local source grants (disabling previously active grants not in the new set).
 //  5. Installing the scheduled background service.
 //  6. Reporting probe-only tool statuses to the server (unsupported tools, missing default
 //     directories); activated tools are reported by the collection flow (synced / no_new_records).
-//  7. Performing an initial collection run (without nested state locks).
+//  7. The shared post-install sync orchestration (Sync): an initial collection run that
+//     refreshes the server authorization, scans local sources and recovers quarantine state;
+//     the history retransmission of already-synced outbox batches under an exclusive state
+//     lock; and bounded backlog drain passes. Every incompleteness is reported honestly —
+//     the run returns ErrSyncIncomplete (or the phase error) instead of presenting a
+//     partial sync as success, while the scheduled incremental installed in step 5 keeps
+//     running regardless.
+//
+// Before any bind, connect fails closed on authorization-identity mismatches: a state
+// directory already bound to a different server/application/subject is never silently
+// re-pointed (the outbox does not record per-subject ownership, so its history cannot be
+// moved to a new account), and a rebind that would change the device identity over an
+// existing synced history is refused (cross-device de-duplication is not promised, so
+// retransmitting it would double count).
 func Run(ctx context.Context, opt Options) (Result, error) {
 	out := opt.Out
 	if out == nil {
@@ -93,12 +105,13 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	// Compute deterministic receipt fingerprint (SHA-256 of ticket and canonical URL).
 	fingerprint := computeReceiptFingerprint(ticket, strippedURL)
 
-	// 3-5. Perform state-locked setup operations
+	// 3-6. Perform state-locked setup operations
 	var (
 		deviceID        string
 		consentRev      int64
 		skippedBind     bool
 		authorizedTools []string
+		accountTools    []string
 		serviceIdentity string
 	)
 
@@ -112,6 +125,52 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		st, err := store.Load()
 		if err != nil {
 			return err
+		}
+
+		// Ownership fail-closed checks. The outbox does not record which
+		// device or subject originally synced a batch, and the server
+		// does not promise cross-device de-duplication, so a state
+		// directory's synced history must never be silently re-pointed
+		// at a different authorization or device identity. All checks
+		// below run before any bind, and the ownership guard makes them
+		// durable: a refused mismatch leaves the state unchanged, so
+		// every later run fails the same way until the user moves to a
+		// separate state directory (or knowingly abandons the record).
+		priorDeviceID := st.DeviceID
+		priorSynced, err := countSyncedBatches(stateDir)
+		if err != nil {
+			return err
+		}
+		if priorDeviceID != "" {
+			if strings.TrimRight(strings.TrimSpace(st.ServerURL), "/") != strings.TrimRight(cfg.ServerURL, "/") ||
+				strings.TrimSpace(st.ApplicationID) != cfg.ApplicationID ||
+				strings.TrimSpace(st.ExternalSubjectID) != cfg.SubjectID {
+				return fmt.Errorf("this state directory is already bound to a different authorization (server=%s applicationId=%s subjectId=%s) than this connect link authorizes (server=%s applicationId=%s subjectId=%s); the local outbox does not record per-subject ownership, so existing history cannot be moved to a new account automatically — use a separate --state-dir for this connect link",
+					strings.TrimSpace(st.ServerURL), strings.TrimSpace(st.ApplicationID), strings.TrimSpace(st.ExternalSubjectID),
+					cfg.ServerURL, cfg.ApplicationID, cfg.SubjectID)
+			}
+			ownership, hasOwnership, err := loadOwnership(stateDir)
+			if err != nil {
+				return err
+			}
+			if hasOwnership && ownership.DeviceID != priorDeviceID {
+				return fmt.Errorf("the synced history in this state directory belongs to device %s, but this collector is bound as %s; cross-device de-duplication is not guaranteed, so connect refuses to retransmit it (avoiding double counting) — use a separate --state-dir, or remove %s only if you accept abandoning the ownership record",
+					ownership.DeviceID, priorDeviceID, ownershipPath(stateDir))
+			}
+			// Record ownership before any bind that could change the
+			// device identity, so the guard above also covers retries
+			// after such a rebind.
+			if priorSynced > 0 && !hasOwnership {
+				if err := saveOwnership(stateDir, priorDeviceID, nowFn().UTC()); err != nil {
+					return err
+				}
+			}
+		} else if priorSynced > 0 {
+			// An unbound state directory that still holds synced history
+			// cannot attribute it: binding a new device over it would
+			// retransmit another device's archives under the new
+			// identity (double counting). Fail closed.
+			return fmt.Errorf("this state directory holds %d synced batch(es) but no bound device; the history's owning device cannot be attributed, so connect refuses to bind a new device over it — use a separate --state-dir for this connect link", priorSynced)
 		}
 
 		deviceName := opt.DeviceName
@@ -136,11 +195,18 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 			needSave := false
 			isNewReceipt := st.ConnectReceiptHash != fingerprint
 			if isNewReceipt {
+				// A receipt this state has not seen is a new
+				// authorization acceptance: pin its history window.
 				st.ConnectReceiptHash = fingerprint
 				st.PendingConnectReceiptHash = ""
+				applyHistoryCutoff(&st, cutoff, historyDays)
 				needSave = true
-			}
-			if isNewReceipt || cfg.Days == nil || st.HistoryFrom == nil || st.HistoryFrom.IsZero() {
+			} else if st.HistoryFrom == nil || st.HistoryFrom.IsZero() {
+				// First pinning for a receipt whose window was never
+				// recorded (for example a device bound outside
+				// connect). A same-receipt retry never re-derives the
+				// cutoff: a now-based window would drift forward on
+				// every retry, progressively narrowing the window.
 				applyHistoryCutoff(&st, cutoff, historyDays)
 				needSave = true
 			}
@@ -168,6 +234,16 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 			})
 			if err != nil {
 				return fmt.Errorf("device bind failed: %w", sanitizeError(err, ticket))
+			}
+			// A rebind that changed the device identity must not
+			// retransmit the previous device's history: the outbox does
+			// not attribute batches to devices and cross-device
+			// de-duplication is not promised, so the run fails closed
+			// instead of risking double counting. The ownership guard
+			// recorded above makes the refusal durable across retries.
+			if priorSynced > 0 && bindRes.State.DeviceID != priorDeviceID {
+				return fmt.Errorf("rebinding this connect link changed the device identity from %s to %s; the %d synced batch(es) in this state directory belong to %s and connect will not retransmit them under the new device (cross-device de-duplication is not guaranteed, so retransmitting would double count) — use a separate --state-dir for the new device",
+					priorDeviceID, bindRes.State.DeviceID, priorSynced, priorDeviceID)
 			}
 			deviceID = bindRes.State.DeviceID
 			consentRev = bindRes.State.ConsentRevision
@@ -216,7 +292,10 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 				// mutations; an existing permit defers to the initial
 				// collection. A confirmation failure is a clear skip — it
 				// never fails the whole connect run (the other tools keep
-				// their setup) and never reports a fabricated tool status.
+				// their setup) and never reports a fabricated tool status;
+				// the sync phase reports the account source as incomplete
+				// instead.
+				accountTools = append(accountTools, spec.Tool)
 				if opt.Cursor == nil {
 					fmt.Fprintf(out, "tool %q: account source; this build has no cursor wiring, skipped\n", spec.Tool)
 					continue
@@ -325,54 +404,22 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		return Result{}, err
 	}
 
-	// 7. Initial collection run (collection.Run acquires its own state lock)
-	fmt.Fprintf(out, "running initial collection...\n")
-	cursorOpts := opt.Cursor
-	if cursorOpts != nil {
-		c := *cursorOpts
-		c.StateDir = stateDir
-		c.ServerURL = cfg.ServerURL
-		c.HTTPClient = opt.HTTPClient
-		c.Out = out
-		cursorOpts = &c
-	}
-	periodicResult, err := collection.Run(ctx, collection.Options{
-		StateDir:   stateDir,
-		ServerURL:  cfg.ServerURL,
-		MaxBatches: collection.DefaultMaxSyncBatches,
-		HTTPClient: opt.HTTPClient,
-		Now:        nowFn,
-		Cursor:     cursorOpts,
+	// 7. Shared post-install sync orchestration: initial collection
+	// (authorization refresh, scan, quarantine recovery, bounded drain),
+	// history retransmission under an exclusive state lock, then backlog
+	// drain passes. Failures and incompleteness are reported honestly and
+	// never break the scheduled incremental installed above.
+	syncRes, syncErr := Sync(ctx, SyncOptions{
+		StateDir:        stateDir,
+		ServerURL:       cfg.ServerURL,
+		HTTPClient:      opt.HTTPClient,
+		Now:             nowFn,
+		Out:             out,
+		HomeDir:         homeDir,
+		Cursor:          opt.Cursor,
+		AuthorizedTools: authorizedTools,
+		AccountTools:    accountTools,
 	})
-	if err != nil {
-		return Result{
-			DeviceID:         deviceID,
-			ServerURL:        cfg.ServerURL,
-			ApplicationID:    cfg.ApplicationID,
-			SubjectID:        cfg.SubjectID,
-			ConsentRevision:  consentRev,
-			SkippedBind:      skippedBind,
-			AuthorizedTools:  authorizedTools,
-			InstalledService: serviceIdentity,
-		}, fmt.Errorf("initial collection failed: %w", err)
-	}
-
-	if periodicResult.NoGrants {
-		fmt.Fprintf(out, "initial collection: no enabled source grants; skipped\n")
-	} else {
-		fmt.Fprintf(out, "initial collection: exportedBatches=%d exportedRecords=%d syncedBatches=%d syncedRecords=%d\n",
-			periodicResult.ExportedBatches, periodicResult.ExportedRecords,
-			periodicResult.SyncedBatches, periodicResult.SyncedRecords)
-	}
-	if periodicResult.Cursor.Ran {
-		// The account-level cursor round is independent of the local
-		// grant counts above; surface it so a cursor-only device never
-		// looks like an all-zero run.
-		fmt.Fprintf(out, "initial collection: cursor pulledEvents=%d newRecords=%d replacedRecords=%d uploadedRecords=%d pendingBatches=%d\n",
-			periodicResult.Cursor.PulledEvents, periodicResult.Cursor.NewRecords,
-			periodicResult.Cursor.ReplacedRecords, periodicResult.Cursor.SyncedRecords,
-			periodicResult.Cursor.PendingRemaining)
-	}
 
 	return Result{
 		DeviceID:         deviceID,
@@ -383,32 +430,22 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		SkippedBind:      skippedBind,
 		AuthorizedTools:  authorizedTools,
 		InstalledService: serviceIdentity,
-		PeriodicResult:   periodicResult,
-	}, nil
+		PeriodicResult:   syncRes.Collection,
+		Sync:             syncRes,
+	}, syncErr
 }
 
-// applyHistoryCutoff pins the consented history window without ever
-// shrinking it. Bind and rebind must not orphan records an earlier consent
-// already authorized: narrowing HistoryFrom would move already-collected
-// records before the cutoff, where the pipeline quarantines them as
-// before_history_from. A cutoff is applied only when it widens the window
-// (no current cutoff, or an earlier date); HistoryDays keeps the widest
-// window ever granted. A nil cutoff means unlimited history — the widest
-// window — so it clears any pinned cutoff. Baselines, the outbox, and
-// collection progress live in separate stores and are never rewritten by
-// bind or rebind.
+// applyHistoryCutoff pins the consented history window to THIS run's
+// authorization. The current cutoff replaces whatever was pinned before:
+// narrowing (for example 30→7 days) follows the user's current consent,
+// and a nil cutoff means unlimited history. It is called only when a NEW
+// authorization is accepted — a fresh bind, or a receipt this state has
+// not seen — because re-deriving a now-based cutoff on a same-receipt
+// retry would drift the window forward run by run, progressively
+// narrowing it. Records already collected that fall before a narrowed
+// cutoff are quarantined by the pipeline (before_history_from), never
+// deleted.
 func applyHistoryCutoff(st *statedir.DeviceState, cutoff *time.Time, days int) {
-	if cutoff == nil {
-		st.HistoryFrom = nil
-		st.HistoryDays = 0
-		return
-	}
-	if st.HistoryFrom == nil || st.HistoryFrom.IsZero() || cutoff.Before(*st.HistoryFrom) {
-		st.HistoryFrom = cutoff
-		st.HistoryDays = days
-		return
-	}
-	if days > st.HistoryDays {
-		st.HistoryDays = days
-	}
+	st.HistoryFrom = cutoff
+	st.HistoryDays = days
 }

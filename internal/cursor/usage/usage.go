@@ -41,9 +41,45 @@ type NormalizeStats struct {
 	// they cannot receive a stable eventKey and are never guessed into
 	// one (a fabricated identity would double-count the event).
 	SkippedNoStableID int
+	// ReemittedRecords counts unchanged events re-emitted (instead of
+	// skipped) because NormalizeOptions.ForceReemitUnchanged was set:
+	// their content matches the cached entry, but the round re-delivers
+	// them so a rebuilt or reinstalled deployment recovers the full
+	// authorized range. They are neither new nor replaced — the server
+	// already holds the same fact; the re-delivery re-asserts it at a
+	// fresh revision.
+	ReemittedRecords int
 }
 
-// Normalize converts one round's collapsed snapshots into upload records.
+// NormalizeOptions extends Normalize with per-round behavioral switches.
+// The zero value preserves the default semantics exactly.
+type NormalizeOptions struct {
+	// ForceReemitUnchanged re-emits unchanged events (same content digest
+	// as the cached entry) as records carrying a fresh revision instead
+	// of skipping them. The fresh revision is the round revision — which
+	// the caller derives as the max of the local and the server-delivered
+	// nextRevision — bumped past the event's cached revision whenever
+	// needed, so the re-delivery can never be stale against either
+	// memory. The cache itself is never cleared: a re-emitted entry
+	// simply restages at the fresh revision with the same digest, keeping
+	// the ledger monotonic.
+	//
+	// This powers reinstall recovery (cursorsync.Options.ForceResync):
+	// the server's view of the account source is rebuilt from the
+	// currently authorized window even when the local cache considers
+	// every event unchanged.
+	ForceReemitUnchanged bool
+}
+
+// Normalize converts one round's collapsed snapshots into upload records
+// with the default options. See NormalizeWithOptions for the full
+// contract.
+func Normalize(events []api.UsageEvent, subjectID, accountID string, roundRevision int64, cache *EventCache) ([]protocol.Event, map[string]CacheEntry, NormalizeStats, error) {
+	return NormalizeWithOptions(events, subjectID, accountID, roundRevision, cache, NormalizeOptions{})
+}
+
+// NormalizeWithOptions converts one round's collapsed snapshots into
+// upload records under the given per-round options.
 //
 // Input must already be collapsed per response (api.CollapseSnapshots):
 // rows sharing a UsageEventID are cumulative snapshot re-deliveries of one
@@ -54,17 +90,18 @@ type NormalizeStats struct {
 // Revision rule: all new and changed events in one round share the round
 // revision (roundRevision, assigned by the caller from the license
 // NextRevision and persisted with the batch before upload); unchanged
-// events (same counter digest as the cache) are skipped. A per-event guard
-// keeps the assigned revision strictly above any cached revision for the
-// same event, so a replacement can never collide with the fact it
-// replaces.
+// events (same counter digest as the cache) are skipped — unless
+// opts.ForceReemitUnchanged re-emits them (see NormalizeOptions). A
+// per-event guard keeps the assigned revision strictly above any cached
+// revision for the same event, so a replacement (or a forced re-emission)
+// can never collide with the fact it replaces.
 //
 // The cache is read-only here: staged entries are returned separately and
 // must be applied (EventCache.Apply + Commit) by the caller only after
 // the resulting batch is durable in the cursor outbox — a failed or
 // interrupted round therefore never pollutes the live cache. Error
 // messages never embed raw upstream event ids (they are untrusted data).
-func Normalize(events []api.UsageEvent, subjectID, accountID string, roundRevision int64, cache *EventCache) ([]protocol.Event, map[string]CacheEntry, NormalizeStats, error) {
+func NormalizeWithOptions(events []api.UsageEvent, subjectID, accountID string, roundRevision int64, cache *EventCache, opts NormalizeOptions) ([]protocol.Event, map[string]CacheEntry, NormalizeStats, error) {
 	if roundRevision < 1 {
 		return nil, nil, NormalizeStats{}, errors.New("round revision must be positive")
 	}
@@ -86,14 +123,17 @@ func Normalize(events []api.UsageEvent, subjectID, accountID string, roundRevisi
 		}
 		digest := eventDigest(ev)
 		cached, has := cache.Get(eventKey)
-		if has && cached.Digest == digest {
+		unchanged := has && cached.Digest == digest
+		if unchanged && !opts.ForceReemitUnchanged {
 			stats.SkippedUnchanged++
 			continue
 		}
 		rev := roundRevision
 		if has && cached.Revision >= rev {
 			// Never reuse or regress below a revision this event already
-			// carries (stale seeding edge): bump past it.
+			// carries (stale seeding edge): bump past it. For a forced
+			// re-emission this also guarantees the re-delivered revision
+			// stays strictly above the event's cached revision.
 			rev = cached.Revision + 1
 		}
 		rec := protocol.Event{
@@ -114,9 +154,12 @@ func Normalize(events []api.UsageEvent, subjectID, accountID string, roundRevisi
 		rec.Output = decimalOfPtr(ev.OutputTokens)
 		records = append(records, rec)
 		staged[eventKey] = CacheEntry{Revision: rev, Digest: digest}
-		if has {
+		switch {
+		case unchanged:
+			stats.ReemittedRecords++
+		case has:
 			stats.ReplacedRecords++
-		} else {
+		default:
 			stats.NewRecords++
 		}
 	}

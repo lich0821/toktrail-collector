@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -24,33 +25,55 @@ import (
 type fakeRemote struct {
 	mu                                    sync.Mutex
 	calls                                 int
+	selfCalls                             int
 	posts                                 int
+	posted                                [][]string
 	seen                                  map[string]bool
 	receipts                              map[string]syncclient.BatchReceipt
 	paused, revoked, reject, wrongReceipt bool
 	failBatch                             string
+	scopeRejectBatch                      string
 	allowed                               []string
 	from                                  *time.Time
+	revision                              int64
+	// Mid-run authorization drift: once more than widenAfterSelf self
+	// GETs have been served, the served scope switches to
+	// widenRevision/widenFrom (modeling a consent change between this
+	// collector's preflight and a later read). Zero disables the switch.
+	widenAfterSelf int
+	widenRevision  int64
+	widenFrom      *time.Time
+}
+
+// servedScope reports the consent scope the fake currently serves.
+func (f *fakeRemote) servedScope() (revision int64, from *time.Time) {
+	if f.widenAfterSelf > 0 && f.selfCalls > f.widenAfterSelf {
+		return f.widenRevision, f.widenFrom
+	}
+	return f.revision, f.from
 }
 
 func newRemote(t *testing.T) (*fakeRemote, *httptest.Server) {
 	t.Helper()
-	s := &fakeRemote{seen: map[string]bool{}, receipts: map[string]syncclient.BatchReceipt{}, allowed: []string{"Codex"}}
+	s := &fakeRemote{seen: map[string]bool{}, receipts: map[string]syncclient.BatchReceipt{}, allowed: []string{"Codex"}, revision: 1}
 	h := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.calls++
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/v1/devices/self" {
+			s.selfCalls++
+			revision, from := s.servedScope()
 			v := 1
-			json.NewEncoder(w).Encode(map[string]any{"device": syncclient.SelfStatus{DeviceID: "device-resync", ConsentRevision: 1, UploadAuthorized: !s.revoked, Revoked: s.revoked, Paused: s.paused, GrantProtocolVersion: &v, AllowedTools: s.allowed, HistoryFrom: s.from}})
+			json.NewEncoder(w).Encode(map[string]any{"device": syncclient.SelfStatus{DeviceID: "device-resync", ConsentRevision: revision, UploadAuthorized: !s.revoked, Revoked: s.revoked, Paused: s.paused, GrantProtocolVersion: &v, AllowedTools: s.allowed, HistoryFrom: from}})
 			return
 		}
 		if r.URL.Path != "/v1/ingest/batches" {
 			w.WriteHeader(404)
 			return
 		}
-		if r.Header.Get("X-Consent-Revision") != "1" {
+		effectiveRevision, _ := s.servedScope()
+		if r.Header.Get("X-Consent-Revision") != strconv.FormatInt(effectiveRevision, 10) {
 			t.Error("missing live consent revision")
 		}
 		s.posts++
@@ -60,9 +83,22 @@ func newRemote(t *testing.T) (*fakeRemote, *httptest.Server) {
 			w.WriteHeader(400)
 			return
 		}
+		keys := make([]string, 0, len(batch.Records))
+		for _, raw := range batch.Records {
+			var probe map[string]any
+			if json.Unmarshal(raw, &probe) == nil {
+				keys = append(keys, fmt.Sprint(probe["recordKey"]))
+			}
+		}
+		s.posted = append(s.posted, keys)
 		if batch.BatchID == s.failBatch {
 			w.WriteHeader(503)
 			fmt.Fprint(w, `{"error":{"code":"temporarily_unavailable","message":"synthetic failure"}}`)
+			return
+		}
+		if batch.BatchID == s.scopeRejectBatch {
+			w.WriteHeader(409)
+			fmt.Fprint(w, `{"error":{"code":"scope_changed","message":"synthetic scope change"}}`)
 			return
 		}
 		receipt, ok := s.receipts[batch.BatchID]
@@ -92,6 +128,50 @@ func newRemote(t *testing.T) (*fakeRemote, *httptest.Server) {
 	}))
 	t.Cleanup(h.Close)
 	return s, h
+}
+
+// set swaps the live consent revision and history cutoff the fake serves
+// (and disables any armed mid-run switch, stabilizing the new scope).
+func (f *fakeRemote) set(revision int64, from *time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revision = revision
+	f.from = from
+	f.widenAfterSelf = 0
+}
+
+// armWiden switches the served consent scope once more than afterSelf
+// self GETs have been served.
+func (f *fakeRemote) armWiden(afterSelf int, revision int64, from *time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.widenAfterSelf = afterSelf
+	f.widenRevision = revision
+	f.widenFrom = from
+}
+
+func (f *fakeRemote) postCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.posts
+}
+
+func (f *fakeRemote) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *fakeRemote) resetPosted() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.posted = nil
+}
+
+func (f *fakeRemote) postedKeys() [][]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][]string(nil), f.posted...)
 }
 func record(key, occurred string) json.RawMessage {
 	b, _ := json.Marshal(map[string]any{"recordKey": key, "kind": "delta", "tool": "Codex", "model": "gpt-5.4", "occurredAt": occurred, "input": "100", "output": "50", "cacheRead": "20", "cacheWrite": "5", "adapterVersion": "synthetic", "sourceType": "fixture"})
@@ -439,5 +519,506 @@ func TestRejectedReceiptIsNotReportedAsSuccessfulRestore(t *testing.T) {
 	result, err := Run(context.Background(), options(dir))
 	if err == nil || result.RejectedRecords != 1 || result.AcceptedRecords != 0 || len(remote.seen) != 0 {
 		t.Fatalf("rejection hidden: %+v err=%v", result, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Consent-scope changes on incomplete jobs
+// ---------------------------------------------------------------------------
+
+// rewriteJournalAsSchemaOne rewrites the on-disk journal in the legacy
+// schema-1 form (no job-level scope baseline, per-batch revision stamps
+// preserved), optionally editing the job first. It models journals written
+// before the scope baseline existed.
+func rewriteJournalAsSchemaOne(t *testing.T, dir string, edit func(*job)) {
+	t.Helper()
+	jb, exists, err := loadJob(dir)
+	if err != nil || !exists {
+		t.Fatalf("load journal: exists=%t err=%v", exists, err)
+	}
+	if edit != nil {
+		edit(&jb)
+	}
+	jb.Schema = legacyJournalSchema
+	jb.Scope = nil
+	if err := saveJob(dir, jb); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResumeReplansWhenScopeWidens(t *testing.T) {
+	remote, server := newRemote(t)
+	cutoff := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	remote.from = &cutoff
+	dir := fixture(t, server.URL,
+		[]json.RawMessage{record("old", "2025-01-01T00:00:00Z"), record("new", "2026-10-28T00:00:00Z")},
+		[]json.RawMessage{record("b", "2026-10-27T00:00:00Z")},
+	)
+	opt := options(dir)
+	opt.MaxBatches = 1
+	first, err := Run(context.Background(), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Completed || first.SkippedOutOfScopeRecords != 1 || remote.seen["old"] || !remote.seen["new"] {
+		t.Fatalf("first pass: %+v", first)
+	}
+	staleJob, exists, err := loadJob(dir)
+	if err != nil || !exists || staleJob.CompletedAt != nil {
+		t.Fatalf("incomplete job: exists=%t err=%v", exists, err)
+	}
+
+	// The authorization widens: no history cutoff, revision bumped.
+	remote.set(2, nil)
+
+	postsBefore := remote.postCount()
+	second, err := Run(context.Background(), options(dir))
+	if err == nil {
+		t.Fatal("expected the scope-change stop")
+	}
+	if second.Completed || second.Stopped != "consent scope changed" || remote.postCount() != postsBefore {
+		t.Fatalf("the scope-change run must stop before any upload: %+v err=%v", second, err)
+	}
+	if !strings.Contains(err.Error(), "NOT treated as completing the current scope") {
+		t.Fatalf("the stop must explain the stale-decision rule: %v", err)
+	}
+
+	replanned, exists, err := loadJob(dir)
+	if err != nil || !exists {
+		t.Fatalf("re-planned journal: exists=%t err=%v", exists, err)
+	}
+	if replanned.CompletedAt != nil || replanned.JobID == staleJob.JobID || replanned.Scope == nil || replanned.Scope.Revision != 2 {
+		t.Fatalf("the journal must carry a fresh incomplete plan pinned to revision 2: %+v", replanned)
+	}
+	for _, b := range replanned.Batches {
+		if b.Outcome != outcomePlanned || len(b.Uploads) > 0 || len(b.Skipped) > 0 {
+			t.Fatalf("stale decision carried into the re-planned job: %+v", b)
+		}
+	}
+
+	third, err := Run(context.Background(), options(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !third.Completed || !third.Plan.Resumed || !remote.seen["old"] || !remote.seen["b"] {
+		t.Fatalf("the re-planned pass must restore the widened history: %+v", third)
+	}
+}
+
+func TestResumeReplansWhenScopeNarrows(t *testing.T) {
+	remote, server := newRemote(t)
+	dir := fixture(t, server.URL,
+		[]json.RawMessage{record("a", "2026-10-28T00:00:00Z"), record("b2", "2026-10-27T00:00:00Z")},
+		[]json.RawMessage{record("c", "2026-10-26T00:00:00Z")},
+	)
+	opt := options(dir)
+	opt.MaxBatches = 1
+	first, err := Run(context.Background(), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Completed || !remote.seen["a"] || !remote.seen["b2"] {
+		t.Fatalf("first pass: %+v", first)
+	}
+
+	// The authorization narrows: history now starts at 2026-10-28.
+	cutoff := time.Date(2026, 10, 28, 0, 0, 0, 0, time.UTC)
+	remote.set(2, &cutoff)
+
+	postsBefore := remote.postCount()
+	second, err := Run(context.Background(), options(dir))
+	if err == nil || second.Completed || second.Stopped != "consent scope changed" || remote.postCount() != postsBefore {
+		t.Fatalf("the scope-change run must stop before any upload: %+v err=%v", second, err)
+	}
+
+	remote.resetPosted()
+	third, err := Run(context.Background(), options(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Records withheld outside the narrowed scope are a normal exclusion,
+	// never a failure: the pass still completes.
+	if !third.Completed || third.SkippedOutOfScopeRecords != 2 || third.Blocked != 1 {
+		t.Fatalf("narrowed pass: %+v", third)
+	}
+	posted := remote.postedKeys()
+	if len(posted) != 1 || len(posted[0]) != 1 || posted[0][0] != "a" {
+		t.Fatalf("only in-scope records may be retransmitted after narrowing: %v", posted)
+	}
+}
+
+func TestFinalizeVerifiesLiveScopeBeforeCompleting(t *testing.T) {
+	remote, server := newRemote(t)
+	cutoff := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	remote.from = &cutoff
+	dir := fixture(t, server.URL, []json.RawMessage{record("old", "2025-01-01T00:00:00Z"), record("new", "2026-10-28T00:00:00Z")})
+	if _, err := Run(context.Background(), options(dir)); err != nil {
+		t.Fatal(err)
+	}
+	jb, exists, err := loadJob(dir)
+	if err != nil || !exists || jb.CompletedAt == nil {
+		t.Fatalf("completed job: exists=%t err=%v", exists, err)
+	}
+	// Simulate the crash the lazy finalize path exists for: the last
+	// upload landed, the completion write did not.
+	jb.CompletedAt = nil
+	if err := saveJob(dir, jb); err != nil {
+		t.Fatal(err)
+	}
+
+	// The authorization widens before the job may be marked complete.
+	remote.set(2, nil)
+	postsBefore := remote.postCount()
+	result, err := Run(context.Background(), options(dir))
+	if err == nil || result.Completed || result.Stopped != "consent scope changed" || remote.postCount() != postsBefore {
+		t.Fatalf("stale done must not complete under a changed scope: %+v err=%v", result, err)
+	}
+
+	final, err := Run(context.Background(), options(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !final.Completed || !remote.seen["old"] {
+		t.Fatalf("the re-planned pass must restore the widened record: %+v", final)
+	}
+}
+
+func TestFinalizeConvergesWhenScopeUnchanged(t *testing.T) {
+	remote, server := newRemote(t)
+	dir := fixture(t, server.URL, []json.RawMessage{record("a", "2026-10-28T00:00:00Z")})
+	if _, err := Run(context.Background(), options(dir)); err != nil {
+		t.Fatal(err)
+	}
+	jb, _, err := loadJob(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jb.CompletedAt = nil
+	if err := saveJob(dir, jb); err != nil {
+		t.Fatal(err)
+	}
+	postsBefore := remote.postCount()
+	callsBefore := remote.callCount()
+	result, err := Run(context.Background(), options(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Completed || !result.Plan.PendingFinalize {
+		t.Fatalf("lazy finalize: %+v", result)
+	}
+	if remote.postCount() != postsBefore {
+		t.Fatal("the lazy finalize must not re-upload anything")
+	}
+	if remote.callCount() == callsBefore {
+		t.Fatal("the lazy finalize must re-verify the live scope before completing")
+	}
+	converged, _, err := loadJob(dir)
+	if err != nil || converged.CompletedAt == nil {
+		t.Fatalf("job not converged: %+v err=%v", converged, err)
+	}
+}
+
+func TestLegacyJournalMigratesWithoutReplanWhenRevisionMatches(t *testing.T) {
+	remote, server := newRemote(t)
+	dir := fixture(t, server.URL,
+		[]json.RawMessage{record("a", "2026-10-28T00:00:00Z")},
+		[]json.RawMessage{record("b", "2026-10-27T00:00:00Z")},
+	)
+	opt := options(dir)
+	opt.MaxBatches = 1
+	if _, err := Run(context.Background(), opt); err != nil {
+		t.Fatal(err)
+	}
+	rewriteJournalAsSchemaOne(t, dir, nil)
+
+	postsBefore := remote.postCount()
+	result, err := Run(context.Background(), options(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Completed || !result.Plan.Resumed {
+		t.Fatalf("a legacy journal with a matching revision must resume: %+v", result)
+	}
+	if remote.postCount() != postsBefore+1 {
+		t.Fatalf("migration must keep the resume fast path (only the remaining batch uploads): posts %d -> %d", postsBefore, remote.postCount())
+	}
+	upgraded, _, err := loadJob(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upgraded.Schema != journalSchema || upgraded.Scope == nil || upgraded.Scope.Revision != 1 || upgraded.CompletedAt == nil {
+		t.Fatalf("the journal must be upgraded with the adopted baseline: %+v", upgraded)
+	}
+}
+
+func TestLegacyJournalReplansWhenRevisionDiffers(t *testing.T) {
+	remote, server := newRemote(t)
+	dir := fixture(t, server.URL,
+		[]json.RawMessage{record("a", "2026-10-28T00:00:00Z")},
+		[]json.RawMessage{record("b", "2026-10-27T00:00:00Z")},
+	)
+	opt := options(dir)
+	opt.MaxBatches = 1
+	if _, err := Run(context.Background(), opt); err != nil {
+		t.Fatal(err)
+	}
+	rewriteJournalAsSchemaOne(t, dir, nil)
+	remote.set(2, nil)
+
+	postsBefore := remote.postCount()
+	result, err := Run(context.Background(), options(dir))
+	if err == nil || result.Completed || result.Stopped != "consent scope changed" || remote.postCount() != postsBefore {
+		t.Fatalf("a legacy journal under a new revision must re-plan: %+v err=%v", result, err)
+	}
+	if !strings.Contains(err.Error(), "the job's scope content was not recorded") {
+		t.Fatalf("the stop must describe the legacy baseline: %v", err)
+	}
+	final, err := Run(context.Background(), options(dir))
+	if err != nil || !final.Completed {
+		t.Fatalf("re-planned pass: %+v err=%v", final, err)
+	}
+	if remote.postCount() != postsBefore+2 {
+		t.Fatalf("the re-planned pass re-sends the complete history: posts %d -> %d", postsBefore, remote.postCount())
+	}
+}
+
+func TestLegacyJournalWithMixedRevisionsReplans(t *testing.T) {
+	remote, server := newRemote(t)
+	dir := fixture(t, server.URL,
+		[]json.RawMessage{record("a", "2026-10-28T00:00:00Z")},
+		[]json.RawMessage{record("b", "2026-10-27T00:00:00Z")},
+	)
+	opt := options(dir)
+	opt.MaxBatches = 1
+	if _, err := Run(context.Background(), opt); err != nil {
+		t.Fatal(err)
+	}
+	rewriteJournalAsSchemaOne(t, dir, func(j *job) {
+		// Simulate decisions recorded under two different consent
+		// revisions (a job that ran across a scope change).
+		j.Batches[1].ScopeRevision = 2
+	})
+	postsBefore := remote.postCount()
+	result, err := Run(context.Background(), options(dir))
+	if err == nil || result.Completed || result.Stopped != "consent scope changed" || remote.postCount() != postsBefore {
+		t.Fatalf("unattributable decisions must re-plan even at an unchanged revision: %+v err=%v", result, err)
+	}
+	if !strings.Contains(err.Error(), "mixed or unrecorded") {
+		t.Fatalf("the stop must describe the unattributable baseline: %v", err)
+	}
+}
+
+func TestCompletedLegacyJournalIsReplacedByFreshPass(t *testing.T) {
+	remote, server := newRemote(t)
+	dir := fixture(t, server.URL, []json.RawMessage{record("a", "2026-10-28T00:00:00Z")})
+	if _, err := Run(context.Background(), options(dir)); err != nil {
+		t.Fatal(err)
+	}
+	completed, _, err := loadJob(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewriteJournalAsSchemaOne(t, dir, nil)
+	remote.set(2, nil)
+
+	result, err := Run(context.Background(), options(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Completed || result.Plan.Resumed || result.Plan.JobID == completed.JobID {
+		t.Fatalf("a completed job is always replaced by a fresh full pass: %+v", result)
+	}
+	if remote.postCount() != 2 {
+		t.Fatalf("the fresh pass re-sends the history once more: posts=%d", remote.postCount())
+	}
+}
+
+func TestMidRunScopeChangeReplansOnResume(t *testing.T) {
+	remote, server := newRemote(t)
+	dir := fixture(t, server.URL,
+		[]json.RawMessage{record("a", "2026-10-28T00:00:00Z")},
+		[]json.RawMessage{record("b", "2026-10-27T00:00:00Z")},
+	)
+	remote.scopeRejectBatch = "batch-01"
+	first, err := Run(context.Background(), options(dir))
+	if err == nil || first.Completed {
+		t.Fatalf("expected the server scope rejection to stop the run: %+v", first)
+	}
+	if first.Blocked != 1 || first.Stopped != "server scope rejection" {
+		t.Fatalf("scope rejection outcome: %+v", first)
+	}
+	// The change the server was rejecting under becomes visible.
+	remote.scopeRejectBatch = ""
+	remote.set(2, nil)
+
+	postsBefore := remote.postCount()
+	second, err := Run(context.Background(), options(dir))
+	if err == nil || second.Stopped != "consent scope changed" || remote.postCount() != postsBefore {
+		t.Fatalf("the resume must re-plan after a mid-run scope change: %+v err=%v", second, err)
+	}
+	third, err := Run(context.Background(), options(dir))
+	if err != nil || !third.Completed {
+		t.Fatalf("re-planned pass: %+v err=%v", third, err)
+	}
+}
+
+func TestUndecidedJobAdoptsFreshScopeWithoutReplan(t *testing.T) {
+	remote, server := newRemote(t)
+	dir := fixture(t, server.URL,
+		[]json.RawMessage{record("a", "2026-10-28T00:00:00Z")},
+		[]json.RawMessage{record("b", "2026-10-27T00:00:00Z")},
+	)
+	if _, err := Run(context.Background(), options(dir)); err != nil {
+		t.Fatal(err)
+	}
+	jb, _, err := loadJob(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Roll the journal back to the crash-after-plan state: the durable
+	// plan was written, but no decision was ever recorded under any scope.
+	jb.CompletedAt = nil
+	jb.Scope = nil
+	for idx := range jb.Batches {
+		jb.Batches[idx].Outcome = outcomePlanned
+		jb.Batches[idx].Uploads = nil
+		jb.Batches[idx].Skipped = nil
+		jb.Batches[idx].ScopeRevision = 0
+		jb.Batches[idx].Attempts = 0
+		jb.Batches[idx].LastAttemptAt = nil
+	}
+	if err := saveJob(dir, jb); err != nil {
+		t.Fatal(err)
+	}
+	// The authorization moved on since the plan was frozen; with nothing
+	// decided there is nothing stale, so the run adopts the fresh scope.
+	remote.set(2, nil)
+
+	result, err := Run(context.Background(), options(dir))
+	if err != nil || !result.Completed || !result.Plan.Resumed {
+		t.Fatalf("an undecided job must adopt the fresh scope instead of re-planning: %+v err=%v", result, err)
+	}
+	if !remote.seen["a"] || !remote.seen["b"] {
+		t.Fatalf("both batches must be retransmitted: %+v", result)
+	}
+}
+
+func TestDoneBatchUnderDifferentRevisionIsReEvaluated(t *testing.T) {
+	remote, server := newRemote(t)
+	dir := fixture(t, server.URL,
+		[]json.RawMessage{record("a", "2026-10-28T00:00:00Z")},
+		[]json.RawMessage{record("b", "2026-10-27T00:00:00Z")},
+	)
+	opt := options(dir)
+	opt.MaxBatches = 1
+	if _, err := Run(context.Background(), opt); err != nil {
+		t.Fatal(err)
+	}
+	// Force the job-level gate to pass while the done batch's own revision
+	// stamp still disagrees with the live revision: the per-batch dynamic
+	// scope check must re-open the batch instead of skipping it as done.
+	remote.set(2, nil)
+	jb, _, err := loadJob(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jb.Scope = snapshotScope(liveScope{revision: 2, allowedTools: map[string]struct{}{"Codex": {}}})
+	if err := saveJob(dir, jb); err != nil {
+		t.Fatal(err)
+	}
+
+	remote.resetPosted()
+	result, err := Run(context.Background(), options(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Completed || result.UploadedBatches != 2 {
+		t.Fatalf("re-evaluated pass: %+v", result)
+	}
+	posted := remote.postedKeys()
+	if len(posted) != 2 {
+		t.Fatalf("the stale done batch must be retransmitted under the live revision: %v", posted)
+	}
+}
+
+func TestMidRunWideningDriftStopsBeforeCompleting(t *testing.T) {
+	remote, server := newRemote(t)
+	cutoff := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	remote.from = &cutoff
+	dir := fixture(t, server.URL, []json.RawMessage{record("old", "2025-01-01T00:00:00Z"), record("new", "2026-10-28T00:00:00Z")})
+	// The server widens the consent scope right after this run's own
+	// preflight: the first upload then succeeds under the NEWER scope
+	// (no 409), while this run's keep/skip decisions were derived from
+	// the old one. The pass must not complete on those stale decisions.
+	remote.armWiden(1, 2, nil)
+
+	result, err := Run(context.Background(), options(dir))
+	if err == nil {
+		t.Fatal("expected the mid-run scope drift to stop the pass")
+	}
+	if result.Completed || result.Stopped != "consent scope changed" {
+		t.Fatalf("drift outcome: %+v", result)
+	}
+	if !strings.Contains(err.Error(), "consent revision 1 -> 2") {
+		t.Fatalf("the stop must describe the drift: %v", err)
+	}
+	// The drifted upload itself stands (the server accepted it under the
+	// live authorization), but the widened record stays withheld.
+	if remote.postCount() != 1 || !remote.seen["new"] || remote.seen["old"] {
+		t.Fatalf("the drifted upload must land while the widened record stays withheld: posts=%d seen=%v", remote.postCount(), remote.seen)
+	}
+	jb, exists, err := loadJob(dir)
+	if err != nil || !exists || jb.CompletedAt != nil || jb.Scope == nil || jb.Scope.Revision != 1 {
+		t.Fatalf("the job must stay incomplete under the planned baseline: %+v err=%v", jb, err)
+	}
+
+	remote.set(2, nil)
+	second, err := Run(context.Background(), options(dir))
+	if err == nil || second.Stopped != "consent scope changed" || remote.postCount() != 1 {
+		t.Fatalf("the next run must re-plan under the live scope before uploading: %+v err=%v", second, err)
+	}
+	third, err := Run(context.Background(), options(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !third.Completed || !remote.seen["old"] {
+		t.Fatalf("the re-planned pass must restore the widened record: %+v", third)
+	}
+}
+
+func TestCompletionVerifiesFreshScopeAfterLastUpload(t *testing.T) {
+	remote, server := newRemote(t)
+	cutoff := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	remote.from = &cutoff
+	dir := fixture(t, server.URL, []json.RawMessage{record("old", "2025-01-01T00:00:00Z"), record("new", "2026-10-28T00:00:00Z")})
+	// The upload is authorized under the planning scope; the consent
+	// scope widens only afterwards, before the completion write.
+	remote.armWiden(2, 2, nil)
+
+	result, err := Run(context.Background(), options(dir))
+	if err == nil {
+		t.Fatal("expected the completion gate to stop the pass")
+	}
+	if result.Completed || result.Stopped != "consent scope changed" {
+		t.Fatalf("completion outcome: %+v", result)
+	}
+	if remote.postCount() != 1 || !remote.seen["new"] || remote.seen["old"] {
+		t.Fatalf("the accepted upload must stand while the completion is withheld: posts=%d seen=%v", remote.postCount(), remote.seen)
+	}
+	jb, exists, err := loadJob(dir)
+	if err != nil || !exists || jb.CompletedAt != nil {
+		t.Fatalf("the job must not be marked complete on stale decisions: %+v err=%v", jb, err)
+	}
+
+	// The resume must refuse to finalize the all-done job under the
+	// widened authorization: it re-plans instead.
+	remote.set(2, nil)
+	second, err := Run(context.Background(), options(dir))
+	if err == nil || second.Stopped != "consent scope changed" || remote.postCount() != 1 {
+		t.Fatalf("the resume must re-plan instead of finalizing: %+v err=%v", second, err)
+	}
+	third, err := Run(context.Background(), options(dir))
+	if err != nil || !third.Completed || !remote.seen["old"] {
+		t.Fatalf("the re-planned pass must restore the widened record: %+v err=%v", third, err)
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"toktrail-collector/internal/local/grants"
 	"toktrail-collector/internal/local/outbox"
 	"toktrail-collector/internal/local/progress"
 	"toktrail-collector/internal/local/quarantine"
@@ -649,12 +650,16 @@ func sortedKeysOfMap(m map[string]int) []string {
 // recoverQuarantinedWithScope recovers quarantined records that are back
 // inside the live consent scope. Recovery requires the live revision to be
 // strictly newer than the revision the record was quarantined under (no
-// quarantine/recovery loops within one revision) and the current scope to
-// allow the record. Original record keys and interval endpoints are kept
-// verbatim, so the server's dedup makes a repeated recovery safe. Any
-// inconsistency (missing progress entry, mismatched quarantine marker,
-// changed confirmed baseline) fails closed and leaves everything
-// quarantined.
+// quarantine/recovery loops within one revision), the current scope to
+// allow the record, and — on a device with a configured grant store — an
+// enabled local grant for the record's exact (source, input): a grant the
+// user disabled or connect closed (ApplyConnectGrants disables pairs that
+// left the authorized list) keeps its quarantined records held even when
+// the server scope would allow them again. Original record keys and
+// interval endpoints are kept verbatim, so the server's dedup makes a
+// repeated recovery safe. Any inconsistency (missing progress entry,
+// mismatched quarantine marker, changed confirmed baseline) fails closed
+// and leaves everything quarantined.
 func recoverQuarantinedWithScope(stateDir string, self SelfStatus) (int, error) {
 	if strings.TrimSpace(stateDir) == "" {
 		return 0, nil
@@ -670,12 +675,24 @@ func recoverQuarantinedWithScope(stateDir string, self SelfStatus) (int, error) 
 	if err != nil {
 		return 0, err
 	}
+	grantAllowed, err := localGrantAuthorizer(stateDir)
+	if err != nil {
+		return 0, err
+	}
 	cursors := progress.New(stateDir)
 	fitting := make([]quarantine.Entry, 0, len(entries))
 	for _, entry := range entries {
 		if scope.revision <= entry.ConsentRevision {
 			// Same (or older) revision: never auto-recover, the scope that
 			// quarantined the record is still authoritative.
+			continue
+		}
+		if !grantAllowed(entry.Source, entry.Input) {
+			// The local read authorization for this record's (source,
+			// input) was revoked — the user disabled the grant or connect
+			// closed it out of the authorized list. The record stays
+			// quarantined (recoverable once the grant is enabled again)
+			// even though the server revision moved on.
 			continue
 		}
 		if entry.MessageID != "" {
@@ -708,32 +725,46 @@ func recoverQuarantinedWithScope(stateDir string, self SelfStatus) (int, error) 
 	if len(fitting) == 0 {
 		return 0, nil
 	}
-	bySource := make(map[string][]quarantine.Entry)
-	sources := make([]string, 0)
-	for _, entry := range fitting {
-		if _, ok := bySource[entry.Source]; !ok {
-			sources = append(sources, entry.Source)
-		}
-		bySource[entry.Source] = append(bySource[entry.Source], entry)
+	// Group by the full (source, input) identity so a recovery batch never
+	// mixes records from different granted inputs: the batch's provenance
+	// (outbox entry, progress confirmation) must match every record it
+	// carries, and the grant authorization above is decided per pair.
+	type recoveryGroup struct {
+		source string
+		input  string
 	}
-	sort.Strings(sources)
+	byGroup := make(map[recoveryGroup][]quarantine.Entry)
+	groups := make([]recoveryGroup, 0)
+	for _, entry := range fitting {
+		key := recoveryGroup{source: entry.Source, input: entry.Input}
+		if _, ok := byGroup[key]; !ok {
+			groups = append(groups, key)
+		}
+		byGroup[key] = append(byGroup[key], entry)
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		if groups[i].source != groups[j].source {
+			return groups[i].source < groups[j].source
+		}
+		return groups[i].input < groups[j].input
+	})
 	journal := reorgJournal{Kind: "quarantine-recovery", ConsentRevision: scope.revision, CreatedAt: time.Now().UTC()}
 	recovered := 0
-	for _, source := range sources {
-		group := bySource[source]
-		for start := 0; start < len(group); start += maxRecordsPerBatch {
-			chunk := group[start:min(start+maxRecordsPerBatch, len(group))]
+	for _, group := range groups {
+		entries := byGroup[group]
+		for start := 0; start < len(entries); start += maxRecordsPerBatch {
+			chunk := entries[start:min(start+maxRecordsPerBatch, len(entries))]
 			keys := make([]string, 0, len(chunk))
 			records := make([]json.RawMessage, 0, len(chunk))
 			for _, entry := range chunk {
 				keys = append(keys, entry.RecordKey)
 				records = append(records, entry.Record)
 			}
-			batchID := recoveryBatchID(source, scope.revision, keys)
+			batchID := recoveryBatchID(group.source, scope.revision, keys)
 			journal.NewBatches = append(journal.NewBatches, reorgBatchPlan{
 				BatchID: batchID,
-				Source:  source,
-				Input:   chunk[0].Input,
+				Source:  group.source,
+				Input:   group.input,
 				Records: records,
 			})
 			for _, entry := range chunk {
@@ -760,6 +791,66 @@ func recoverQuarantinedWithScope(stateDir string, self SelfStatus) (int, error) 
 		return 0, err
 	}
 	return recovered, nil
+}
+
+// localGrantAuthorizer returns the (source, input) authorization decision
+// for quarantine recovery.
+//
+//   - A grant store that was never configured — neither grants.json nor
+//     the legacy sources.json exists — authorizes everything. Grants exist
+//     only to feed the periodic entry's reads and never governed the
+//     manual sync path, so a device that never configured any keeps the
+//     historical grant-agnostic recovery.
+//
+//   - A configured store authorizes exactly its enabled (source, input)
+//     pairs, normalized the same way the grant store itself persists them
+//     (trimmed source, cleaned input). A disabled or closed grant —
+//     including one connect dropped from the authorized list — revokes
+//     recovery for its quarantined records until it is enabled again. An
+//     entry whose input is empty can never match (grant inputs are
+//     absolute paths), so it stays held: fail closed.
+//
+//   - A configured store that cannot be loaded authorizes nothing —
+//     recovery fails closed when the authorization cannot be verified —
+//     but this never surfaces as an error, so an unreadable grant store
+//     can never block the ordinary upload of a pending batch. The
+//     periodic entry surfaces grant-store load failures separately through
+//     its own grant handling.
+func localGrantAuthorizer(stateDir string) (func(source, input string) bool, error) {
+	store := grants.New(stateDir)
+	configured := false
+	for _, path := range []string{store.Path(), store.LegacyPath()} {
+		_, err := os.Lstat(path)
+		if err == nil {
+			configured = true
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	}
+	if !configured {
+		return func(string, string) bool { return true }, nil
+	}
+	enabled, err := store.Enabled()
+	if err != nil {
+		return func(string, string) bool { return false }, nil
+	}
+	allowed := make(map[string]bool, len(enabled))
+	for _, grant := range enabled {
+		allowed[grantIdentity(grant.Source, grant.Input)] = true
+	}
+	return func(source, input string) bool {
+		return allowed[grantIdentity(source, input)]
+	}, nil
+}
+
+// grantIdentity renders the normalized (source, input) pair the grant store
+// keys entries on: trimmed source plus cleaned input, the same
+// normalization grants.Enable, Disable, and ApplyConnectGrants apply before
+// persisting.
+func grantIdentity(source, input string) string {
+	return strings.TrimSpace(source) + "\x00" + filepath.Clean(strings.TrimSpace(input))
 }
 
 // recoverQuarantinedWithFreshSelf is the recovery-only path used when the

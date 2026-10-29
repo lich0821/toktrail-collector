@@ -42,6 +42,14 @@ func (p *Pipeline) PrepareExport(opt adapter.Options) (PreparedExport, error) {
 	if batchID == "" {
 		batchID = "local-" + time.Now().UTC().Format("20060102T150405Z")
 	}
+	// Complete any history-filter transaction an earlier crash left
+	// half-applied BEFORE the adapter loads records: adapters read the
+	// message baselines and (via FilterForExport) the quarantine store, and
+	// both must reflect the converged post-recovery state, not a
+	// half-applied transaction.
+	if err := recoverPendingFilterTxn(opt.StateDir); err != nil {
+		return PreparedExport{}, err
+	}
 	loaded, err := p.registry.LoadRecordsForSource(opt)
 	if err != nil {
 		return PreparedExport{}, err

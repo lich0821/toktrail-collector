@@ -62,6 +62,16 @@ var (
 	// sending (uploads and tool-status reports) and keep pending batches
 	// queued; it is a state, not a failure, and never triggers re-binding.
 	ErrDevicePaused = errors.New("device_paused")
+	// ErrQuarantineHeld reports the recovery-only outcome that quarantined
+	// records exist but none is currently recoverable: the live consent
+	// scope still excludes them (or the revision is not strictly newer),
+	// or — on a device with a configured grant store — their (source,
+	// input) no longer carries an enabled local grant. It is a steady
+	// state, not a failure: the records stay quarantined and recoverable
+	// until the authorization widens again. The periodic drain treats it
+	// as a settled run; manual `toktrail sync` still surfaces the wrapped
+	// diagnosis.
+	ErrQuarantineHeld = errors.New("quarantine_held")
 )
 
 type Options struct {
@@ -219,7 +229,7 @@ func Run(ctx context.Context, store statedir.Store, opt Options) (Result, error)
 				return Result{}, err
 			}
 			if recovered == 0 {
-				return Result{}, fmt.Errorf("missing batch file and no pending outbox batch; %d quarantined record(s) remain outside the consent scope and need a strictly newer consent revision before they can be recovered", len(entries))
+				return Result{}, fmt.Errorf("%w; missing batch file and no pending outbox batch; %d quarantined record(s) remain outside the consent scope and need a strictly newer consent revision before they can be recovered (or their local source grant is no longer enabled)", ErrQuarantineHeld, len(entries))
 			}
 			return Result{Self: self, Recovered: recovered, Quarantined: quarantineCount(strings.TrimSpace(opt.StateDir))}, nil
 		}

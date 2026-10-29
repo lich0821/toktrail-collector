@@ -155,3 +155,111 @@ func (s liveScope) fingerprint() string {
 	}
 	return string(b)
 }
+
+// sortedTools renders the scope's allowed tools deterministically.
+func (s liveScope) sortedTools() []string {
+	tools := make([]string, 0, len(s.allowedTools))
+	for tool := range s.allowedTools {
+		tools = append(tools, tool)
+	}
+	sort.Strings(tools)
+	return tools
+}
+
+// snapshotScope freezes the live scope into its durable journal form so a
+// later resume can tell exactly which authorization the job's recorded
+// done/skip decisions were made under.
+func snapshotScope(scope liveScope) *jobScope {
+	return &jobScope{
+		Revision:     scope.revision,
+		Fingerprint:  scope.fingerprint(),
+		HistoryFrom:  scope.historyFrom,
+		UploadUntil:  scope.uploadUntil,
+		AllowedTools: scope.sortedTools(),
+	}
+}
+
+// matches reports whether the recorded baseline still equals the fresh
+// live scope. The revision is the server's authoritative consent version
+// (a consent change always bumps it), and the fingerprint comparison
+// additionally fails closed when the scope content changed without a
+// revision bump — the same never-guess rule syncclient applies to
+// reorganizations.
+func (s *jobScope) matches(scope liveScope) bool {
+	if s == nil || s.Revision != scope.revision {
+		return false
+	}
+	return s.Fingerprint == scope.fingerprint()
+}
+
+// describeScopeChange renders the divergence between a job's recorded
+// baseline and the fresh live scope for stop messages. legacyRevision is
+// the per-batch attributed revision of a journal without a recorded scope
+// snapshot; zero means the decisions could not be attributed at all.
+func describeScopeChange(old *jobScope, legacyRevision int64, fresh liveScope) string {
+	renderTime := func(t *time.Time) string {
+		if t == nil {
+			return "(none)"
+		}
+		return t.UTC().Format(time.RFC3339)
+	}
+	renderTools := func(tools []string) string {
+		if len(tools) == 0 {
+			return "(any)"
+		}
+		return "[" + strings.Join(tools, ",") + "]"
+	}
+	if old == nil {
+		if legacyRevision > 0 {
+			return fmt.Sprintf("consent revision %d -> %d (the job's scope content was not recorded)", legacyRevision, fresh.revision)
+		}
+		return fmt.Sprintf("consent revision mixed or unrecorded -> %d", fresh.revision)
+	}
+	parts := []string{fmt.Sprintf("consent revision %d -> %d", old.Revision, fresh.revision)}
+	if !sameTimePtr(old.HistoryFrom, fresh.historyFrom) {
+		parts = append(parts, fmt.Sprintf("historyFrom %s -> %s", renderTime(old.HistoryFrom), renderTime(fresh.historyFrom)))
+	}
+	if !sameTimePtr(old.UploadUntil, fresh.uploadUntil) {
+		parts = append(parts, fmt.Sprintf("uploadUntil %s -> %s", renderTime(old.UploadUntil), renderTime(fresh.uploadUntil)))
+	}
+	freshTools := fresh.sortedTools()
+	if !sameStrings(old.AllowedTools, freshTools) {
+		parts = append(parts, fmt.Sprintf("allowedTools %s -> %s", renderTools(old.AllowedTools), renderTools(freshTools)))
+	}
+	return strings.Join(parts, "; ")
+}
+
+func sameTimePtr(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Equal(*b)
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for idx := range a {
+		if a[idx] != b[idx] {
+			return false
+		}
+	}
+	return true
+}
+
+// selfDrift reports whether an observed device self snapshot (the one
+// syncclient prefetched for an upload, or a fresh completion check) no
+// longer equals the scope this run derived its keep/skip decisions from,
+// with a human-readable description of the divergence. An unevaluable
+// snapshot counts as drift: unknown never becomes unchanged.
+func selfDrift(planned liveScope, self syncclient.SelfStatus, st statedir.DeviceState) (bool, string) {
+	live, err := scopeFromSelf(self, st)
+	if err != nil {
+		return true, err.Error()
+	}
+	if live.revision == planned.revision && live.fingerprint() == planned.fingerprint() {
+		return false, ""
+	}
+	return true, describeScopeChange(snapshotScope(planned), 0, live)
+}

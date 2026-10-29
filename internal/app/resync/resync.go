@@ -24,6 +24,26 @@
 //     currently matches an enabled local source grant are retransmitted. A
 //     missing grant config denies by default, so residual archives cannot
 //     bypass a withdrawn local permission.
+//   - Consent-scope changes never turn stale progress into completion: an
+//     incomplete job records the live consent scope its done/skip
+//     decisions were made under, and every run re-verifies that baseline
+//     against a fresh live snapshot after the preflight. When the
+//     authorization revision or scope content changed — narrowed or
+//     widened — the old decisions are not treated as completing the
+//     current scope: the complete synced history is re-planned under the
+//     fresh scope and saved as the new journal, the run stops before any
+//     upload, and the next explicit pass executes the re-planned plan
+//     (already-delivered records replay without double counting). A
+//     finalize-only run (crash after the last upload, before the
+//     completion write) may only complete after the same verification.
+//     The same rule holds while a pass is running: every upload's
+//     receipt is checked against the authorization snapshot it was
+//     actually accepted under, and the completion write is preceded by
+//     one final fresh scope comparison — a mid-run change (even a
+//     widening that lets every upload succeed) stops the pass incomplete
+//     instead of completing on stale decisions. Records withheld as
+//     outside the live scope are a normal exclusion, never a failure or
+//     a gap of the pass.
 //   - Idempotent and resumable: an interrupted job resumes from the
 //     resync-owned journal (payload hashes detect tampering), deterministic
 //     child batch identities keep partial-scope retransmissions stable, and
@@ -125,6 +145,10 @@ type Plan struct {
 	// the job (nothing to upload): the previous run crashed after its last
 	// upload but before the completion write, or there are no synced
 	// batches at all. A dry run reports it without writing anything.
+	// Execution re-verifies the live consent scope before it may claim
+	// completion (an empty pass finalizes offline; a crash-recovery
+	// finalize goes through the preflight and the scope gate, and
+	// re-plans instead of completing when the authorization changed).
 	PendingFinalize bool
 	CoverageNote    string
 }
@@ -170,7 +194,8 @@ type Result struct {
 	Remaining                int
 	Completed                bool
 	// Stopped is non-empty when the run ended before finishing the plan
-	// (budget reached, upload failure, or an authorization stop).
+	// (budget reached, upload failure, an authorization stop, or a
+	// consent-scope change that re-planned the job).
 	Stopped     string
 	JournalPath string
 }
@@ -252,8 +277,11 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	// job (an empty new pass, or a job whose last upload landed but whose
 	// completion write crashed). A dry run — and a confirmation abort —
 	// must leave the disk byte-identical, so the write happens only after
-	// the execution path is confirmed; a finalize-only run performs no
-	// uploads and no network access at all.
+	// the execution path is confirmed. An empty pass finalizes fully
+	// offline; a crash-recovery finalize performs no uploads but MUST
+	// re-verify the live consent scope before it may claim completion, so
+	// it flows through the preflight and the scope gate like any resume
+	// (its all-done batch loop then converges with zero uploads).
 	var finalizeOnly bool
 	if resumed {
 		jb = existing
@@ -304,11 +332,17 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	}
 
 	result := Result{Plan: plan, JournalPath: plan.JournalPath}
-	if !resumed || finalizeOnly {
+	// emptyFinalize is the offline completion of a pass with nothing to
+	// retransmit at all (no synced batches, or an empty resumed journal):
+	// there is no scope-dependent decision to re-verify, so it needs no
+	// network access. Every other finalize-only case is a crash recovery
+	// whose done decisions still have to clear the scope gate below.
+	emptyFinalize := finalizeOnly && len(jb.Batches) == 0
+	if !resumed || emptyFinalize {
 		// Durable plan before any upload (a crash from here on resumes
-		// instead of restarting), or the finalize-only completion write.
+		// instead of restarting), or the empty-pass completion write.
 		// Both happen strictly after confirmation.
-		if finalizeOnly && jb.CompletedAt == nil {
+		if emptyFinalize && jb.CompletedAt == nil {
 			if err := completeJob(stateDir, &jb, now); err != nil {
 				return result, err
 			}
@@ -316,7 +350,7 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 			return result, fmt.Errorf("cannot persist the resync job journal before any upload; nothing was retransmitted: %w", err)
 		}
 	}
-	if finalizeOnly {
+	if emptyFinalize {
 		return Result{Plan: plan, Completed: true, JournalPath: plan.JournalPath}, nil
 	}
 
@@ -347,12 +381,47 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		return result, fmt.Errorf("resync stopped before any upload; the job stays resumable: %w", err)
 	}
 
+	// Scope gate: the job's recorded done/skip decisions are valid only
+	// under the live consent scope they were made under. Verify the job's
+	// baseline against this fresh snapshot; on any change (revision or
+	// content, narrowed or widened) re-plan the complete synced history
+	// under the fresh scope and stop before any upload — stale decisions
+	// are never treated as completing the current authorization. This
+	// also guards the crash-recovery finalize above: a job whose every
+	// batch is done may only be marked complete under an unchanged scope.
+	gate, err := reconcileJobScope(stateDir, st, serverURL, out, &jb, scope, now)
+	if err != nil {
+		result.Stopped = scopeGateStopped
+		return result, err
+	}
+	if gate.replanned {
+		result.Stopped = scopeGateStopped
+		result.Remaining = countNotDone(gate.job)
+		return result, fmt.Errorf("resync stopped before any upload: the consent scope changed since the incomplete job %s recorded its progress (%s); the job's earlier done/skip decisions were made under the old authorization and were NOT treated as completing the current scope. The complete synced history was re-planned as job %s (%d batch(es)) and saved to %s; re-run the same toktrail resync --all command to execute the re-planned pass — already-delivered records replay without double counting, and records outside the live scope stay withheld as a normal exclusion rather than a gap. Nothing was retransmitted in this run", jb.JobID, gate.change, gate.job.JobID, len(gate.job.Batches), journalPath(stateDir))
+	}
+
 	uploads := 0
 	budget := opt.MaxBatches > 0
 	for idx := range jb.Batches {
 		b := &jb.Batches[idx]
 		if b.Outcome == outcomeDone {
-			continue
+			if b.ScopeRevision == scope.revision {
+				continue
+			}
+			// Per-batch dynamic scope check (defense in depth behind the
+			// job-level gate): this done decision was recorded under a
+			// consent revision other than the live one. Old done — and
+			// its withheld-record list — must not count as completing the
+			// current authorization, so the batch is re-opened and
+			// re-evaluated from scratch below under the fresh scope. Its
+			// prior receipts are dropped with it: re-derived targets
+			// replay idempotently server-side, and the journal's receipt
+			// accounting then reflects exactly the current evaluation.
+			b.Outcome = outcomePlanned
+			b.BlockedReason = ""
+			b.Error = ""
+			b.Skipped = nil
+			b.Uploads = nil
 		}
 		// Tamper guard: the parent file must still hash to the payload the
 		// job was planned against.
@@ -557,6 +626,22 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 			if err := saveJob(stateDir, jb); err != nil {
 				return result, err
 			}
+			// Mid-run authorization drift: syncclient preflights every
+			// upload with its own fresh self GET and echoes that snapshot's
+			// consent revision on the POST, so this receipt was accepted
+			// under exactly res.Self — which may be newer than the scope
+			// this run derived its keep/skip decisions from (a widening
+			// does not fail the upload, it succeeds). When the two diverge,
+			// the remaining decisions are stale: stop before any further
+			// upload and before the batch could be marked done. The
+			// accepted upload stands; the job stays resumable under its
+			// recorded baseline, so the next run re-plans under the live
+			// scope instead of completing on the stale one.
+			if drift, why := selfDrift(scope, res.Self, st); drift {
+				result.Stopped = scopeGateStopped
+				result.Remaining = countNotDone(jb)
+				return result, fmt.Errorf("resync stopped mid-pass: the consent scope changed while retransmitting (%s); the server accepted the upload of %s under the live authorization, but this run's remaining done/skip decisions were planned under the old scope and were NOT treated as completing the current scope — re-run the same toktrail resync --all command and it re-plans the complete synced history under the live scope (already-delivered records replay without double counting)", why, t.BatchID)
+			}
 		}
 		if stopped != "" {
 			result.Stopped = stopped
@@ -576,6 +661,31 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	}
 
 	if result.Stopped == "" {
+		// Completion gate: the job may only be marked complete under the
+		// authorization it was planned against, verified FRESH at
+		// completion time. The scope can move after the last upload's
+		// preflight (or between the run's own preflight and a
+		// finalize-only convergence), and neither the loop above nor the
+		// server would necessarily notice: a widening lets every upload
+		// succeed while the withheld-record decisions were made under the
+		// old scope. One final self GET — preceded by the same durable
+		// attempt accounting as every authorization read — closes that
+		// window; on drift the job stays incomplete and the next run
+		// re-plans under the live scope.
+		if _, err := ledger.RecordPreflightAttempt(now().UTC()); err != nil {
+			result.Stopped = "preflight accounting failed"
+			return result, fmt.Errorf("cannot persist preflight attempt accounting before the completion check; the job stays resumable and is not marked complete: %w", err)
+		}
+		finalSelf, err := syncclient.FetchDeviceSelf(ctx, store, syncclient.Options{ServerURL: serverURL, HTTPClient: client})
+		if err != nil {
+			result.Stopped = "authorization preflight failed"
+			return result, fmt.Errorf("resync stopped before the completion write; the job stays resumable and is not marked complete: %w", err)
+		}
+		if drift, why := selfDrift(scope, finalSelf, st); drift {
+			result.Stopped = scopeGateStopped
+			result.Remaining = countNotDone(jb)
+			return result, fmt.Errorf("resync stopped before marking the job complete: the consent scope changed while the pass was running (%s); every accepted upload stands, but the job's done/skip decisions were planned under the old scope and were NOT treated as completing the current authorization — re-run the same toktrail resync --all command and it re-plans the complete synced history under the live scope (already-delivered records replay without double counting)", why)
+		}
 		if err := completeJob(stateDir, &jb, now); err != nil {
 			return result, err
 		}
@@ -656,6 +766,100 @@ func completeJob(stateDir string, jb *job, now func() time.Time) error {
 	at := now().UTC()
 	jb.CompletedAt = &at
 	return saveJob(stateDir, *jb)
+}
+
+// scopeGateStopped is the Result.Stopped marker for the consent-scope
+// re-plan path: the run ended before any upload because the authorization
+// changed, and the journal now carries the re-planned full pass.
+const scopeGateStopped = "consent scope changed"
+
+// scopeGateOutcome reports what the scope gate decided for one run.
+type scopeGateOutcome struct {
+	// replanned is true when the recorded decisions were stale and the
+	// complete synced history was re-planned under the fresh scope.
+	replanned bool
+	// job is the re-planned replacement job (replanned only): a fresh full
+	// plan over the current synced outbox, baseline pinned to the fresh
+	// scope, every batch planned, no carried-over outcome or receipt.
+	job job
+	// change describes the detected divergence for stop messages.
+	change string
+}
+
+// reconcileJobScope verifies that the job's recorded done/skip decisions
+// were made under the live consent scope, or re-plans the complete synced
+// history under the fresh scope when they were not. It never uploads and
+// never touches anything outside the resync-owned journal:
+//
+//   - A recorded baseline (current schema) must match the fresh scope by
+//     revision and content fingerprint.
+//   - A journal without a baseline (legacy schema 1, or a job that never
+//     reached its preflight) derives one from the per-batch revision
+//     stamps: with no live-scope decision at all the fresh scope is simply
+//     adopted; with every decision attributable to the same revision as
+//     the fresh snapshot the baseline is adopted (the revision is the
+//     server's authoritative consent version, so an equal revision means
+//     an equal scope); anything else — mixed revisions, unstamped
+//     decisions, or a different revision — re-plans.
+//
+// Adoption only mutates the in-memory job; it persists with the first
+// journal write the run performs. On re-plan the previous journal is
+// replaced atomically by a fresh full plan over the CURRENT complete
+// synced outbox (new job id, all batches planned, fresh scope baseline);
+// the outbox, batch files, per-message progress, cursors, and quarantine
+// store are untouched, and already-delivered records stay de-duplicated
+// by the server's replay receipts when the re-planned pass re-sends them.
+func reconcileJobScope(stateDir string, st statedir.DeviceState, serverURL string, out outbox.Outbox, jb *job, scope liveScope, now func() time.Time) (scopeGateOutcome, error) {
+	if jb.Scope != nil {
+		if jb.Scope.matches(scope) {
+			return scopeGateOutcome{}, nil
+		}
+		return replanJob(stateDir, st, serverURL, out, *jb, jb.Scope, 0, scope, now)
+	}
+	revision, decided, attributable := jobDecisionRevision(*jb)
+	if !decided {
+		// No live-scope decision exists yet (fresh plan, or an interrupted
+		// run that never reached its preflight): adopt the fresh scope as
+		// the baseline the upcoming decisions will be recorded under.
+		jb.Scope = snapshotScope(scope)
+		return scopeGateOutcome{}, nil
+	}
+	if attributable && revision == scope.revision {
+		// Legacy migration: every recorded decision stamps this same
+		// revision, so it was made under the same consent scope. Adopt
+		// the full snapshot so later comparisons check content too.
+		jb.Scope = snapshotScope(scope)
+		return scopeGateOutcome{}, nil
+	}
+	if !attributable {
+		revision = 0
+	}
+	return replanJob(stateDir, st, serverURL, out, *jb, nil, revision, scope, now)
+}
+
+// replanJob rebuilds the resync job over the complete current synced
+// history under the fresh live scope and durably replaces the stale
+// journal with it. oldScope is the recorded baseline (nil for a legacy
+// journal whose decisions attribute to legacyRevision, or 0 when they do
+// not attribute at all). A failure to build or persist leaves the
+// previous journal untouched and resumable.
+func replanJob(stateDir string, st statedir.DeviceState, serverURL string, out outbox.Outbox, old job, oldScope *jobScope, legacyRevision int64, scope liveScope, now func() time.Time) (scopeGateOutcome, error) {
+	change := describeScopeChange(oldScope, legacyRevision, scope)
+	fresh, _, err := buildNewJob(stateDir, st, serverURL, out, now, Plan{
+		DeviceID:     st.DeviceID,
+		ServerURL:    serverURL,
+		StateDir:     stateDir,
+		JournalPath:  journalPath(stateDir),
+		CoverageNote: coverageNote,
+	})
+	if err != nil {
+		return scopeGateOutcome{}, fmt.Errorf("resync stopped before any upload: the consent scope changed since the incomplete job %s recorded its progress (%s), and the complete synced history cannot be re-planned: %w; the previous journal is unchanged and the job stays resumable — resolve the reported problem, or remove %s to abandon the job, then re-run", old.JobID, change, err, journalPath(stateDir))
+	}
+	fresh.Scope = snapshotScope(scope)
+	if err := saveJob(stateDir, fresh); err != nil {
+		return scopeGateOutcome{}, fmt.Errorf("resync stopped before any upload: the consent scope changed since the incomplete job %s recorded its progress (%s), and the re-planned job cannot be persisted: %w; the previous journal is unchanged and the job stays resumable", old.JobID, change, err)
+	}
+	return scopeGateOutcome{replanned: true, job: fresh, change: change}, nil
 }
 
 func fillExclusions(plan *Plan, ex jobExclusions) {

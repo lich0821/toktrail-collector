@@ -73,16 +73,16 @@ Common commands:
 
 - `toktrail version` prints the collector version.
 - `toktrail help` prints the available command surface.
-- `toktrail connect '<URL>'` one-step device setup via connect URL/ticket: fetches server configuration, binds device, probes local tools, configures source grants, installs scheduled service, and runs initial collection.
+- `toktrail connect '<URL>'` binds the device, applies the current authorization, installs the scheduled service, and resynchronizes authorized usage.
 - `toktrail scan` summarizes local records without account or network access.
 - `toktrail preview` validates and previews local records.
 - `toktrail export` writes a server ingest batch and registers it in the local outbox.
 - `toktrail bind` generates or reuses a local device secret and binds the device to a server-issued ticket.
 - `toktrail status` checks the current bound device state.
 - `toktrail sync` uploads either an explicit batch or the oldest pending local outbox batch.
-- `toktrail resync --all --dry-run` previews archived, already-synced device batches for currently enabled local grants without network or writes; it does not verify remote consent.
-- `toktrail resync --all` asks for confirmation, then retransmits those batches under the live server scope without resetting progress or binding another device. `--yes` skips the prompt; `--max-batches N` bounds one invocation. An interrupted pass resumes on the next invocation.
-- Resync does not scan source logs or include unexported records, pending batches, quarantine entries, or separate Cursor account-source history. Server-side idempotency is scoped to the current device; it does not guarantee cross-device deduplication. Missing archives, blocked records, and server rejections are reported, not counted as restored.
+- `toktrail resync --all --dry-run` previews archived, already-synced device batches for currently enabled local grants without network or writes. This is only the archive plan: it does not scan sources, inspect recoverable records, or verify remote consent.
+- `toktrail resync --all` asks for confirmation, then scans enabled sources, recovers records eligible under current authorization, drains pending batches, and retransmits archived history. Cursor account usage receives a full-window sync when enabled. `--yes` skips the prompt; `--max-batches N` limits archive retransmissions in one invocation. Incomplete work is reported and can be resumed.
+- The current authorization determines what can be uploaded; narrowing it does not delete previously uploaded history. Deletion and revocation are managed on the leaderboard. Missing source data or archives cannot be reconstructed reliably, and cross-device deduplication is not guaranteed; preserve the collector state directory on reinstall.
 - `toktrail sources` manages explicit local read grants for scheduled collection.
 - `toktrail periodic` collects from enabled grants and drains a bounded number of pending batches.
 - `toktrail service` installs or uninstalls the user-level scheduled task.

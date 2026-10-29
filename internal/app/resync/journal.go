@@ -19,7 +19,17 @@ import (
 // repeated upload idempotent locally.
 const journalFileName = "resync-journal.json"
 
-const journalSchema = 1
+const journalSchema = 2
+
+// legacyJournalSchema is the journal format written before the job-level
+// scope baseline existed (schema 1): its batches carry per-attempt
+// scopeRevision stamps, but the job itself records no scope snapshot.
+// loadJob still accepts that format and upgrades the in-memory form; the
+// next save persists the current schema. A legacy incomplete journal
+// derives its baseline from the per-batch stamps (see jobDecisionRevision)
+// and is re-planned whenever those decisions cannot be attributed to the
+// live consent revision.
+const legacyJournalSchema = 1
 
 // Batch outcomes within one job. "planned" means selected for
 // retransmission but not yet attempted; "done" means every derived upload
@@ -82,6 +92,22 @@ type jobBatch struct {
 	Error         string          `json:"error,omitempty"`
 }
 
+// jobScope is the journal's durable record of the live consent scope the
+// job's accumulated done/skip decisions were made under. An incomplete
+// job whose recorded scope no longer matches the fresh live scope must
+// not treat those decisions as completing the current authorization: the
+// run re-plans the complete synced history instead (see
+// reconcileJobScope). Journals written before this field existed
+// (schema 1) carry no snapshot; their baseline is derived from the
+// per-batch scope revision stamps.
+type jobScope struct {
+	Revision     int64      `json:"revision"`
+	Fingerprint  string     `json:"fingerprint"`
+	HistoryFrom  *time.Time `json:"historyFrom,omitempty"`
+	UploadUntil  *time.Time `json:"uploadUntil,omitempty"`
+	AllowedTools []string   `json:"allowedTools,omitempty"`
+}
+
 // jobExclusions records what the job deliberately did not include, so a
 // resumed run (and its dry-run) can still report full coverage honestly.
 type jobExclusions struct {
@@ -95,7 +121,9 @@ type jobExclusions struct {
 // An incomplete job (CompletedAt nil) is resumed by the next explicit
 // `toktrail resync --all`; a completed job is replaced by a fresh full pass,
 // which stays safe because batch identities and record keys are stable and
-// the server de-duplicates replays.
+// the server de-duplicates replays. Scope carries the consent scope the
+// recorded decisions were made under; a resume that observes a different
+// live scope re-plans rather than trusting stale done/skip state.
 type job struct {
 	Schema      int           `json:"schema"`
 	JobID       string        `json:"jobId"`
@@ -104,6 +132,7 @@ type job struct {
 	CreatedAt   time.Time     `json:"createdAt"`
 	CompletedAt *time.Time    `json:"completedAt,omitempty"`
 	Exclusions  jobExclusions `json:"exclusions,omitempty"`
+	Scope       *jobScope     `json:"scope,omitempty"`
 	Batches     []jobBatch    `json:"batches"`
 }
 
@@ -156,12 +185,27 @@ func loadJob(stateDir string) (job, bool, error) {
 	if err := j.validate(); err != nil {
 		return job{}, false, err
 	}
+	if j.Schema == legacyJournalSchema {
+		// In-place upgrade: the on-disk file keeps its legacy schema until
+		// the next save, which then persists the current schema together
+		// with the scope baseline the run adopts (or with the re-planned
+		// job that replaces this one).
+		j.Schema = journalSchema
+	}
 	return j, true, nil
 }
 
 func (j job) validate() error {
-	if j.Schema != journalSchema {
+	if j.Schema != journalSchema && j.Schema != legacyJournalSchema {
 		return fmt.Errorf("corrupt resync journal: unsupported schema %d", j.Schema)
+	}
+	if j.Scope != nil {
+		if j.Scope.Revision <= 0 {
+			return fmt.Errorf("corrupt resync journal: scope baseline has no revision")
+		}
+		if strings.TrimSpace(j.Scope.Fingerprint) == "" {
+			return fmt.Errorf("corrupt resync journal: scope baseline has no fingerprint")
+		}
 	}
 	if j.JobID == "" || j.DeviceID == "" || j.ServerURL == "" {
 		return fmt.Errorf("corrupt resync journal: missing job id, device id, or server url")
@@ -207,7 +251,8 @@ func (j job) validate() error {
 // saveJob persists the journal atomically (tmp + rename, 0600, private
 // directory). It is called before the first upload and after every batch
 // outcome, so a crash or Ctrl+C at any point leaves a replayable resume
-// state.
+// state. The schema is written as-is: a legacy journal loaded into memory
+// was already upgraded, so an ordinary save persists the current schema.
 func saveJob(stateDir string, j job) error {
 	stateDir = strings.TrimSpace(stateDir)
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
@@ -223,4 +268,38 @@ func saveJob(stateDir string, j job) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// jobDecisionRevision summarizes the live-scope decisions recorded in a
+// journal with no job-level scope baseline (a legacy schema-1 journal, or
+// a job that never reached its preflight). decided reports whether any
+// batch carries a live-scope decision at all (attempted, done, blocked,
+// failed, or withheld records); attributable reports whether every such
+// decision stamps the same positive consent revision, so all of them can
+// be attributed to exactly that revision. Decisions that cannot be
+// attributed to a single revision (mixed stamps, or a decided batch with
+// no stamp) can never be trusted as completing any live scope and force a
+// re-plan.
+func jobDecisionRevision(j job) (revision int64, decided, attributable bool) {
+	attributable = true
+	for _, b := range j.Batches {
+		if b.Outcome == outcomePlanned && len(b.Skipped) == 0 && b.ScopeRevision <= 0 {
+			continue
+		}
+		decided = true
+		if b.ScopeRevision <= 0 {
+			attributable = false
+			continue
+		}
+		if revision == 0 {
+			revision = b.ScopeRevision
+		} else if revision != b.ScopeRevision {
+			attributable = false
+		}
+	}
+	if !decided {
+		// Nothing was decided under any scope: no revision to attribute.
+		return 0, false, true
+	}
+	return revision, decided, attributable
 }

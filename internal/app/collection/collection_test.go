@@ -3,11 +3,13 @@ package collection
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -48,6 +50,12 @@ type fakeCollectorServer struct {
 	// failIngestOnce, when set, makes the next ingest upload fail with a 500
 	// exactly once. Set by fakeServerWithFlake only.
 	failIngestOnce *atomic.Bool
+
+	// rejectRecords, when set, decides per ingest upload which submitted
+	// record indexes the server rejects, mapped to a stable rejection
+	// code. It lets tests exercise partial and fully rejected receipts;
+	// nil accepts every record (the historical default).
+	rejectRecords func(records []map[string]any) map[int]string
 
 	mu      sync.Mutex
 	reports []toolStatusReport
@@ -113,14 +121,11 @@ func (s *fakeCollectorServer) handle(t *testing.T, w http.ResponseWriter, r *htt
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("invalid ingest body: %v", err)
 		}
-		writeJSONForTest(w, http.StatusAccepted, map[string]any{"batch": map[string]any{
-			"batchId":         body.BatchID,
-			"status":          "accepted",
-			"acceptedRecords": len(body.Records),
-			"rejectedRecords": 0,
-			"replay":          false,
-			"receivedAt":      "2026-10-21T04:01:00Z",
-		}})
+		var rejected map[int]string
+		if s.rejectRecords != nil {
+			rejected = s.rejectRecords(body.Records)
+		}
+		writeJSONForTest(w, http.StatusAccepted, ingestReceiptForTest(body.BatchID, body.Records, rejected))
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/devices/tool-status":
 		s.tooling.Add(1)
 		var body struct {
@@ -160,6 +165,45 @@ func writeJSONForTest(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+// ingestReceiptForTest builds the batch receipt for one accepted ingest
+// upload. rejected maps submitted record indexes to a stable rejection
+// code; the accepted count, the receipt status (accepted / partial_error /
+// rejected) and the per-record errors derive from it exactly like the real
+// server, so the collector's receipt reconciliation accepts the result.
+func ingestReceiptForTest(batchID string, records []map[string]any, rejected map[int]string) map[string]any {
+	accepted := len(records) - len(rejected)
+	recordErrors := make([]map[string]any, 0, len(rejected))
+	indexes := make([]int, 0, len(rejected))
+	for idx := range rejected {
+		indexes = append(indexes, idx)
+	}
+	sort.Ints(indexes)
+	for _, idx := range indexes {
+		recordErrors = append(recordErrors, map[string]any{
+			"index":     idx,
+			"recordKey": records[idx]["recordKey"],
+			"code":      rejected[idx],
+			"message":   "synthetic rejection for tests",
+		})
+	}
+	status := "accepted"
+	switch {
+	case len(rejected) > 0 && accepted == 0:
+		status = "rejected"
+	case len(rejected) > 0:
+		status = "partial_error"
+	}
+	return map[string]any{"batch": map[string]any{
+		"batchId":         batchID,
+		"status":          status,
+		"acceptedRecords": accepted,
+		"rejectedRecords": len(rejected),
+		"replay":          false,
+		"receivedAt":      "2026-10-21T04:01:00Z",
+		"recordErrors":    recordErrors,
+	}}
 }
 
 // bindDevice writes a bound device state pointing at the fake server so the
@@ -221,19 +265,27 @@ func enableGrant(t *testing.T, stateDir, source, input string) {
 	}
 }
 
-// writePendingBatch seeds the outbox with a minimal valid batch file, used
-// to exercise the bounded drain without going through export.
+// writePendingBatch seeds the outbox with a minimal valid one-record batch
+// file, used to exercise the bounded drain without going through export.
 func writePendingBatch(t *testing.T, stateDir, batchID string) {
+	t.Helper()
+	writePendingBatchRecords(t, stateDir, batchID, 1)
+}
+
+// writePendingBatchRecords seeds the outbox with a pending batch file
+// carrying n synthetic records, for drain tests whose receipts must mix
+// accepted and rejected records inside one batch.
+func writePendingBatchRecords(t *testing.T, stateDir, batchID string, n int) {
 	t.Helper()
 	batchesDir := filepath.Join(stateDir, "batches")
 	if err := os.MkdirAll(batchesDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(batchesDir, batchID+".json")
-	payload := map[string]any{
-		"batchId": batchID,
-		"records": []map[string]any{{
-			"recordKey":      batchID + "-record-1",
+	records := make([]map[string]any, 0, n)
+	for i := 1; i <= n; i++ {
+		records = append(records, map[string]any{
+			"recordKey":      fmt.Sprintf("%s-record-%d", batchID, i),
 			"kind":           "delta",
 			"occurredAt":     "2026-10-21T04:00:00Z",
 			"tool":           "usage-json",
@@ -243,8 +295,9 @@ func writePendingBatch(t *testing.T, stateDir, batchID string) {
 			"output":         "5",
 			"adapterVersion": "collection-test-1",
 			"sourceType":     "fixture",
-		}},
+		})
 	}
+	payload := map[string]any{"batchId": batchID, "records": records}
 	b, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatal(err)
@@ -257,7 +310,7 @@ func writePendingBatch(t *testing.T, stateDir, batchID string) {
 		File:        path,
 		Source:      "usage-json",
 		Input:       path,
-		RecordCount: 1,
+		RecordCount: n,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -556,6 +609,167 @@ func TestRunStopsDrainOnUploadFailure(t *testing.T) {
 	}
 	if remaining < 2 {
 		t.Fatalf("both batches must remain pending after the failure, got %d", remaining)
+	}
+}
+
+// A partial receipt — the server accepted some records of a batch and
+// rejected the rest — must never read as full sync success. The
+// syncclient has already reconciled the receipt (accepted records
+// confirmed, batch marked synced), so the run keeps the accepted part
+// counted and still reports the tool as synced, but it fails with
+// ErrRecordsRejected and explicit rejected counts instead of returning
+// nil.
+func TestRunPartialReceiptIsNotFullSyncSuccess(t *testing.T) {
+	stateDir := t.TempDir()
+	server := fakeServer(t)
+	// Every batch's first record is accepted; the rest are rejected with
+	// a stable code.
+	server.rejectRecords = func(records []map[string]any) map[int]string {
+		rejected := map[int]string{}
+		for idx := 1; idx < len(records); idx++ {
+			rejected[idx] = "invalid_record"
+		}
+		return rejected
+	}
+	bindDevice(t, stateDir, server.URL)
+
+	sessions := filepath.Join(t.TempDir(), "sessions")
+	writeClaudeSession(t, sessions, "session.jsonl",
+		claudeLine(t, "2026-10-21T04:00:00Z", "s1", "msg_1", claudeUsage(10, 0, 0, 5)),
+		claudeLine(t, "2026-10-21T04:01:00Z", "s1", "msg_2", claudeUsage(7, 1, 0, 4)))
+	enableGrant(t, stateDir, "claude-code-jsonl", sessions)
+
+	res, err := Run(t.Context(), Options{StateDir: stateDir, Now: func() time.Time {
+		return time.Date(2026, 10, 21, 4, 2, 0, 0, time.UTC)
+	}})
+	if !errors.Is(err, ErrRecordsRejected) {
+		t.Fatalf("expected ErrRecordsRejected, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "1 record(s)") || !strings.Contains(err.Error(), "1 drained batch") {
+		t.Fatalf("the rejection error must carry the explicit counts, got %v", err)
+	}
+	// The accepted record is not lost: it stays counted and reported.
+	if res.SyncedBatches != 1 || res.SyncedRecords != 1 {
+		t.Fatalf("the accepted record must stay counted, got %#v", res)
+	}
+	if res.RejectedBatches != 1 || res.RejectedRecords != 1 {
+		t.Fatalf("the rejected record must be counted explicitly, got %#v", res)
+	}
+	if res.PendingRemaining != 0 || res.DrainStopped != "" {
+		t.Fatalf("the settled batch must leave nothing pending, got %#v", res)
+	}
+	if got := server.toolStatusRequests(); got != 1 {
+		t.Fatalf("the accepted part must still produce one synced receipt, got %d tool-status POSTs", got)
+	}
+	if reports := server.toolStatusReports(); len(reports) != 1 ||
+		reports[0] != (toolStatusReport{Tool: "Claude Code", Status: "synced"}) {
+		t.Fatalf("expected a single Claude Code synced receipt, got %#v", reports)
+	}
+	// The batch is settled in the outbox with both counts recorded — the
+	// syncclient's reconciliation is preserved, nothing is retried.
+	out, loadErr := outbox.New(stateDir).Load()
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if len(out.Batches) != 1 {
+		t.Fatalf("expected exactly the exported batch in the outbox, got %#v", out.Batches)
+	}
+	batch := out.Batches[0]
+	if batch.Status != outbox.StatusSynced || batch.AcceptedRecords != 1 || batch.RejectedRecords != 1 {
+		t.Fatalf("expected the settled batch to record accepted=1 rejected=1, got %#v", batch)
+	}
+}
+
+// A fully rejected receipt — the server accepted nothing — is the
+// strongest form of a partial outcome. The run must fail with
+// ErrRecordsRejected, count every rejected record, and send no tool
+// status at all: no synced receipt (nothing was accepted) and no
+// no_new_records empty-scan report either, because the run is not a
+// clean success.
+func TestRunFullyRejectedReceiptIsNotFullSyncSuccess(t *testing.T) {
+	stateDir := t.TempDir()
+	server := fakeServer(t)
+	server.rejectRecords = func(records []map[string]any) map[int]string {
+		rejected := map[int]string{}
+		for idx := range records {
+			rejected[idx] = "invalid_record"
+		}
+		return rejected
+	}
+	bindDevice(t, stateDir, server.URL)
+	enableIdleGrant(t, stateDir)
+	writePendingBatch(t, stateDir, "batch-rejected-all-1")
+
+	res, err := Run(t.Context(), Options{StateDir: stateDir})
+	if !errors.Is(err, ErrRecordsRejected) {
+		t.Fatalf("expected ErrRecordsRejected, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "batch-rejected-all-1") {
+		t.Fatalf("the rejection error must name the rejected batch, got %v", err)
+	}
+	if res.SyncedRecords != 0 {
+		t.Fatalf("nothing must be counted as accepted, got %#v", res)
+	}
+	if res.SyncedBatches != 1 || res.RejectedBatches != 1 || res.RejectedRecords != 1 {
+		t.Fatalf("expected the settled batch and its rejected record counted, got %#v", res)
+	}
+	if res.PendingRemaining != 0 {
+		t.Fatalf("the settled batch must not stay pending, got %#v", res)
+	}
+	// Neither a synced receipt nor the empty-scan status may dress the
+	// run up as success.
+	if got := server.toolStatusRequests(); got != 0 {
+		t.Fatalf("a fully rejected run must send no tool status, got %d tool-status POSTs", got)
+	}
+	// The syncclient's reconciliation stands: the batch is terminal with
+	// the rejected count recorded, not queued for a blind resend.
+	out, loadErr := outbox.New(stateDir).Load()
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if len(out.Batches) != 1 {
+		t.Fatalf("expected exactly the seeded batch in the outbox, got %#v", out.Batches)
+	}
+	batch := out.Batches[0]
+	if batch.Status != outbox.StatusSynced || batch.AcceptedRecords != 0 || batch.RejectedRecords != 1 {
+		t.Fatalf("expected the settled batch to record accepted=0 rejected=1, got %#v", batch)
+	}
+}
+
+// A partial rejection must not block the rest of the drain: later pending
+// batches still upload and their accepted records stay counted alongside
+// the rejected ones, while the run still fails overall.
+func TestRunDrainContinuesAfterPartialRejection(t *testing.T) {
+	stateDir := t.TempDir()
+	server := fakeServer(t)
+	var uploads atomic.Int64
+	server.rejectRecords = func(records []map[string]any) map[int]string {
+		if uploads.Add(1) == 1 {
+			// First batch: two records, the second one rejected.
+			return map[int]string{1: "invalid_record"}
+		}
+		return nil // Later batches: accept everything.
+	}
+	bindDevice(t, stateDir, server.URL)
+	enableIdleGrant(t, stateDir)
+	writePendingBatchRecords(t, stateDir, "batch-partial-first", 2)
+	writePendingBatch(t, stateDir, "batch-partial-second")
+
+	res, err := Run(t.Context(), Options{StateDir: stateDir})
+	if !errors.Is(err, ErrRecordsRejected) {
+		t.Fatalf("expected ErrRecordsRejected, got %v", err)
+	}
+	if got := server.ingestRequests(); got != 2 {
+		t.Fatalf("the drain must upload both batches despite the partial rejection, got %d ingest POSTs", got)
+	}
+	if res.SyncedBatches != 2 || res.SyncedRecords != 2 {
+		t.Fatalf("the second batch's accepted record must not be lost, got %#v", res)
+	}
+	if res.RejectedBatches != 1 || res.RejectedRecords != 1 {
+		t.Fatalf("only the first batch's rejection must be counted, got %#v", res)
+	}
+	if res.PendingRemaining != 0 {
+		t.Fatalf("both settled batches must leave nothing pending, got %#v", res)
 	}
 }
 

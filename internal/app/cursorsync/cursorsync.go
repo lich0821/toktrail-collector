@@ -99,6 +99,32 @@ type Options struct {
 	MaxBatches int
 	// Out receives progress output; nil discards.
 	Out io.Writer
+	// ForceResync forces one full-range recovery round (reinstall
+	// recovery): the pull covers the whole currently authorized window
+	// (like the daily reconciliation, but unconditional) and unchanged
+	// events are re-emitted — not skipped — as records whose fresh
+	// revision dominates both the local and the server-delivered
+	// nextRevision (and stays strictly above each event's cached
+	// revision), so the server replaces them instead of going stale.
+	//
+	// Safety: the persistent event cache is never cleared (it keeps its
+	// dedupe and revision memory; re-emitted entries merely restage at
+	// the fresh revision) and the revision memory is never reset — it
+	// stays the folded max(local, server) and only ever advances. Pending
+	// batches in the durable outbox drain first with their immutable
+	// revisions and are never dropped; a failed round keeps the
+	// watermark, the cache and every pending batch exactly like a normal
+	// round. The round still runs under the full authorization preflight
+	// (fresh self view, scope, consent, source state) — forcing never
+	// bypasses any permission.
+	//
+	// The effect lasts exactly one round: later rounds skip unchanged
+	// events again unless they force again.
+	//
+	// Reporting: a fully successful forced round sets no Note (the count
+	// travels in Result.ReemittedRecords alone) so success receipts keyed
+	// on an empty Note keep flowing.
+	ForceResync bool
 }
 
 // Gate is the effective collection policy for one run, supplied by the
@@ -144,6 +170,16 @@ type Result struct {
 	ReplacedRecords   int
 	SkippedUnchanged  int
 	SkippedNoStableID int
+	// ReemittedRecords counts unchanged events re-emitted by a forced
+	// resync round (Options.ForceResync): their content matched the local
+	// cache, but the round re-delivered them at a fresh revision so the
+	// server's view of the account source is fully rebuilt. Reported
+	// separately from NewRecords/ReplacedRecords/SkippedUnchanged. It is
+	// the ONLY reporting surface for a forced round: a fully successful
+	// forced round sets no Note, so consumers that key success on an
+	// empty Note (the periodic layer's synced / leaderboard status
+	// receipt) are not suppressed.
+	ReemittedRecords int
 
 	ExportedBatches int
 	SyncedBatches   int
@@ -382,8 +418,11 @@ func Sync(ctx context.Context, opt Options, gate Gate) (Result, error) {
 	// whole authorized window instead; LastFullPullAt advances only after
 	// a complete, durably persisted pull. The pull still runs inside the
 	// authorized window and the API client's hard budgets — no unlimited
-	// beyond-window backfill is promised.
-	fullPull := license.PullWatermark == nil || dueFullPull(opt.now(), license.LastFullPullAt)
+	// beyond-window backfill is promised. A forced resync round
+	// (Options.ForceResync) takes the same full window unconditionally,
+	// so a reinstalled deployment re-covers everything currently
+	// authorized even when the watermark says otherwise.
+	fullPull := license.PullWatermark == nil || dueFullPull(opt.now(), license.LastFullPullAt) || opt.ForceResync
 	// Pull window: overlap before the watermark (skipped for a full
 	// pull), bounded by the effective (merged, fresh) history start; To
 	// is frozen for the whole round and never exceeds the server's upload
@@ -425,13 +464,22 @@ func Sync(ctx context.Context, opt Options, gate Gate) (Result, error) {
 	roundRevision := license.NextRevision
 	// Normalize reads the cache read-only: staged entries are applied
 	// only after the resulting batch is durable, so a failed round never
-	// pollutes the live cache.
-	records, staged, stats, err := usage.Normalize(events, subjectNamespace(st), accountID, roundRevision, cache)
+	// pollutes the live cache. A forced resync round additionally
+	// re-emits unchanged events at the fresh revision instead of
+	// skipping them (reinstall recovery); the cache itself is never
+	// cleared. A fully successful forced round deliberately sets NO Note:
+	// the count travels in Result.ReemittedRecords alone, so success
+	// receipts keyed on an empty Note (the periodic layer's synced /
+	// leaderboard status report) keep flowing.
+	records, staged, stats, err := usage.NormalizeWithOptions(events, subjectNamespace(st), accountID, roundRevision, cache, usage.NormalizeOptions{
+		ForceReemitUnchanged: opt.ForceResync,
+	})
 	if err != nil {
 		return res, fmt.Errorf("cursor usage normalization failed (watermark not advanced): %w", err)
 	}
 	res.NewRecords, res.ReplacedRecords = stats.NewRecords, stats.ReplacedRecords
 	res.SkippedUnchanged, res.SkippedNoStableID = stats.SkippedUnchanged, stats.SkippedNoStableID
+	res.ReemittedRecords = stats.ReemittedRecords
 
 	if len(records) > 0 {
 		for start := 0; start < len(records); start += protocol.MaxBatchRecords {

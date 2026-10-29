@@ -350,7 +350,7 @@ func TestConnectCrashRecovery(t *testing.T) {
 	_ = homeDir
 }
 
-func TestConnectHistoryCutoffPreservesWidestWindow(t *testing.T) {
+func TestConnectHistoryCutoffFollowsCurrentAuthorization(t *testing.T) {
 	fixedNow := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
 
 	// setup builds one mock pair per scenario; the captured `days`
@@ -454,46 +454,61 @@ func TestConnectHistoryCutoffPreservesWidestWindow(t *testing.T) {
 		st := runTicket(strings.Repeat("a", 64))
 		assertWindow(t, st, cutoff90, 90)
 
-		// Server narrows the window on the SAME link; retry must not
-		// shrink the pinned cutoff.
+		// Server narrows the window on the SAME link: a retry is the same
+		// authorization being re-presented, and re-deriving the now-based
+		// cutoff on every retry would drift the window forward run by
+		// run. The pinned cutoff stays fixed.
 		setDays(7)
 		st = runTicket(strings.Repeat("a", 64))
 		assertWindow(t, st, cutoff90, 90)
 	})
 
-	t.Run("rebind_with_narrower_window_preserves_widest", func(t *testing.T) {
+	t.Run("rebind_with_narrower_window_narrows", func(t *testing.T) {
 		runTicket, setDays := setup(t)
 		cutoff90 := fixedNow.AddDate(0, 0, -90)
+		cutoff7 := fixedNow.AddDate(0, 0, -7)
 
 		st := runTicket(strings.Repeat("a", 64))
 		assertWindow(t, st, cutoff90, 90)
 
-		// A new link with a 7-day window must NOT move the cutoff later:
-		// records already collected under the 90-day consent would fall
-		// before the cutoff and be quarantined as before_history_from.
+		// A new link (new receipt → rebind) carries the user's CURRENT
+		// authorization: a narrower window replaces the wider one.
+		// Records already collected that fall before the new cutoff are
+		// quarantined by the pipeline (before_history_from), never
+		// deleted.
 		setDays(7)
 		st = runTicket(strings.Repeat("b", 64)) // new ticket → rebind
-		assertWindow(t, st, cutoff90, 90)
+		assertWindow(t, st, cutoff7, 7)
 	})
 
-	for _, tc := range []struct {
-		name   string
-		ticket string
-	}{
-		{"same_receipt_unlimited", strings.Repeat("a", 64)},
-		{"new_receipt_unlimited", strings.Repeat("b", 64)},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			runTicket, setDays := setup(t)
-			setDays(30)
-			assertWindow(t, runTicket(strings.Repeat("a", 64)), fixedNow.AddDate(0, 0, -30), 30)
-			setDays(0) // encode an explicit JSON null
-			st := runTicket(tc.ticket)
-			if st.HistoryFrom != nil || st.HistoryDays != 0 {
-				t.Fatalf("expected unlimited history, got from=%v days=%d", st.HistoryFrom, st.HistoryDays)
-			}
-		})
-	}
+	t.Run("same_receipt_unlimited_keeps_fixed_window", func(t *testing.T) {
+		runTicket, setDays := setup(t)
+		cutoff30 := fixedNow.AddDate(0, 0, -30)
+
+		setDays(30)
+		assertWindow(t, runTicket(strings.Repeat("a", 64)), cutoff30, 30)
+
+		// An explicit null on the SAME receipt must not clear the pinned
+		// window: same-receipt retries never re-derive the cutoff (see
+		// same_receipt_retry_keeps_pinned_cutoff).
+		setDays(0) // encode an explicit JSON null
+		st := runTicket(strings.Repeat("a", 64))
+		assertWindow(t, st, cutoff30, 30)
+	})
+
+	t.Run("new_receipt_unlimited_clears_window", func(t *testing.T) {
+		runTicket, setDays := setup(t)
+		cutoff30 := fixedNow.AddDate(0, 0, -30)
+
+		setDays(30)
+		assertWindow(t, runTicket(strings.Repeat("a", 64)), cutoff30, 30)
+
+		setDays(0)                               // encode an explicit JSON null
+		st := runTicket(strings.Repeat("b", 64)) // new receipt → rebind
+		if st.HistoryFrom != nil || st.HistoryDays != 0 {
+			t.Fatalf("expected unlimited history from the new authorization, got from=%v days=%d", st.HistoryFrom, st.HistoryDays)
+		}
+	})
 
 	t.Run("rebind_with_wider_window_widens_cutoff", func(t *testing.T) {
 		runTicket, setDays := setup(t)
@@ -515,6 +530,11 @@ func TestApplyHistoryCutoffRules(t *testing.T) {
 		tt := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC).AddDate(0, 0, offset)
 		return &tt
 	}
+
+	// applyHistoryCutoff pins the window to THIS authorization: the
+	// current cutoff replaces whatever was stored, narrowing included.
+	// The same-receipt "keep fixed" behavior lives in Run's receipt
+	// logic, not in this setter.
 
 	t.Run("no_current_cutoff_adopts_any_cutoff", func(t *testing.T) {
 		st := statedir.DeviceState{}
@@ -540,11 +560,13 @@ func TestApplyHistoryCutoffRules(t *testing.T) {
 		}
 	})
 
-	t.Run("later_cutoff_is_ignored", func(t *testing.T) {
+	t.Run("later_cutoff_narrows_to_current_authorization", func(t *testing.T) {
+		// The user's current consent governs: a re-issued authorization
+		// with a narrower window replaces the wider one.
 		st := statedir.DeviceState{HistoryFrom: day(-90), HistoryDays: 90}
 		applyHistoryCutoff(&st, day(-7), 7)
-		if !st.HistoryFrom.Equal(*day(-90)) || st.HistoryDays != 90 {
-			t.Fatalf("cutoff must never shrink; got (HistoryFrom=%v, HistoryDays=%d)", st.HistoryFrom, st.HistoryDays)
+		if !st.HistoryFrom.Equal(*day(-7)) || st.HistoryDays != 7 {
+			t.Fatalf("cutoff must follow the current authorization; got (HistoryFrom=%v, HistoryDays=%d)", st.HistoryFrom, st.HistoryDays)
 		}
 	})
 
@@ -560,16 +582,16 @@ func TestApplyHistoryCutoffRules(t *testing.T) {
 		st := statedir.DeviceState{HistoryFrom: day(-30), HistoryDays: 30}
 		applyHistoryCutoff(&st, nil, 0)
 		if st.HistoryFrom != nil || st.HistoryDays != 0 {
-			t.Fatalf("nil cutoff must clear the pinned window; got (HistoryFrom=%v, HistoryDays=%d)", st.HistoryFrom, st.HistoryDays)
+			t.Fatalf("nil cutoff must clear the window; got (HistoryFrom=%v, HistoryDays=%d)", st.HistoryFrom, st.HistoryDays)
 		}
 	})
 
-	t.Run("preserved_cutoff_tracks_widest_days_granted", func(t *testing.T) {
-		// Cutoff stays pinned, but the day count tracks the widest
-		// window ever granted.
+	t.Run("cutoff_and_days_replace_together", func(t *testing.T) {
+		// Both fields always reflect the SAME authorization; there is no
+		// widowed widest-days tracking anymore.
 		st := statedir.DeviceState{HistoryFrom: day(-7), HistoryDays: 7}
 		applyHistoryCutoff(&st, day(-3), 90)
-		if !st.HistoryFrom.Equal(*day(-7)) || st.HistoryDays != 90 {
+		if !st.HistoryFrom.Equal(*day(-3)) || st.HistoryDays != 90 {
 			t.Fatalf("got (HistoryFrom=%v, HistoryDays=%d)", st.HistoryFrom, st.HistoryDays)
 		}
 	})

@@ -306,6 +306,126 @@ func TestNormalizeNilVersusZeroCounts(t *testing.T) {
 	}
 }
 
+// TestNormalizeForceReemitUnchanged covers the ForceReemitUnchanged
+// option (reinstall recovery): unchanged events are re-emitted as
+// records carrying the round revision instead of being skipped, the
+// staged entries restage at the fresh revision with the same digest, and
+// a later default round skips them again — the option changes one round,
+// never the ledger semantics.
+func TestNormalizeForceReemitUnchanged(t *testing.T) {
+	cache, dir := freshCache(t)
+	events := []api.UsageEvent{fullEvent("evt-0001", 100, 10, 20, 50), partialEvent("evt-0002", 7, 3)}
+	_, staged, _, err := usage.Normalize(events, subjectNS, testAccount, 5, cache)
+	if err != nil {
+		t.Fatalf("round 1: %v", err)
+	}
+	cache = commitRound(t, dir, staged)
+	key1 := eventKey(t, "evt-0001")
+	before, _ := cache.Get(key1)
+
+	records, staged2, stats, err := usage.NormalizeWithOptions(events, subjectNS, testAccount, 6, cache, usage.NormalizeOptions{ForceReemitUnchanged: true})
+	if err != nil {
+		t.Fatalf("forced round: %v", err)
+	}
+	if stats.ReemittedRecords != 2 || stats.NewRecords != 0 || stats.ReplacedRecords != 0 || stats.SkippedUnchanged != 0 {
+		t.Fatalf("forced stats: %+v", stats)
+	}
+	if len(records) != 2 || len(staged2) != 2 {
+		t.Fatalf("forced records=%d staged=%d, want 2/2", len(records), len(staged2))
+	}
+	for i, rec := range records {
+		if err := rec.Validate(); err != nil {
+			t.Fatalf("re-emitted record %d must be wire-valid: %v", i, err)
+		}
+		if rec.Revision != 6 {
+			t.Fatalf("re-emitted revision %d, want the round revision 6", rec.Revision)
+		}
+	}
+	if records[0].EventKey != key1 || records[1].EventKey != eventKey(t, "evt-0002") {
+		t.Fatal("re-emitted records must keep their event keys")
+	}
+	entry, ok := staged2[key1]
+	if !ok || entry.Revision != 6 || entry.Digest == "" || entry.Digest != before.Digest {
+		t.Fatalf("staged re-emit: %+v ok=%t (before %+v)", entry, ok, before)
+	}
+	cache = commitRound(t, dir, staged2)
+	if entry, ok := cache.Get(key1); !ok || entry.Revision != 6 || entry.Digest != before.Digest {
+		t.Fatalf("applied re-emit: %+v ok=%t", entry, ok)
+	}
+
+	// A later default round skips the unchanged events again.
+	_, staged3, stats, err := usage.Normalize(events, subjectNS, testAccount, 7, cache)
+	if err != nil {
+		t.Fatalf("post round: %v", err)
+	}
+	if stats.SkippedUnchanged != 2 || stats.ReemittedRecords != 0 || len(staged3) != 0 {
+		t.Fatalf("post-forced stats: %+v staged=%d", stats, len(staged3))
+	}
+}
+
+// TestNormalizeForceReemitRevisionGuard pins the forced re-emit revision
+// floor: the re-emitted revision is never at or below the cached revision
+// for the event, even when the round revision is lower (stale-seeding
+// edge: the license was rebuilt while the ledger survived).
+func TestNormalizeForceReemitRevisionGuard(t *testing.T) {
+	cache, dir := freshCache(t)
+	events := []api.UsageEvent{fullEvent("evt-0001", 100, 0, 0, 50)}
+	_, staged, _, err := usage.Normalize(events, subjectNS, testAccount, 10, cache)
+	if err != nil {
+		t.Fatalf("round 1: %v", err)
+	}
+	cache = commitRound(t, dir, staged)
+
+	records, staged2, stats, err := usage.NormalizeWithOptions(events, subjectNS, testAccount, 5, cache, usage.NormalizeOptions{ForceReemitUnchanged: true})
+	if err != nil {
+		t.Fatalf("forced round: %v", err)
+	}
+	if stats.ReemittedRecords != 1 || len(records) != 1 {
+		t.Fatalf("guard stats: %+v records=%d", stats, len(records))
+	}
+	if records[0].Revision != 11 {
+		t.Fatalf("re-emitted revision %d, want 11 (cached 10 + 1)", records[0].Revision)
+	}
+	if entry, ok := staged2[eventKey(t, "evt-0001")]; !ok || entry.Revision != 11 {
+		t.Fatalf("the staged re-emit must carry the guarded revision: %+v ok=%t", entry, ok)
+	}
+}
+
+// TestNormalizeForceReemitMixedRound verifies the per-event accounting
+// inside one forced round: an unchanged event, a changed event and a new
+// event count separately (re-emitted / replaced / new).
+func TestNormalizeForceReemitMixedRound(t *testing.T) {
+	cache, dir := freshCache(t)
+	_, staged, _, err := usage.Normalize([]api.UsageEvent{
+		fullEvent("evt-keep", 5, 0, 0, 5),
+		fullEvent("evt-chg", 5, 0, 0, 5),
+	}, subjectNS, testAccount, 3, cache)
+	if err != nil {
+		t.Fatalf("round 1: %v", err)
+	}
+	cache = commitRound(t, dir, staged)
+
+	records, _, stats, err := usage.NormalizeWithOptions([]api.UsageEvent{
+		fullEvent("evt-keep", 5, 0, 0, 5), // unchanged → re-emitted
+		fullEvent("evt-chg", 9, 0, 0, 9),  // changed → replaced
+		fullEvent("evt-new", 1, 0, 0, 1),  // never seen → new
+	}, subjectNS, testAccount, 4, cache, usage.NormalizeOptions{ForceReemitUnchanged: true})
+	if err != nil {
+		t.Fatalf("forced round: %v", err)
+	}
+	if stats.ReemittedRecords != 1 || stats.ReplacedRecords != 1 || stats.NewRecords != 1 || stats.SkippedUnchanged != 0 {
+		t.Fatalf("mixed forced stats: %+v", stats)
+	}
+	if len(records) != 3 {
+		t.Fatalf("mixed forced records: %d", len(records))
+	}
+	for _, rec := range records {
+		if rec.Revision != 4 {
+			t.Fatalf("record %s revision %d, want the round revision 4", rec.EventKey, rec.Revision)
+		}
+	}
+}
+
 // TestEventCacheApplyCommitReloadDelete covers the ledger persistence:
 // commit is a no-op when clean, Apply+Commit persists (0600 on POSIX), reload
 // round-trips, corrupt files fail closed, and DeleteCacheFile removes

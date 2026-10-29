@@ -24,6 +24,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -412,14 +413,27 @@ func TestConnectCursorIntegratedEnable(t *testing.T) {
 	// The enable used the injected authentication (no separate login
 	// step): the credential was read and verified through the fakes, and
 	// the synthetic usage was pulled and uploaded as a source batch.
+	// The initial collection's cursor round runs a FORCED full-range
+	// recovery pull (cursorsync.Options.ForceResync, set by connect's
+	// sync phase for reinstall recovery): the two cached events are
+	// re-emitted at fresh revisions and uploaded once more, so the server
+	// sees two source-batch posts totaling four records. That replay is
+	// idempotent by design (the fresh revision dominates), and the
+	// informational Note it leaves is not a failure.
 	if got := authFake.fetches.Load(); got < 1 {
 		t.Fatalf("the integrated enable must read the (injected) credential, got %d reads", got)
 	}
 	if got := pullFake.calls.Load(); got < 1 {
 		t.Fatalf("the integrated enable must pull usage, got %d pulls", got)
 	}
-	if srcPosts != 1 || srcRecords != 2 {
-		t.Fatalf("source-batch uploads = %d posts / %d records, want 1 post / 2 records", srcPosts, srcRecords)
+	if srcPosts != 2 || srcRecords != 4 {
+		t.Fatalf("source-batch uploads = %d posts / %d records, want 2 posts / 4 records (first sync + forced recovery re-emission)", srcPosts, srcRecords)
+	}
+	if res.PeriodicResult.Cursor.ReemittedRecords != 2 {
+		t.Fatalf("the forced cursor round must re-emit the 2 cached events, got %+v", res.PeriodicResult.Cursor)
+	}
+	if res.PeriodicResult.Cursor.Skipped != "" || !res.PeriodicResult.Cursor.Ran {
+		t.Fatalf("the forced cursor round completed and must not be skipped, got %+v", res.PeriodicResult.Cursor)
 	}
 
 	// No local grant is fabricated for the account-level source: the
@@ -456,11 +470,14 @@ func TestConnectCursorIntegratedEnable(t *testing.T) {
 }
 
 // TestConnectCursorDeclineSkipsCredentialAndKeepsOtherTools verifies that
-// a declined first-time confirmation is a clean, non-fatal skip: the
-// Cursor credential is never read (the desktop state is untouched), no
-// permit and no server enable exist afterwards, and every other
+// a declined first-time confirmation is a clean, non-fatal skip for the
+// OTHER tools while making the overall install explicitly incomplete:
+// the Cursor credential is never read (the desktop state is untouched),
+// no permit and no server enable exist afterwards, and every other
 // authorized tool keeps its full connect setup — grant, scheduler and
-// initial collection.
+// initial collection. The run itself returns ErrSyncIncomplete naming
+// the account source, because the authorization selected Cursor and it
+// was not activated.
 func TestConnectCursorDeclineSkipsCredentialAndKeepsOtherTools(t *testing.T) {
 	stateDir := t.TempDir()
 	homeDir := t.TempDir()
@@ -508,8 +525,14 @@ func TestConnectCursorDeclineSkipsCredentialAndKeepsOtherTools(t *testing.T) {
 			return false, nil // first-time non-interactive rejection
 		},
 	})
-	if err != nil {
-		t.Fatalf("a declined cursor confirmation must not fail connect: %v", err)
+	if err == nil {
+		t.Fatalf("a declined cursor confirmation leaves the install explicitly incomplete; expected an error")
+	}
+	if !errors.Is(err, ErrSyncIncomplete) {
+		t.Fatalf("the decline must surface as ErrSyncIncomplete, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "Cursor") {
+		t.Fatalf("the incomplete error must name the account source: %v", err)
 	}
 	if confirmCalls != 1 {
 		t.Fatalf("confirmation calls = %d, want 1", confirmCalls)

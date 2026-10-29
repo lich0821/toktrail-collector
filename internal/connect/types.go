@@ -45,6 +45,12 @@ type Result struct {
 	AuthorizedTools  []string          `json:"authorizedTools"`
 	InstalledService string            `json:"installedService"`
 	PeriodicResult   collection.Result `json:"periodicResult"`
+	// Sync reports the post-install sync orchestration (the initial
+	// collection round, the history retransmission, and the backlog
+	// drain). Sync.Incomplete lists every reason the current
+	// authorization was not fully covered; a non-empty list always came
+	// with a non-nil Run error.
+	Sync SyncResult `json:"sync"`
 }
 
 // Config is the server-provided configuration payload fetched from the connect endpoint.
