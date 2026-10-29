@@ -17,6 +17,7 @@ Supported sources in the current implementation:
 - Qwen Code / Qwen CLI chat JSONL (`qwen-jsonl`): passive `api_response`/`usageMetadata` counters only.
 - Kimi CLI wire JSONL (`kimi-cli-jsonl`): passive `StatusUpdate.token_usage` counters only.
 - Kimi Code wire JSONL (`kimi-code-jsonl`): passive turn-scoped `usage.record` counters only.
+- ZCode SQLite (`zcode-sqlite`): passive `model_usage` table counters only.
 - Synthetic/free-form `usage-json` fixtures for integration and compatibility testing.
 
 The collector uploads token usage counters, stable privacy-safe record identifiers, and source-specific model identifiers described below. It must not upload prompts, message bodies, raw session IDs, raw message IDs, or absolute local paths.
@@ -57,6 +58,7 @@ internal/source/
   workbuddyjsonl/        WorkBuddy JSONL parser and tests
   qwenjsonl/             Qwen Code / Qwen CLI JSONL parser and tests
   kimiwire/              Kimi CLI / Kimi Code wire JSONL parser and tests
+  zcodesqlite/           ZCode SQLite parser and tests
   registry/             Explicit compiled-in adapter registry
   pipeline/             Scan, preview, export, and batch splitting
 internal/local/         Local state, grants, outbox, commit, progress, lock, and quarantine
@@ -165,6 +167,20 @@ Kimi specifics:
 - Counters map as `input_other`/`inputOther` → `input`, `input_cache_read`/`inputCacheRead` → `cacheRead`, `input_cache_creation`/`inputCacheCreation` → `cacheWrite`, and `output` → `output`.
 - Kimi Desktop embedded runtime paths and archives are not default grants; validate real samples before granting them explicitly.
 
+Scan and export ZCode usage from a local directory:
+
+```sh
+go run ./cmd/toktrail scan --source zcode-sqlite --input ~/.zcode/cli/db
+go run ./cmd/toktrail export --source zcode-sqlite --input ~/.zcode/cli/db --out ./zcode-batch.json --batch zcode-demo-1
+```
+
+ZCode specifics:
+
+- The source reads only ZCode local SQLite `model_usage` tables. The default grant directory is `~/.zcode/cli/db`, and every `*.sqlite` file in that directory is read.
+- `input_tokens` includes cache read/write; the collector uploads net `input`, `cacheRead`, and `cacheWrite` separately.
+- Reads use a read-only immutable SQLite DSN to avoid creating sidecar files in the live ZCode directory. WAL-only commits may appear on the next scheduled read after checkpointing.
+- `rollout/model-io-*.jsonl`, `usage-archive.sqlite`, and `history-freeze.sqlite` are not included in the first version; validate real samples before extending the source.
+
 WorkBuddy specifics:
 
 - The source is passive JSONL only: it reads the session JSONL files WorkBuddy appends to and never writes to them.
@@ -203,6 +219,7 @@ go run ./cmd/toktrail service install \
   --grant qwen-jsonl=$HOME/.qwen/projects \
   --grant kimi-cli-jsonl=$HOME/.kimi/sessions \
   --grant kimi-code-jsonl=$HOME/.kimi-code/sessions \
+  --grant zcode-sqlite=$HOME/.zcode/cli/db \
   --interval 30m
 ```
 

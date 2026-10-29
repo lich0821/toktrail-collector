@@ -12,6 +12,7 @@ import (
 	"toktrail-collector/internal/source/qwenjsonl"
 	"toktrail-collector/internal/source/usagejson"
 	"toktrail-collector/internal/source/workbuddyjsonl"
+	"toktrail-collector/internal/source/zcodesqlite"
 )
 
 type Registry struct{ adapters []adapter.Adapter }
@@ -39,7 +40,7 @@ func New(adapters ...adapter.Adapter) (*Registry, error) {
 var production = mustProduction()
 
 func mustProduction() *Registry {
-	r, err := New(usagejson.Adapter(), codexjsonl.Adapter(), claudecodejsonl.Adapter(), deepseekharness.Adapter(), workbuddyjsonl.Adapter(), qwenjsonl.Adapter(), kimiwire.KimiCLIAdapter(), kimiwire.KimiCodeAdapter())
+	r, err := New(usagejson.Adapter(), codexjsonl.Adapter(), claudecodejsonl.Adapter(), deepseekharness.Adapter(), workbuddyjsonl.Adapter(), qwenjsonl.Adapter(), kimiwire.KimiCLIAdapter(), kimiwire.KimiCodeAdapter(), zcodesqlite.Adapter())
 	if err != nil {
 		panic(err)
 	}

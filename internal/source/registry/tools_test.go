@@ -44,6 +44,10 @@ func TestLookupTool(t *testing.T) {
 		{"Kimi Code", "Kimi Code", "kimi-code-jsonl", true},
 		{"kimi-code", "Kimi Code", "kimi-code-jsonl", true},
 		{"kimicode", "Kimi Code", "kimi-code-jsonl", true},
+		{"ZCode", "ZCode", "zcode-sqlite", true},
+		{"zcode", "ZCode", "zcode-sqlite", true},
+		{"z-code", "ZCode", "zcode-sqlite", true},
+		{"智谱 zcode", "ZCode", "zcode-sqlite", true},
 		{"Cursor", "Cursor", "cursor-dashboard-api", true},
 		{"cursor", "Cursor", "cursor-dashboard-api", true},
 		{"  cursor  ", "Cursor", "cursor-dashboard-api", true},
@@ -134,6 +138,16 @@ func TestResolveDefaultInput(t *testing.T) {
 	}
 	resolved = spec.ResolveDefaultInput(home)
 	expected = filepath.Join("test", "home", ".kimi-code", "sessions")
+	if resolved != expected {
+		t.Errorf("expected %q, got %q", expected, resolved)
+	}
+
+	spec, found = LookupTool("ZCode")
+	if !found {
+		t.Fatal("ZCode not found")
+	}
+	resolved = spec.ResolveDefaultInput(home)
+	expected = filepath.Join("test", "home", ".zcode", "cli", "db")
 	if resolved != expected {
 		t.Errorf("expected %q, got %q", expected, resolved)
 	}

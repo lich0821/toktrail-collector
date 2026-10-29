@@ -82,6 +82,13 @@ var supportedTools = []ToolSpec{
 		Mode:           ModeLocal,
 	},
 	{
+		Tool:           "ZCode",
+		Aliases:        []string{"zcode", "z code", "z-code", "zai zcode", "z.ai zcode", "智谱 zcode"},
+		Source:         adapter.ZCodeSQLiteSource,
+		DefaultSubpath: []string{".zcode", "cli", "db"},
+		Mode:           ModeLocal,
+	},
+	{
 		// Cursor is the first account-level network source: usage is
 		// collected by direct authenticated requests to the Cursor
 		// dashboard API using the locally confirmed desktop login. It

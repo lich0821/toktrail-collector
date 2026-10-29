@@ -15,6 +15,7 @@ const (
 	QwenJSONLSource       = "qwen-jsonl"
 	KimiCLIJSONLSource    = "kimi-cli-jsonl"
 	KimiCodeJSONLSource   = "kimi-code-jsonl"
+	ZCodeSQLiteSource     = "zcode-sqlite"
 	// CursorDashboardAPISource identifies the account-level Cursor network
 	// source. It is deliberately NOT a compiled-in local file adapter: it
 	// never appears in the local grants store (whose validation requires
