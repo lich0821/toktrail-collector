@@ -15,6 +15,8 @@ Collector 的设计目标是：即使没有账号，本地检查仍然可用。`
 - DeepSeek Harness session JSONL（`deepseek-harness`）。
 - WorkBuddy AI session JSONL（`workbuddy-jsonl`）：仅被动读取 JSONL。
 - Qwen Code / Qwen CLI chat JSONL（`qwen-jsonl`）：仅被动读取 `api_response`/`usageMetadata` 计数。
+- Kimi CLI wire JSONL（`kimi-cli-jsonl`）：仅读取 `StatusUpdate.token_usage` 计数。
+- Kimi Code wire JSONL（`kimi-code-jsonl`）：仅读取 turn 级 `usage.record` 计数。
 - 用于集成与兼容测试的合成/自由格式 `usage-json`。
 
 Collector 上传 Token 使用计数、稳定的隐私安全记录标识，以及下文说明的各采集源模型标识。它不得上传 prompt、消息正文、原始 session ID、原始 message ID 或本地绝对路径。
@@ -54,6 +56,7 @@ internal/source/
   deepseekharness/       DeepSeek Harness parser 与测试
   workbuddyjsonl/        WorkBuddy JSONL parser 与测试
   qwenjsonl/             Qwen Code / Qwen CLI JSONL parser 与测试
+  kimiwire/              Kimi CLI / Kimi Code wire JSONL parser 与测试
   registry/             显式编译期 adapter 注册表
   pipeline/             扫描、预览、导出与批次拆分
 internal/local/         本地状态、授权、outbox、commit、进度、锁与隔离区
@@ -139,6 +142,27 @@ Qwen 说明：
 - `promptTokenCount` / `input_token_count` 包含 cache read；Collector 上传时拆成净 input 与 `cacheRead`。Qwen 日志未可靠暴露 cache write，首版记录为 `0`，不从价格或 prompt 差额反推。
 - 默认目录是 `~/.qwen/projects`；旧版 `~/.qwen/tmp/...` 布局和 `~/.qwen/usage*.jsonl` 台账尚未作为权威来源启用，需后续真实样本验证。
 
+扫描并导出 Kimi CLI 使用数据：
+
+```sh
+go run ./cmd/toktrail scan --source kimi-cli-jsonl --input ~/.kimi/sessions
+go run ./cmd/toktrail export --source kimi-cli-jsonl --input ~/.kimi/sessions --out ./kimi-cli-batch.json --batch kimi-cli-demo-1
+```
+
+扫描并导出 Kimi Code 使用数据：
+
+```sh
+go run ./cmd/toktrail scan --source kimi-code-jsonl --input ~/.kimi-code/sessions
+go run ./cmd/toktrail export --source kimi-code-jsonl --input ~/.kimi-code/sessions --out ./kimi-code-batch.json --batch kimi-code-demo-1
+```
+
+Kimi 说明：
+
+- Kimi CLI 和 Kimi Code 分别注册为 `kimi-cli-jsonl` 与 `kimi-code-jsonl`，默认目录分别是 `~/.kimi/sessions` 与 `~/.kimi-code/sessions`，不假设两者完全兼容。
+- Kimi CLI 仅读取 `wire.jsonl` 中的 `StatusUpdate.token_usage`；Kimi Code 仅读取 turn 级 `usage.record`，跳过 session 级累计记录以避免重复计数。
+- 计数映射为 `input_other`/`inputOther` → `input`，`input_cache_read`/`inputCacheRead` → `cacheRead`，`input_cache_creation`/`inputCacheCreation` → `cacheWrite`，`output` → `output`。
+- Kimi Desktop 内置运行时路径和其它归档目录尚未作为默认授权路径；如需采集，需先用真实样本单独验证后显式授权。
+
 WorkBuddy 说明：
 
 - 该 source 仅被动读取 JSONL：只读 WorkBuddy 追加写入的 session JSONL 文件，绝不写入。
@@ -175,6 +199,8 @@ go run ./cmd/toktrail service install \
   --grant deepseek-harness=$HOME/.dsh/sessions \
   --grant workbuddy-jsonl=$HOME/.workbuddy-ai/projects \
   --grant qwen-jsonl=$HOME/.qwen/projects \
+  --grant kimi-cli-jsonl=$HOME/.kimi/sessions \
+  --grant kimi-code-jsonl=$HOME/.kimi-code/sessions \
   --interval 30m
 ```
 

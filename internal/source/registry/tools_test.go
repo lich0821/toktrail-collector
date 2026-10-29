@@ -37,6 +37,13 @@ func TestLookupTool(t *testing.T) {
 		{"qwen cli", "Qwen Code", "qwen-jsonl", true},
 		{"qwencli", "Qwen Code", "qwen-jsonl", true},
 		{"  Qwen Code  ", "Qwen Code", "qwen-jsonl", true},
+		{"Kimi CLI", "Kimi CLI", "kimi-cli-jsonl", true},
+		{"kimi", "Kimi CLI", "kimi-cli-jsonl", true},
+		{"kimi-cli", "Kimi CLI", "kimi-cli-jsonl", true},
+		{"kimicli", "Kimi CLI", "kimi-cli-jsonl", true},
+		{"Kimi Code", "Kimi Code", "kimi-code-jsonl", true},
+		{"kimi-code", "Kimi Code", "kimi-code-jsonl", true},
+		{"kimicode", "Kimi Code", "kimi-code-jsonl", true},
 		{"Cursor", "Cursor", "cursor-dashboard-api", true},
 		{"cursor", "Cursor", "cursor-dashboard-api", true},
 		{"  cursor  ", "Cursor", "cursor-dashboard-api", true},
@@ -107,6 +114,26 @@ func TestResolveDefaultInput(t *testing.T) {
 	}
 	resolved = spec.ResolveDefaultInput(home)
 	expected = filepath.Join("test", "home", ".qwen", "projects")
+	if resolved != expected {
+		t.Errorf("expected %q, got %q", expected, resolved)
+	}
+
+	spec, found = LookupTool("Kimi CLI")
+	if !found {
+		t.Fatal("Kimi CLI not found")
+	}
+	resolved = spec.ResolveDefaultInput(home)
+	expected = filepath.Join("test", "home", ".kimi", "sessions")
+	if resolved != expected {
+		t.Errorf("expected %q, got %q", expected, resolved)
+	}
+
+	spec, found = LookupTool("Kimi Code")
+	if !found {
+		t.Fatal("Kimi Code not found")
+	}
+	resolved = spec.ResolveDefaultInput(home)
+	expected = filepath.Join("test", "home", ".kimi-code", "sessions")
 	if resolved != expected {
 		t.Errorf("expected %q, got %q", expected, resolved)
 	}
