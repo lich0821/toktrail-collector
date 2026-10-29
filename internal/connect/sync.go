@@ -138,6 +138,23 @@ type SyncOptions struct {
 	// ResyncMaxBatches is an optional per-run retransmission upload
 	// budget (0 walks the whole frozen plan).
 	ResyncMaxBatches int
+	// ResyncReplaceExisting switches the resync CLI entry into the
+	// explicitly confirmed override pass: scan the CURRENT Codex and
+	// DeepSeek Harness sources and replace same-key server records with
+	// the current scanned record. It is a manual-only mode: connect's own
+	// automatic flow never sets it, and when set the sync runs ONLY the
+	// override pass (no cursor round, no collection phase, no backlog
+	// drain — normal collection resumes on the next ordinary sync once
+	// the repair is done).
+	ResyncReplaceExisting bool
+	// ResyncOverrideConfirm is the interactive confirmation hook for the
+	// override pass (the resync CLI's prompt). Sync invokes it with the
+	// ACTUAL current-scan override plan before any state change or
+	// network traffic; returning an error aborts with zero writes.
+	// Required for a non-dry-run override pass.
+	ResyncOverrideConfirm func(resync.OverridePlan) error
+	// ResyncOverrideProgress reports each override batch outcome.
+	ResyncOverrideProgress func(resync.OverrideProgressEvent)
 	// MaxBacklogPasses bounds the extra drain passes (defaults to
 	// DefaultMaxBacklogPasses).
 	MaxBacklogPasses int
@@ -274,6 +291,70 @@ func Sync(ctx context.Context, opt SyncOptions) (SyncResult, error) {
 			return syncRes, fmt.Errorf("history retransmission planning failed: %w", err)
 		}
 		fmt.Fprintln(out, "dry-run: offline, no files changed, remote consent scope NOT verified; execution checks consent before every upload")
+		return syncRes, nil
+	}
+
+	// Override pass (manual `resync --all --replace-existing`): runs ONLY
+	// the repair — no cursor round, no collection phase, no backlog
+	// drain. Normal collection is blocked fail-closed while override
+	// attempts are pending and resumes on the next ordinary sync once the
+	// repair completes. Connect's own automatic flow never sets this
+	// mode; it exists solely for the explicitly confirmed CLI gesture.
+	if opt.ResyncReplaceExisting {
+		if opt.ResyncDryRun {
+			res, err := resync.RunOverride(ctx, resync.OverrideOptions{
+				StateDir:   stateDir,
+				ServerURL:  opt.ServerURL,
+				HTTPClient: opt.HTTPClient,
+				DryRun:     true,
+				Now:        now,
+			})
+			syncRes.Resync = summarizeOverride(res, true)
+			if err != nil {
+				syncRes.Resync.Err = err.Error()
+				return syncRes, fmt.Errorf("override planning failed: %w", err)
+			}
+			fmt.Fprintln(out, "dry-run: offline, no files changed, remote consent scope and server capability NOT verified")
+			return syncRes, nil
+		}
+		if err := checkHistoryOwnership(stateDir); err != nil {
+			return syncRes, err
+		}
+		lock, err := acquireStateLock(ctx, stateDir)
+		if err != nil {
+			if errors.Is(err, runlock.ErrBusy) {
+				syncRes.Resync.Skipped = fmt.Sprintf("the state directory stayed busy for %s (another collector process — likely the scheduled task — holds the lock); the override pass was NOT run", stateLockRetryTotal)
+				fmt.Fprintf(out, "override pass: not run (%s)\n", syncRes.Resync.Skipped)
+				return syncRes, nil
+			}
+			return syncRes, fmt.Errorf("acquire state lock for the override pass: %w", err)
+		}
+		// RunOverride plans from the CURRENT scan and invokes the
+		// confirmation hook with that exact plan before any state change
+		// or network traffic — under the lock, so what the user confirms
+		// is precisely what executes.
+		res, overrideErr := resync.RunOverride(ctx, resync.OverrideOptions{
+			StateDir:   stateDir,
+			ServerURL:  opt.ServerURL,
+			HTTPClient: opt.HTTPClient,
+			MaxBatches: opt.ResyncMaxBatches,
+			Confirm:    opt.ResyncOverrideConfirm,
+			Progress:   progressOverrideOrDefault(opt.ResyncOverrideProgress, out),
+			Now:        now,
+		})
+		_ = lock.Close()
+		syncRes.Resync = summarizeOverride(res, true)
+		if overrideErr != nil {
+			if errors.Is(overrideErr, syncclient.ErrDevicePaused) {
+				syncRes.Resync.Skipped = overrideErr.Error()
+				fmt.Fprintf(out, "override pass: skipped (device paused)\n")
+				return syncRes, nil
+			}
+			syncRes.Resync.Err = overrideErr.Error()
+			return syncRes, fmt.Errorf("override pass failed: %w", overrideErr)
+		}
+		fmt.Fprintf(out, "override pass: complete (uploads=%d replaced=%d inserted=%d confirmedKeys=%d)\n", res.Uploads, res.ReplacedRecords, res.InsertedRecords, res.ConfirmedKeys)
+		fmt.Fprintln(out, "normal collection resumes on the next ordinary sync or scheduled run")
 		return syncRes, nil
 	}
 
@@ -854,6 +935,34 @@ func progressResyncOrDefault(progress func(resync.ProgressEvent), out io.Writer)
 	return func(ev resync.ProgressEvent) {
 		fmt.Fprintf(out, "batch %s: %s submitted=%d accepted=%d rejected=%d skipped=%d replay=%t\n",
 			ev.BatchID, ev.Outcome, ev.Uploaded, ev.Accepted, ev.Rejected, ev.Skipped, ev.Replay)
+	}
+}
+
+func progressOverrideOrDefault(progress func(resync.OverrideProgressEvent), out io.Writer) func(resync.OverrideProgressEvent) {
+	if progress != nil {
+		return progress
+	}
+	return func(ev resync.OverrideProgressEvent) {
+		fmt.Fprintf(out, "override batch %s: %s records=%d accepted=%d rejected=%d replay=%t\n",
+			ev.BatchID, ev.Outcome, ev.Records, ev.Accepted, ev.Rejected, ev.Replay)
+	}
+}
+
+// summarizeOverride maps an override result onto the connect summary.
+// It never claims more than the receipts proved: RejectedRecords and
+// RemainingPending (mapped to Remaining) carry what was NOT repaired.
+func summarizeOverride(res resync.OverrideResult, ran bool) ResyncSummary {
+	return ResyncSummary{
+		Ran:                      ran,
+		DryRun:                   res.DryRun,
+		Completed:                res.Completed,
+		ConsentRevision:          res.Self.ConsentRevision,
+		Uploads:                  res.Uploads,
+		UploadedRecords:          res.UploadedRecords,
+		AcceptedRecords:          res.ReplacedRecords + res.InsertedRecords,
+		RejectedRecords:          res.RejectedRecords,
+		SkippedOutOfScopeRecords: res.WithheldOutOfScope,
+		Remaining:                res.RemainingPending,
 	}
 }
 

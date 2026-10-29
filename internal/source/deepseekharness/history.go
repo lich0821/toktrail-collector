@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"toktrail-collector/internal/local/outbox"
+	"toktrail-collector/internal/local/overrides"
 	"toktrail-collector/internal/local/quarantine"
 	"toktrail-collector/internal/source/adapter"
 )
@@ -89,6 +90,14 @@ func filterKnownDSHRecords(stateDir string, records []adapter.Record) ([]adapter
 			return nil, err
 		}
 	}
+	// Override baseline: an explicitly confirmed override pass may have
+	// declared the current scan authoritative for some keys. Confirmed
+	// overrides supersede the stored payloads for baseline comparison
+	// (the old files stay untouched on disk); a pending override blocks
+	// the whole scan fail-closed until the pass finishes or is abandoned.
+	if err := overrides.ApplyToBaseline(stateDir, adapter.DeepSeekHarnessSource, known); err != nil {
+		return nil, err
+	}
 	fresh := make([]adapter.Record, 0, len(records))
 	for _, rec := range records {
 		key, _ := rec["recordKey"].(string)
@@ -98,7 +107,7 @@ func filterKnownDSHRecords(stateDir string, records []adapter.Record) ([]adapter
 		}
 		if prior, ok := known[key]; ok {
 			if !bytes.Equal(prior, canonical) {
-				return nil, fmt.Errorf("DeepSeek Harness record %s changed after export; refusing to overwrite immutable history", key)
+				return nil, fmt.Errorf("DeepSeek Harness record %s changed after export or after an override baseline; refusing to overwrite immutable history (re-run toktrail resync --all --replace-existing to adopt the current scan)", key)
 			}
 			continue
 		}

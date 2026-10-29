@@ -57,7 +57,10 @@ type skippedRecord struct {
 // server size limits) or a deterministic child batch derived from it (scope
 // filtering or chunking). Deterministic batch identities make a re-run after
 // a crash produce the same upload, which the server answers with a replay
-// receipt instead of counting the records twice.
+// receipt instead of counting the records twice. Replace marks uploads
+// whose records carry acknowledged override content: they are sent with
+// BatchRequest.replaceExisting=true so the server's same-key copy is
+// replaced instead of rejected as record_conflict.
 type jobUpload struct {
 	BatchID         string    `json:"batchId"`
 	File            string    `json:"file"`
@@ -66,6 +69,7 @@ type jobUpload struct {
 	AcceptedRecords int       `json:"acceptedRecords"`
 	RejectedRecords int       `json:"rejectedRecords"`
 	Replay          bool      `json:"replay"`
+	Replace         bool      `json:"replace,omitempty"`
 	SyncedAt        time.Time `json:"syncedAt,omitempty"`
 }
 
@@ -124,16 +128,20 @@ type jobExclusions struct {
 // the server de-duplicates replays. Scope carries the consent scope the
 // recorded decisions were made under; a resume that observes a different
 // live scope re-plans rather than trusting stale done/skip state.
+// OverrideUploads records the receipts of the override-ledger retransmission
+// (acknowledged current-scan records no archived batch carries), so a
+// resume skips them like batch uploads.
 type job struct {
-	Schema      int           `json:"schema"`
-	JobID       string        `json:"jobId"`
-	DeviceID    string        `json:"deviceId"`
-	ServerURL   string        `json:"serverUrl"`
-	CreatedAt   time.Time     `json:"createdAt"`
-	CompletedAt *time.Time    `json:"completedAt,omitempty"`
-	Exclusions  jobExclusions `json:"exclusions,omitempty"`
-	Scope       *jobScope     `json:"scope,omitempty"`
-	Batches     []jobBatch    `json:"batches"`
+	Schema         int           `json:"schema"`
+	JobID          string        `json:"jobId"`
+	DeviceID       string        `json:"deviceId"`
+	ServerURL      string        `json:"serverUrl"`
+	CreatedAt      time.Time     `json:"createdAt"`
+	CompletedAt    *time.Time    `json:"completedAt,omitempty"`
+	Exclusions     jobExclusions `json:"exclusions,omitempty"`
+	Scope          *jobScope     `json:"scope,omitempty"`
+	Batches        []jobBatch    `json:"batches"`
+	OverrideUpload []jobUpload   `json:"overrideUploads,omitempty"`
 }
 
 func (j job) completed() bool { return j.CompletedAt != nil }
@@ -244,6 +252,16 @@ func (j job) validate() error {
 				return fmt.Errorf("corrupt resync journal: batch %s skipped record %d is malformed", b.BatchID, sidx)
 			}
 		}
+	}
+	seenOverride := make(map[string]bool, len(j.OverrideUpload))
+	for uidx, u := range j.OverrideUpload {
+		if u.BatchID == "" || u.File == "" || u.Records <= 0 {
+			return fmt.Errorf("corrupt resync journal: override upload %d is malformed", uidx)
+		}
+		if seenOverride[u.BatchID] {
+			return fmt.Errorf("corrupt resync journal: duplicate override upload %s", u.BatchID)
+		}
+		seenOverride[u.BatchID] = true
 	}
 	return nil
 }

@@ -73,6 +73,7 @@ import (
 
 	"toktrail-collector/internal/local/grants"
 	"toktrail-collector/internal/local/outbox"
+	"toktrail-collector/internal/local/overrides"
 	"toktrail-collector/internal/local/quarantine"
 	"toktrail-collector/internal/local/statedir"
 	"toktrail-collector/internal/source/adapter"
@@ -239,6 +240,39 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	out, err := ledger.Load()
 	if err != nil {
 		return Result{}, err
+	}
+
+	// Override-ledger gate: plain resync retransmits archived payloads,
+	// so it must never run underneath an unfinished override (the
+	// superseded values would collide with the very records the override
+	// is repairing) nor apply another binding's acknowledgments. Pending
+	// attempts block fail-closed; confirmed entries are folded into the
+	// retransmission below (content substitution and the ledger-only
+	// records).
+	ovStore := overrides.New(stateDir)
+	ovLedger, hasOverrides, err := ovStore.Load()
+	if err != nil {
+		return Result{}, err
+	}
+	confirmedOverrides := map[string]overrides.Entry{}
+	if hasOverrides {
+		if err := ovLedger.BindingError(stateDir); err != nil {
+			return Result{}, err
+		}
+		if ovLedger.HasPending() {
+			pending := 0
+			for _, e := range ovLedger.Entries {
+				if e.Status == overrides.StatusPending {
+					pending++
+				}
+			}
+			return Result{}, fmt.Errorf("an override pass is incomplete (%d record(s) pending acknowledgment); plain resync is blocked so it cannot retransmit superseded payloads underneath an unfinished override — re-run toktrail resync --all --replace-existing to finish it, or remove %s only if you accept abandoning the override", pending, ovStore.Path())
+		}
+		for key, entry := range ovLedger.Entries {
+			if entry.Status == overrides.StatusConfirmed {
+				confirmedOverrides[key] = entry
+			}
+		}
 	}
 
 	// An incomplete job is resumed; a completed job is replaced by this
@@ -510,7 +544,7 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 			continue
 		}
 
-		targets, err := deriveUploads(stateDir, *b, parent, inScope, scope)
+		targets, err := deriveUploads(stateDir, *b, parent, inScope, scope, confirmedOverrides)
 		if err != nil {
 			result.Stopped = "upload derivation failed"
 			return result, fmt.Errorf("resync stopped; batch %s stays un-retransmitted: %w", b.BatchID, err)
@@ -553,10 +587,11 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 				return result, fmt.Errorf("cannot persist preflight attempt accounting before the upload of %s; the job stays resumable: %w", t.BatchID, err)
 			}
 			res, runErr := syncclient.Run(ctx, store, syncclient.Options{
-				ServerURL:  serverURL,
-				BatchFile:  t.File,
-				BatchID:    t.BatchID,
-				HTTPClient: client,
+				ServerURL:       serverURL,
+				BatchFile:       t.File,
+				BatchID:         t.BatchID,
+				HTTPClient:      client,
+				ReplaceExisting: t.Replace,
 			})
 			if runErr != nil {
 				switch {
@@ -657,6 +692,125 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 			result.UploadedBatches++
 			result.SkippedOutOfScopeRecords += len(skipped)
 			emit(opt.Progress, progressDoneEvent(*b))
+		}
+	}
+
+	// Override-ledger retransmission: acknowledged current-scan records
+	// that no archived batch carries (keys the override pass added or
+	// repaired beyond the archive) are part of the full restore — without
+	// them, a server that lost its history again could never recover
+	// them. They are re-derived from the CURRENT ledger each run (their
+	// identities hash the attempt id and full content, so a changed
+	// generation re-uploads instead of replaying an old receipt),
+	// grant-gated, scope-evaluated per record, and sent with
+	// replaceExisting=true (the acknowledged override content is the
+	// authority for its key).
+	if result.Stopped == "" && len(confirmedOverrides) > 0 {
+		archived, err := plannedBatchKeys(jb)
+		if err != nil {
+			result.Stopped = "override ledger read failed"
+			return result, fmt.Errorf("resync stopped before the override-ledger retransmission; the job stays resumable: %w", err)
+		}
+		cfg, cfgErr := grants.New(stateDir).Load()
+		if cfgErr != nil {
+			result.Stopped = "local grant config unreadable"
+			return result, fmt.Errorf("resync stopped before the override-ledger retransmission; the job stays resumable: %w", cfgErr)
+		}
+		delta := make([]overrideDelta, 0)
+		for key, entry := range confirmedOverrides {
+			if archived[entry.Source][key] {
+				// The archived batches already retransmit this key (with
+				// the substituted override content); never send it twice.
+				continue
+			}
+			if !grantAllowed(cfg, entry.Source, entry.Input) {
+				continue
+			}
+			canonical, cerr := overrides.Canonical(entry.Record)
+			if cerr != nil {
+				result.Stopped = "override ledger read failed"
+				return result, fmt.Errorf("resync stopped: override ledger record %s is not valid JSON: %w", key, cerr)
+			}
+			in, _, evalErr := scope.evaluateRecord(canonical)
+			if evalErr != nil {
+				result.Stopped = "record unevaluable"
+				return result, fmt.Errorf("resync stopped before the override-ledger retransmission; the job stays resumable: %w", evalErr)
+			}
+			if !in {
+				result.SkippedOutOfScopeRecords++
+				continue
+			}
+			delta = append(delta, overrideDelta{Key: key, Canonical: canonical, Source: entry.Source, Input: entry.Input, IsNew: true, AttemptID: entry.AttemptID})
+		}
+		doneOverride := make(map[string]bool, len(jb.OverrideUpload))
+		for _, u := range jb.OverrideUpload {
+			if u.ReceiptStatus != "" {
+				doneOverride[u.BatchID] = true
+			}
+		}
+		for _, chunk := range chunkOverrideDelta(delta) {
+			id := overrideBatchID(chunk)
+			if doneOverride[id] {
+				continue
+			}
+			if budget && uploads >= opt.MaxBatches {
+				result.Stopped = fmt.Sprintf("upload budget reached (%d upload(s) this run); re-run toktrail resync --all to continue", opt.MaxBatches)
+				break
+			}
+			file, werr := writeChildBatch(stateDir, id, chunkRecords(chunk))
+			if werr != nil {
+				result.Stopped = "override batch write failed"
+				return result, fmt.Errorf("resync stopped before the override-ledger retransmission; the job stays resumable: %w", werr)
+			}
+			if _, perr := ledger.RecordPreflightAttempt(now().UTC()); perr != nil {
+				result.Stopped = "preflight accounting failed"
+				return result, fmt.Errorf("cannot persist preflight attempt accounting before the upload of %s; the job stays resumable: %w", id, perr)
+			}
+			res, runErr := syncclient.Run(ctx, store, syncclient.Options{
+				ServerURL:       serverURL,
+				BatchFile:       file,
+				BatchID:         id,
+				HTTPClient:      client,
+				ReplaceExisting: true,
+			})
+			if runErr != nil {
+				if serr := saveJob(stateDir, jb); serr != nil {
+					return result, serr
+				}
+				result.Stopped = "override-ledger upload failed"
+				return result, fmt.Errorf("resync stopped after the override-ledger upload of %s failed; the job stays resumable: %w", id, runErr)
+			}
+			if res.Receipt.BatchID == "" {
+				result.Stopped = "override-ledger upload failed"
+				return result, fmt.Errorf("resync stopped: the override-ledger upload of %s returned no batch receipt; the job stays resumable", id)
+			}
+			jb.OverrideUpload = append(jb.OverrideUpload, jobUpload{
+				BatchID:         id,
+				File:            file,
+				Records:         len(chunk),
+				ReceiptStatus:   res.Receipt.Status,
+				AcceptedRecords: res.Receipt.AcceptedRecords,
+				RejectedRecords: res.Receipt.RejectedRecords,
+				Replay:          res.Receipt.Replay,
+				Replace:         true,
+				SyncedAt:        res.Receipt.ReceivedAt,
+			})
+			uploads++
+			result.Uploads++
+			result.UploadedRecords += res.Receipt.AcceptedRecords + res.Receipt.RejectedRecords
+			result.AcceptedRecords += res.Receipt.AcceptedRecords
+			result.RejectedRecords += res.Receipt.RejectedRecords
+			if res.Receipt.Replay {
+				result.ReplayReceipts++
+			}
+			if serr := saveJob(stateDir, jb); serr != nil {
+				return result, serr
+			}
+			if drift, why := selfDrift(scope, res.Self, st); drift {
+				result.Stopped = scopeGateStopped
+				result.Remaining = countNotDone(jb)
+				return result, fmt.Errorf("resync stopped mid-pass: the consent scope changed while retransmitting the override ledger (%s); re-run the same command and it re-plans under the live scope", why)
+			}
 		}
 	}
 
@@ -1167,25 +1321,52 @@ func validatePlannedRecord(batchID string, idx int, rec json.RawMessage) error {
 // keys, so the same decision always replays to the same identity and the
 // server de-duplicates it. Withheld records stay in the immutable original
 // file — nothing is quarantined, modified, or deleted.
-func deriveUploads(stateDir string, parent jobBatch, batch syncclient.BatchRequest, inScope []json.RawMessage, scope liveScope) ([]jobUpload, error) {
-	if len(inScope) == len(batch.Records) &&
-		len(batch.Records) <= syncclient.MaxBatchRecords &&
-		envelopeSize(batch) <= syncclient.MaxBatchPayloadBytes {
-		return []jobUpload{{BatchID: parent.BatchID, File: parent.File, Records: len(batch.Records)}}, nil
-	}
-	// Compact every record so chunk sizing is formatting-stable.
-	compact := make([]json.RawMessage, 0, len(inScope))
-	keys := make([]string, 0, len(inScope))
+//
+// Confirmed overrides: when a kept record's key carries an acknowledged
+// override (of the batch's own source), the override content replaces the
+// archived payload — a same-key conflict must send the current scanned
+// record, not the superseded archive value. Any substitution forces child
+// derivation (never the verbatim parent), folds the FULL canonical content
+// and the override attempt ids into the child identity (so an A→B→A
+// content sequence can never replay an earlier receipt), and marks the
+// upload replace=true so the server replaces instead of rejecting.
+func deriveUploads(stateDir string, parent jobBatch, batch syncclient.BatchRequest, inScope []json.RawMessage, scope liveScope, confirmed map[string]overrides.Entry) ([]jobUpload, error) {
+	substituted := false
+	effective := make([]json.RawMessage, 0, len(inScope))
 	for _, rec := range inScope {
-		c, err := compactRecord(rec)
-		if err != nil {
-			return nil, fmt.Errorf("record is not valid JSON: %w", err)
-		}
 		key, err := recordKeyOf(rec)
 		if err != nil {
 			return nil, err
 		}
-		compact = append(compact, c)
+		if entry, ok := confirmed[key]; ok && entry.Source == parent.Source {
+			canonical, cerr := overrides.Canonical(entry.Record)
+			if cerr != nil {
+				return nil, cerr
+			}
+			effective = append(effective, canonical)
+			substituted = true
+			continue
+		}
+		c, err := compactRecord(rec)
+		if err != nil {
+			return nil, fmt.Errorf("record is not valid JSON: %w", err)
+		}
+		effective = append(effective, c)
+	}
+	if !substituted {
+		if len(inScope) == len(batch.Records) &&
+			len(batch.Records) <= syncclient.MaxBatchRecords &&
+			envelopeSize(batch) <= syncclient.MaxBatchPayloadBytes {
+			return []jobUpload{{BatchID: parent.BatchID, File: parent.File, Records: len(batch.Records)}}, nil
+		}
+	}
+	compact := effective
+	keys := make([]string, 0, len(compact))
+	for _, rec := range compact {
+		key, err := recordKeyOf(rec)
+		if err != nil {
+			return nil, err
+		}
 		keys = append(keys, key)
 	}
 	// Partition into chunks of <= MaxBatchRecords records and <=
@@ -1224,14 +1405,41 @@ func deriveUploads(stateDir string, parent jobBatch, batch syncclient.BatchReque
 	}
 	targets := make([]jobUpload, 0, len(chunks))
 	for idx, chunk := range chunks {
-		id := resyncChildBatchID(parent.BatchID, scope.revision, scope, chunkKeys[idx])
+		var id string
+		if substituted {
+			// Override-substituted children hash the full canonical
+			// content and the override attempt ids: a later generation
+			// (or a revert to an earlier payload) derives a different
+			// batch instead of replaying an old receipt.
+			id = resyncOverrideChildBatchID(parent.BatchID, scope.revision, scope, chunk)
+		} else {
+			id = resyncChildBatchID(parent.BatchID, scope.revision, scope, chunkKeys[idx])
+		}
 		file, err := writeChildBatch(stateDir, id, chunk)
 		if err != nil {
 			return nil, err
 		}
-		targets = append(targets, jobUpload{BatchID: id, File: file, Records: len(chunk)})
+		targets = append(targets, jobUpload{BatchID: id, File: file, Records: len(chunk), Replace: substituted})
 	}
 	return targets, nil
+}
+
+// resyncOverrideChildBatchID derives the child identity for an
+// override-substituted batch: hash(parent batch + live revision + scope
+// content + every record's full canonical content). The content — not
+// just the keys — is hashed so any payload change yields a new batch.
+func resyncOverrideChildBatchID(parentBatchID string, revision int64, scope liveScope, records []json.RawMessage) string {
+	h := sha256.New()
+	h.Write([]byte(parentBatchID))
+	h.Write([]byte{0})
+	h.Write([]byte(strconv.FormatInt(revision, 10)))
+	h.Write([]byte{0})
+	h.Write([]byte(scope.fingerprint()))
+	for _, rec := range records {
+		h.Write([]byte{0})
+		h.Write(rec)
+	}
+	return "resync-" + hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 func envelopeSize(batch syncclient.BatchRequest) int {
@@ -1240,6 +1448,38 @@ func envelopeSize(batch syncclient.BatchRequest) int {
 		return 0
 	}
 	return len(b)
+}
+
+// plannedBatchKeys reads the job's planned batch files and returns, per
+// source, the record keys the archived retransmission already covers —
+// the override-ledger retransmission skips those keys so no record is
+// sent twice.
+func plannedBatchKeys(jb job) (map[string]map[string]bool, error) {
+	out := map[string]map[string]bool{}
+	for _, b := range jb.Batches {
+		if out[b.Source] == nil {
+			out[b.Source] = map[string]bool{}
+		}
+		raw, err := os.ReadFile(b.File)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("batch %s history file disappeared (%s)", b.BatchID, b.File)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("batch %s history file cannot be read: %w", b.BatchID, err)
+		}
+		var batch syncclient.BatchRequest
+		if err := json.Unmarshal(raw, &batch); err != nil {
+			return nil, fmt.Errorf("batch %s history file is no longer a valid batch: %w", b.BatchID, err)
+		}
+		for _, rec := range batch.Records {
+			key, err := recordKeyOf(rec)
+			if err != nil {
+				return nil, err
+			}
+			out[b.Source][key] = true
+		}
+	}
+	return out, nil
 }
 
 // resyncChildBatchID derives the deterministic child identity:

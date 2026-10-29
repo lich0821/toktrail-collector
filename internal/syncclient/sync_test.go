@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,6 +18,49 @@ import (
 	"toktrail-collector/internal/local/quarantine"
 	"toktrail-collector/internal/local/statedir"
 )
+
+func TestRunSyncReplaceExistingRequiresExplicitOption(t *testing.T) {
+	for _, replace := range []bool{false, true} {
+		t.Run(fmt.Sprintf("replace=%t", replace), func(t *testing.T) {
+			store := statedir.New(t.TempDir())
+			if err := store.Save(statedir.DeviceState{DeviceID: "dev-1", DeviceSecret: strings.Repeat("b", 64)}); err != nil {
+				t.Fatal(err)
+			}
+			file := writeBatchFile(t, map[string]any{
+				"batchId": "replace-test", "replaceExisting": true,
+				"records": []map[string]any{{"recordKey": "record-1", "kind": "delta", "occurredAt": "2026-10-20T10:00:00Z", "tool": "Codex", "model": "unknown", "input": "10", "cacheRead": "0", "cacheWrite": "0", "output": "5", "adapterVersion": "test", "sourceType": "codex-jsonl"}},
+			})
+			var posted atomic.Bool
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if serveSelf(t, w, r, 7) {
+					return
+				}
+				var body map[string]json.RawMessage
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				var got bool
+				if value, exists := body["replaceExisting"]; exists {
+					if err := json.Unmarshal(value, &got); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if got != replace {
+					t.Errorf("replaceExisting = %t, want %t", got, replace)
+				}
+				posted.Store(true)
+				writeJSON(w, http.StatusAccepted, map[string]any{"batch": map[string]any{"batchId": "replace-test", "status": "accepted", "acceptedRecords": 1, "rejectedRecords": 0, "replay": false, "receivedAt": "2026-10-20T10:12:00Z"}})
+			}))
+			defer server.Close()
+			if _, err := Run(t.Context(), store, Options{ServerURL: server.URL, BatchFile: file, ReplaceExisting: replace}); err != nil {
+				t.Fatal(err)
+			}
+			if !posted.Load() {
+				t.Fatal("batch was not uploaded")
+			}
+		})
+	}
+}
 
 func TestRunSyncUploadsBatchAndPersistsReceipt(t *testing.T) {
 	secret := strings.Repeat("b", 64)

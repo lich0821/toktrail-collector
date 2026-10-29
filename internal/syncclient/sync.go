@@ -81,6 +81,8 @@ type Options struct {
 	BatchID      string
 	HTTPClient   *http.Client
 	ToolStatuses []ToolStatus
+	// ReplaceExisting must be enabled only for an explicitly authorized repair.
+	ReplaceExisting bool
 }
 
 type Result struct {
@@ -100,8 +102,9 @@ type Result struct {
 }
 
 type BatchRequest struct {
-	BatchID string            `json:"batchId"`
-	Records []json.RawMessage `json:"records"`
+	BatchID         string            `json:"batchId"`
+	Records         []json.RawMessage `json:"records"`
+	ReplaceExisting bool              `json:"replaceExisting,omitempty"`
 }
 
 type BatchReceipt struct {
@@ -240,10 +243,14 @@ func Run(ctx context.Context, store statedir.Store, opt Options) (Result, error)
 		}
 		fromOutbox = true
 	}
+	if opt.ReplaceExisting && fromOutbox {
+		return Result{}, errors.New("replacement requires an explicitly selected batch file")
+	}
 	batch, err := loadBatch(batchFile, opt.BatchID)
 	if err != nil {
 		return Result{}, err
 	}
+	batch.ReplaceExisting = opt.ReplaceExisting
 	// Privacy gate before any state change or HTTP traffic: a batch with
 	// extra fields or malformed model identifiers must never leave the device, so
 	// the upload cannot rely on the server rejecting it. The check sits
@@ -364,6 +371,7 @@ func Run(ctx context.Context, store statedir.Store, opt Options) (Result, error)
 	if err != nil {
 		return Result{}, err
 	}
+	batch.ReplaceExisting = opt.ReplaceExisting
 	payload, err := json.Marshal(batch)
 	if err != nil {
 		return Result{}, err
