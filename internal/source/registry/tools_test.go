@@ -52,6 +52,9 @@ func TestLookupTool(t *testing.T) {
 		{"hermes", "Hermes Agent", "hermes-sqlite", true},
 		{"hermes-agent", "Hermes Agent", "hermes-sqlite", true},
 		{"hermesagent", "Hermes Agent", "hermes-sqlite", true},
+		{"OpenClaw", "OpenClaw", "openclaw-sqlite", true},
+		{"openclaw", "OpenClaw", "openclaw-sqlite", true},
+		{"open-claw", "OpenClaw", "openclaw-sqlite", true},
 		{"Cursor", "Cursor", "cursor-dashboard-api", true},
 		{"cursor", "Cursor", "cursor-dashboard-api", true},
 		{"  cursor  ", "Cursor", "cursor-dashboard-api", true},
@@ -162,6 +165,16 @@ func TestResolveDefaultInput(t *testing.T) {
 	}
 	resolved = spec.ResolveDefaultInput(home)
 	expected = filepath.Join("test", "home", ".hermes")
+	if resolved != expected {
+		t.Errorf("expected %q, got %q", expected, resolved)
+	}
+
+	spec, found = LookupTool("OpenClaw")
+	if !found {
+		t.Fatal("OpenClaw not found")
+	}
+	resolved = spec.ResolveDefaultInput(home)
+	expected = filepath.Join("test", "home", ".openclaw", "agents")
 	if resolved != expected {
 		t.Errorf("expected %q, got %q", expected, resolved)
 	}

@@ -19,6 +19,7 @@ Collector 的设计目标是：即使没有账号，本地检查仍然可用。`
 - Kimi Code wire JSONL（`kimi-code-jsonl`）：仅读取 turn 级 `usage.record` 计数。
 - ZCode SQLite（`zcode-sqlite`）：仅读取 `model_usage` 用量表。
 - Hermes Agent SQLite（`hermes-sqlite`）：仅读取 `state.db` 的用量表。
+- OpenClaw SQLite（`openclaw-sqlite`）：仅读取 `transcript_events.event_json` 用量事件。
 - 用于集成与兼容测试的合成/自由格式 `usage-json`。
 
 Collector 上传 Token 使用计数、稳定的隐私安全记录标识，以及下文说明的各采集源模型标识。它不得上传 prompt、消息正文、原始 session ID、原始 message ID 或本地绝对路径。
@@ -61,6 +62,7 @@ internal/source/
   kimiwire/              Kimi CLI / Kimi Code wire JSONL parser 与测试
   zcodesqlite/           ZCode SQLite parser 与测试
   hermessqlite/          Hermes Agent SQLite parser 与测试
+  openclawsqlite/        OpenClaw SQLite parser 与测试
   registry/             显式编译期 adapter 注册表
   pipeline/             扫描、预览、导出与批次拆分
 internal/local/         本地状态、授权、outbox、commit、进度、锁与隔离区
@@ -195,6 +197,20 @@ Hermes 说明：
 - 默认授权目录是 `~/.hermes`；多 profile 目录（如 `~/.hermes/profiles/<name>/state.db`）首版不会自动递归，需要真实样本验证后显式授权。
 - 不读取 `auth.json`、`messages`、FTS 表、日志或 legacy session JSONL，避免接触凭据和正文。
 
+扫描并导出 OpenClaw 使用数据：
+
+```sh
+go run ./cmd/toktrail scan --source openclaw-sqlite --input ~/.openclaw/agents
+go run ./cmd/toktrail export --source openclaw-sqlite --input ~/.openclaw/agents --out ./openclaw-batch.json --batch openclaw-demo-1
+```
+
+OpenClaw 说明：
+
+- 该 source 递归查找 `openclaw-agent.sqlite`，仅读取 `transcript_events.event_json` 中带 `usage` 的事件。
+- 默认授权目录是 `~/.openclaw/agents`；旧版 JSONL 与 legacy/archive artifacts 不作为首版权威来源。
+- 首版不解码 `event_zstd` 压缩事件；发现压缩行时会本地报告跳过，需后续加入 zstd 解码后再覆盖。
+- 不读取 credentials、控制面状态或不含用量的对话正文表；记录只上传计数、模型、时间和脱敏事件标识。
+
 WorkBuddy 说明：
 
 - 该 source 仅被动读取 JSONL：只读 WorkBuddy 追加写入的 session JSONL 文件，绝不写入。
@@ -235,6 +251,7 @@ go run ./cmd/toktrail service install \
   --grant kimi-code-jsonl=$HOME/.kimi-code/sessions \
   --grant zcode-sqlite=$HOME/.zcode/cli/db \
   --grant hermes-sqlite=$HOME/.hermes \
+  --grant openclaw-sqlite=$HOME/.openclaw/agents \
   --interval 30m
 ```
 

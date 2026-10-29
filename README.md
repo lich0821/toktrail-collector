@@ -19,6 +19,7 @@ Supported sources in the current implementation:
 - Kimi Code wire JSONL (`kimi-code-jsonl`): passive turn-scoped `usage.record` counters only.
 - ZCode SQLite (`zcode-sqlite`): passive `model_usage` table counters only.
 - Hermes Agent SQLite (`hermes-sqlite`): passive `state.db` usage table counters only.
+- OpenClaw SQLite (`openclaw-sqlite`): passive `transcript_events.event_json` usage events only.
 - Synthetic/free-form `usage-json` fixtures for integration and compatibility testing.
 
 The collector uploads token usage counters, stable privacy-safe record identifiers, and source-specific model identifiers described below. It must not upload prompts, message bodies, raw session IDs, raw message IDs, or absolute local paths.
@@ -61,6 +62,7 @@ internal/source/
   kimiwire/              Kimi CLI / Kimi Code wire JSONL parser and tests
   zcodesqlite/           ZCode SQLite parser and tests
   hermessqlite/          Hermes Agent SQLite parser and tests
+  openclawsqlite/        OpenClaw SQLite parser and tests
   registry/             Explicit compiled-in adapter registry
   pipeline/             Scan, preview, export, and batch splitting
 internal/local/         Local state, grants, outbox, commit, progress, lock, and quarantine
@@ -197,6 +199,20 @@ Hermes specifics:
 - The default grant directory is `~/.hermes`; profile directories such as `~/.hermes/profiles/<name>/state.db` are not discovered automatically in the first version.
 - The source does not read `auth.json`, messages, FTS tables, logs, or legacy session JSONL, so credentials and conversation bodies stay out of the collector.
 
+Scan and export OpenClaw usage from a local directory:
+
+```sh
+go run ./cmd/toktrail scan --source openclaw-sqlite --input ~/.openclaw/agents
+go run ./cmd/toktrail export --source openclaw-sqlite --input ~/.openclaw/agents --out ./openclaw-batch.json --batch openclaw-demo-1
+```
+
+OpenClaw specifics:
+
+- The source recursively discovers `openclaw-agent.sqlite` files and reads only `transcript_events.event_json` rows that carry usage.
+- The default grant directory is `~/.openclaw/agents`; legacy JSONL and archive artifacts are not authoritative in the first version.
+- Compressed `event_zstd` rows are reported and skipped in this first version; add zstd decoding before relying on compressed stores for complete totals.
+- Credentials, control-plane state, and non-usage transcript content are not uploaded; records contain counts, model, time, and a hashed event identity.
+
 WorkBuddy specifics:
 
 - The source is passive JSONL only: it reads the session JSONL files WorkBuddy appends to and never writes to them.
@@ -237,6 +253,7 @@ go run ./cmd/toktrail service install \
   --grant kimi-code-jsonl=$HOME/.kimi-code/sessions \
   --grant zcode-sqlite=$HOME/.zcode/cli/db \
   --grant hermes-sqlite=$HOME/.hermes \
+  --grant openclaw-sqlite=$HOME/.openclaw/agents \
   --interval 30m
 ```
 

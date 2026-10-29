@@ -96,6 +96,13 @@ var supportedTools = []ToolSpec{
 		Mode:           ModeLocal,
 	},
 	{
+		Tool:           "OpenClaw",
+		Aliases:        []string{"openclaw", "open claw", "open-claw"},
+		Source:         adapter.OpenClawSQLiteSource,
+		DefaultSubpath: []string{".openclaw", "agents"},
+		Mode:           ModeLocal,
+	},
+	{
 		// Cursor is the first account-level network source: usage is
 		// collected by direct authenticated requests to the Cursor
 		// dashboard API using the locally confirmed desktop login. It
