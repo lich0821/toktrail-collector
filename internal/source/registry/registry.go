@@ -8,6 +8,7 @@ import (
 	"toktrail-collector/internal/source/claudecodejsonl"
 	"toktrail-collector/internal/source/codexjsonl"
 	"toktrail-collector/internal/source/deepseekharness"
+	"toktrail-collector/internal/source/qwenjsonl"
 	"toktrail-collector/internal/source/usagejson"
 	"toktrail-collector/internal/source/workbuddyjsonl"
 )
@@ -37,7 +38,7 @@ func New(adapters ...adapter.Adapter) (*Registry, error) {
 var production = mustProduction()
 
 func mustProduction() *Registry {
-	r, err := New(usagejson.Adapter(), codexjsonl.Adapter(), claudecodejsonl.Adapter(), deepseekharness.Adapter(), workbuddyjsonl.Adapter())
+	r, err := New(usagejson.Adapter(), codexjsonl.Adapter(), claudecodejsonl.Adapter(), deepseekharness.Adapter(), workbuddyjsonl.Adapter(), qwenjsonl.Adapter())
 	if err != nil {
 		panic(err)
 	}

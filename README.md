@@ -14,6 +14,7 @@ Supported sources in the current implementation:
 - Claude Code session JSONL (`claude-code-jsonl`).
 - DeepSeek Harness session JSONL (`deepseek-harness`).
 - WorkBuddy AI session JSONL (`workbuddy-jsonl`): passive JSONL only.
+- Qwen Code / Qwen CLI chat JSONL (`qwen-jsonl`): passive `api_response`/`usageMetadata` counters only.
 - Synthetic/free-form `usage-json` fixtures for integration and compatibility testing.
 
 The collector uploads token usage counters, stable privacy-safe record identifiers, and source-specific model identifiers described below. It must not upload prompts, message bodies, raw session IDs, raw message IDs, or absolute local paths.
@@ -52,6 +53,7 @@ internal/source/
   claudecodejsonl/       Claude Code parser, interval integrity, and tests
   deepseekharness/       DeepSeek Harness parser and tests
   workbuddyjsonl/        WorkBuddy JSONL parser and tests
+  qwenjsonl/             Qwen Code / Qwen CLI JSONL parser and tests
   registry/             Explicit compiled-in adapter registry
   pipeline/             Scan, preview, export, and batch splitting
 internal/local/         Local state, grants, outbox, commit, progress, lock, and quarantine
@@ -125,6 +127,20 @@ go run ./cmd/toktrail scan --source workbuddy-jsonl --input ~/.workbuddy-ai/proj
 go run ./cmd/toktrail export --source workbuddy-jsonl --input ~/.workbuddy-ai/projects --out ./workbuddy-batch.json --batch workbuddy-demo-1
 ```
 
+Scan and export Qwen Code / Qwen CLI usage from a local directory:
+
+```sh
+go run ./cmd/toktrail scan --source qwen-jsonl --input ~/.qwen/projects
+go run ./cmd/toktrail export --source qwen-jsonl --input ~/.qwen/projects --out ./qwen-batch.json --batch qwen-demo-1
+```
+
+Qwen specifics:
+
+- The source passively reads Qwen Code / Qwen CLI chat JSONL only; it does not read runtime session IPC tokens, settings, credentials, or unrelated directories.
+- Newer logs prefer `systemPayload.uiEvent.event.name = "qwen-code.api_response"`; when a file has no such events, the loader falls back to `assistant.usageMetadata` so the same main call is not counted twice.
+- `promptTokenCount` / `input_token_count` includes cache read. The collector uploads net input plus `cacheRead`. Qwen logs do not reliably expose cache write, so the first version records it as `0` and never infers it from prices or prompt deltas.
+- The default directory is `~/.qwen/projects`; old `~/.qwen/tmp/...` layouts and `~/.qwen/usage*.jsonl` ledgers are not authoritative sources yet and need later real-sample validation.
+
 WorkBuddy specifics:
 
 - The source is passive JSONL only: it reads the session JSONL files WorkBuddy appends to and never writes to them.
@@ -160,6 +176,7 @@ go run ./cmd/toktrail service install \
   --grant claude-code-jsonl=$HOME/.claude/projects \
   --grant deepseek-harness=$HOME/.dsh/sessions \
   --grant workbuddy-jsonl=$HOME/.workbuddy-ai/projects \
+  --grant qwen-jsonl=$HOME/.qwen/projects \
   --interval 30m
 ```
 

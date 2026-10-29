@@ -31,6 +31,12 @@ func TestLookupTool(t *testing.T) {
 		{"work-buddy", "WorkBuddy", "workbuddy-jsonl", true},
 		{"workbuddy-ai", "WorkBuddy", "workbuddy-jsonl", true},
 		{"  WorkBuddy  ", "WorkBuddy", "workbuddy-jsonl", true},
+		{"Qwen Code", "Qwen Code", "qwen-jsonl", true},
+		{"qwen", "Qwen Code", "qwen-jsonl", true},
+		{"qwen-code", "Qwen Code", "qwen-jsonl", true},
+		{"qwen cli", "Qwen Code", "qwen-jsonl", true},
+		{"qwencli", "Qwen Code", "qwen-jsonl", true},
+		{"  Qwen Code  ", "Qwen Code", "qwen-jsonl", true},
 		{"Cursor", "Cursor", "cursor-dashboard-api", true},
 		{"cursor", "Cursor", "cursor-dashboard-api", true},
 		{"  cursor  ", "Cursor", "cursor-dashboard-api", true},
@@ -91,6 +97,16 @@ func TestResolveDefaultInput(t *testing.T) {
 	}
 	resolved = spec.ResolveDefaultInput(home)
 	expected = filepath.Join("test", "home", ".workbuddy-ai", "projects")
+	if resolved != expected {
+		t.Errorf("expected %q, got %q", expected, resolved)
+	}
+
+	spec, found = LookupTool("Qwen CLI")
+	if !found {
+		t.Fatal("Qwen Code not found")
+	}
+	resolved = spec.ResolveDefaultInput(home)
+	expected = filepath.Join("test", "home", ".qwen", "projects")
 	if resolved != expected {
 		t.Errorf("expected %q, got %q", expected, resolved)
 	}

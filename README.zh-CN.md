@@ -14,6 +14,7 @@ Collector 的设计目标是：即使没有账号，本地检查仍然可用。`
 - Claude Code session JSONL（`claude-code-jsonl`）。
 - DeepSeek Harness session JSONL（`deepseek-harness`）。
 - WorkBuddy AI session JSONL（`workbuddy-jsonl`）：仅被动读取 JSONL。
+- Qwen Code / Qwen CLI chat JSONL（`qwen-jsonl`）：仅被动读取 `api_response`/`usageMetadata` 计数。
 - 用于集成与兼容测试的合成/自由格式 `usage-json`。
 
 Collector 上传 Token 使用计数、稳定的隐私安全记录标识，以及下文说明的各采集源模型标识。它不得上传 prompt、消息正文、原始 session ID、原始 message ID 或本地绝对路径。
@@ -52,6 +53,7 @@ internal/source/
   claudecodejsonl/       Claude Code parser、区间完整性与测试
   deepseekharness/       DeepSeek Harness parser 与测试
   workbuddyjsonl/        WorkBuddy JSONL parser 与测试
+  qwenjsonl/             Qwen Code / Qwen CLI JSONL parser 与测试
   registry/             显式编译期 adapter 注册表
   pipeline/             扫描、预览、导出与批次拆分
 internal/local/         本地状态、授权、outbox、commit、进度、锁与隔离区
@@ -123,6 +125,20 @@ go run ./cmd/toktrail scan --source workbuddy-jsonl --input ~/.workbuddy-ai/proj
 go run ./cmd/toktrail export --source workbuddy-jsonl --input ~/.workbuddy-ai/projects --out ./workbuddy-batch.json --batch workbuddy-demo-1
 ```
 
+扫描并导出 Qwen Code / Qwen CLI 使用数据：
+
+```sh
+go run ./cmd/toktrail scan --source qwen-jsonl --input ~/.qwen/projects
+go run ./cmd/toktrail export --source qwen-jsonl --input ~/.qwen/projects --out ./qwen-batch.json --batch qwen-demo-1
+```
+
+Qwen 说明：
+
+- 该 source 仅被动读取 Qwen Code / Qwen CLI chat JSONL，不读取运行中 session IPC token、设置、凭据或正文之外的目录。
+- 新版优先读取 `systemPayload.uiEvent.event.name = "qwen-code.api_response"` 的遥测计数；若某个文件没有该事件，才回退读取 `assistant.usageMetadata`，避免同一次主调用被双重统计。
+- `promptTokenCount` / `input_token_count` 包含 cache read；Collector 上传时拆成净 input 与 `cacheRead`。Qwen 日志未可靠暴露 cache write，首版记录为 `0`，不从价格或 prompt 差额反推。
+- 默认目录是 `~/.qwen/projects`；旧版 `~/.qwen/tmp/...` 布局和 `~/.qwen/usage*.jsonl` 台账尚未作为权威来源启用，需后续真实样本验证。
+
 WorkBuddy 说明：
 
 - 该 source 仅被动读取 JSONL：只读 WorkBuddy 追加写入的 session JSONL 文件，绝不写入。
@@ -158,6 +174,7 @@ go run ./cmd/toktrail service install \
   --grant claude-code-jsonl=$HOME/.claude/projects \
   --grant deepseek-harness=$HOME/.dsh/sessions \
   --grant workbuddy-jsonl=$HOME/.workbuddy-ai/projects \
+  --grant qwen-jsonl=$HOME/.qwen/projects \
   --interval 30m
 ```
 

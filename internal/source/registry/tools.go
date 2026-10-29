@@ -61,6 +61,13 @@ var supportedTools = []ToolSpec{
 		Mode:           ModeLocal,
 	},
 	{
+		Tool:           "Qwen Code",
+		Aliases:        []string{"qwen", "qwen code", "qwen-code", "qwencode", "qwen cli", "qwen-cli", "qwencli"},
+		Source:         adapter.QwenJSONLSource,
+		DefaultSubpath: []string{".qwen", "projects"},
+		Mode:           ModeLocal,
+	},
+	{
 		// Cursor is the first account-level network source: usage is
 		// collected by direct authenticated requests to the Cursor
 		// dashboard API using the locally confirmed desktop login. It
