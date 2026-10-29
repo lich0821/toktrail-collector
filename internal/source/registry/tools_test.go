@@ -48,6 +48,10 @@ func TestLookupTool(t *testing.T) {
 		{"zcode", "ZCode", "zcode-sqlite", true},
 		{"z-code", "ZCode", "zcode-sqlite", true},
 		{"智谱 zcode", "ZCode", "zcode-sqlite", true},
+		{"Hermes Agent", "Hermes Agent", "hermes-sqlite", true},
+		{"hermes", "Hermes Agent", "hermes-sqlite", true},
+		{"hermes-agent", "Hermes Agent", "hermes-sqlite", true},
+		{"hermesagent", "Hermes Agent", "hermes-sqlite", true},
 		{"Cursor", "Cursor", "cursor-dashboard-api", true},
 		{"cursor", "Cursor", "cursor-dashboard-api", true},
 		{"  cursor  ", "Cursor", "cursor-dashboard-api", true},
@@ -148,6 +152,16 @@ func TestResolveDefaultInput(t *testing.T) {
 	}
 	resolved = spec.ResolveDefaultInput(home)
 	expected = filepath.Join("test", "home", ".zcode", "cli", "db")
+	if resolved != expected {
+		t.Errorf("expected %q, got %q", expected, resolved)
+	}
+
+	spec, found = LookupTool("Hermes")
+	if !found {
+		t.Fatal("Hermes Agent not found")
+	}
+	resolved = spec.ResolveDefaultInput(home)
+	expected = filepath.Join("test", "home", ".hermes")
 	if resolved != expected {
 		t.Errorf("expected %q, got %q", expected, resolved)
 	}

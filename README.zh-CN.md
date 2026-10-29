@@ -18,6 +18,7 @@ Collector 的设计目标是：即使没有账号，本地检查仍然可用。`
 - Kimi CLI wire JSONL（`kimi-cli-jsonl`）：仅读取 `StatusUpdate.token_usage` 计数。
 - Kimi Code wire JSONL（`kimi-code-jsonl`）：仅读取 turn 级 `usage.record` 计数。
 - ZCode SQLite（`zcode-sqlite`）：仅读取 `model_usage` 用量表。
+- Hermes Agent SQLite（`hermes-sqlite`）：仅读取 `state.db` 的用量表。
 - 用于集成与兼容测试的合成/自由格式 `usage-json`。
 
 Collector 上传 Token 使用计数、稳定的隐私安全记录标识，以及下文说明的各采集源模型标识。它不得上传 prompt、消息正文、原始 session ID、原始 message ID 或本地绝对路径。
@@ -59,6 +60,7 @@ internal/source/
   qwenjsonl/             Qwen Code / Qwen CLI JSONL parser 与测试
   kimiwire/              Kimi CLI / Kimi Code wire JSONL parser 与测试
   zcodesqlite/           ZCode SQLite parser 与测试
+  hermessqlite/          Hermes Agent SQLite parser 与测试
   registry/             显式编译期 adapter 注册表
   pipeline/             扫描、预览、导出与批次拆分
 internal/local/         本地状态、授权、outbox、commit、进度、锁与隔离区
@@ -179,6 +181,20 @@ ZCode 说明：
 - 为避免写入 live SQLite 目录，读取使用只读 immutable DSN；刚写入 WAL 且尚未 checkpoint 的记录可能要到下一次采集才可见。
 - `rollout/model-io-*.jsonl`、`usage-archive.sqlite`、`history-freeze.sqlite` 等归档/补偿来源尚未纳入首版，需真实样本验证后再决定是否扩展。
 
+扫描并导出 Hermes Agent 使用数据：
+
+```sh
+go run ./cmd/toktrail scan --source hermes-sqlite --input ~/.hermes
+go run ./cmd/toktrail export --source hermes-sqlite --input ~/.hermes --out ./hermes-batch.json --batch hermes-demo-1
+```
+
+Hermes 说明：
+
+- 该 source 仅读取 Hermes Agent 本地 `state.db` 的 `session_model_usage` 用量表；旧 schema 缺少该表时回退读取 `sessions` 汇总计数。
+- Hermes 的计数是会话/模型累计快照，Collector 以 `kind="cumulative"` 上传，交由服务端按稳定 group/reset 计算差分。
+- 默认授权目录是 `~/.hermes`；多 profile 目录（如 `~/.hermes/profiles/<name>/state.db`）首版不会自动递归，需要真实样本验证后显式授权。
+- 不读取 `auth.json`、`messages`、FTS 表、日志或 legacy session JSONL，避免接触凭据和正文。
+
 WorkBuddy 说明：
 
 - 该 source 仅被动读取 JSONL：只读 WorkBuddy 追加写入的 session JSONL 文件，绝不写入。
@@ -218,6 +234,7 @@ go run ./cmd/toktrail service install \
   --grant kimi-cli-jsonl=$HOME/.kimi/sessions \
   --grant kimi-code-jsonl=$HOME/.kimi-code/sessions \
   --grant zcode-sqlite=$HOME/.zcode/cli/db \
+  --grant hermes-sqlite=$HOME/.hermes \
   --interval 30m
 ```
 

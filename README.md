@@ -18,6 +18,7 @@ Supported sources in the current implementation:
 - Kimi CLI wire JSONL (`kimi-cli-jsonl`): passive `StatusUpdate.token_usage` counters only.
 - Kimi Code wire JSONL (`kimi-code-jsonl`): passive turn-scoped `usage.record` counters only.
 - ZCode SQLite (`zcode-sqlite`): passive `model_usage` table counters only.
+- Hermes Agent SQLite (`hermes-sqlite`): passive `state.db` usage table counters only.
 - Synthetic/free-form `usage-json` fixtures for integration and compatibility testing.
 
 The collector uploads token usage counters, stable privacy-safe record identifiers, and source-specific model identifiers described below. It must not upload prompts, message bodies, raw session IDs, raw message IDs, or absolute local paths.
@@ -59,6 +60,7 @@ internal/source/
   qwenjsonl/             Qwen Code / Qwen CLI JSONL parser and tests
   kimiwire/              Kimi CLI / Kimi Code wire JSONL parser and tests
   zcodesqlite/           ZCode SQLite parser and tests
+  hermessqlite/          Hermes Agent SQLite parser and tests
   registry/             Explicit compiled-in adapter registry
   pipeline/             Scan, preview, export, and batch splitting
 internal/local/         Local state, grants, outbox, commit, progress, lock, and quarantine
@@ -181,6 +183,20 @@ ZCode specifics:
 - Reads use a read-only immutable SQLite DSN to avoid creating sidecar files in the live ZCode directory. WAL-only commits may appear on the next scheduled read after checkpointing.
 - `rollout/model-io-*.jsonl`, `usage-archive.sqlite`, and `history-freeze.sqlite` are not included in the first version; validate real samples before extending the source.
 
+Scan and export Hermes Agent usage from a local directory:
+
+```sh
+go run ./cmd/toktrail scan --source hermes-sqlite --input ~/.hermes
+go run ./cmd/toktrail export --source hermes-sqlite --input ~/.hermes --out ./hermes-batch.json --batch hermes-demo-1
+```
+
+Hermes specifics:
+
+- The source reads only Hermes Agent local `state.db` usage tables. It prefers `session_model_usage` and falls back to `sessions` summary counters for older schemas.
+- Hermes counters are cumulative session/model snapshots, so the collector uploads `kind="cumulative"` records and lets the server derive deltas by stable group/reset keys.
+- The default grant directory is `~/.hermes`; profile directories such as `~/.hermes/profiles/<name>/state.db` are not discovered automatically in the first version.
+- The source does not read `auth.json`, messages, FTS tables, logs, or legacy session JSONL, so credentials and conversation bodies stay out of the collector.
+
 WorkBuddy specifics:
 
 - The source is passive JSONL only: it reads the session JSONL files WorkBuddy appends to and never writes to them.
@@ -220,6 +236,7 @@ go run ./cmd/toktrail service install \
   --grant kimi-cli-jsonl=$HOME/.kimi/sessions \
   --grant kimi-code-jsonl=$HOME/.kimi-code/sessions \
   --grant zcode-sqlite=$HOME/.zcode/cli/db \
+  --grant hermes-sqlite=$HOME/.hermes \
   --interval 30m
 ```
 

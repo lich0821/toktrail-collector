@@ -89,6 +89,13 @@ var supportedTools = []ToolSpec{
 		Mode:           ModeLocal,
 	},
 	{
+		Tool:           "Hermes Agent",
+		Aliases:        []string{"hermes", "hermes agent", "hermes-agent", "hermesagent"},
+		Source:         adapter.HermesSQLiteSource,
+		DefaultSubpath: []string{".hermes"},
+		Mode:           ModeLocal,
+	},
+	{
 		// Cursor is the first account-level network source: usage is
 		// collected by direct authenticated requests to the Cursor
 		// dashboard API using the locally confirmed desktop login. It
