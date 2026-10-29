@@ -6,6 +6,7 @@ package usage_test
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -306,7 +307,7 @@ func TestNormalizeNilVersusZeroCounts(t *testing.T) {
 }
 
 // TestEventCacheApplyCommitReloadDelete covers the ledger persistence:
-// commit is a no-op when clean, Apply+Commit persists with 0600, reload
+// commit is a no-op when clean, Apply+Commit persists (0600 on POSIX), reload
 // round-trips, corrupt files fail closed, and DeleteCacheFile removes
 // exactly once.
 func TestEventCacheApplyCommitReloadDelete(t *testing.T) {
@@ -331,7 +332,9 @@ func TestEventCacheApplyCommitReloadDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ledger file: %v", err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	// Windows reports synthesized Unix permission bits, not its ACLs.
+	// Keep reload/corruption/deletion coverage on every platform below.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("ledger permissions %v, want 0600", info.Mode().Perm())
 	}
 	reloaded, err := usage.LoadCache(dir)

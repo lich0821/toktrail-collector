@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"toktrail-collector/internal/connect"
+	"toktrail-collector/internal/local/grants"
 )
 
 func intPtr(n int) *int { return &n }
@@ -72,6 +73,11 @@ func TestRunConnectCLIIntegration(t *testing.T) {
 	stateDir := t.TempDir()
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+	resolvedHome, err := os.UserHomeDir()
+	if err != nil || filepath.Clean(resolvedHome) != filepath.Clean(homeDir) {
+		t.Fatalf("CLI must use the synthetic home: got %q, err=%v", resolvedHome, err)
+	}
 
 	validTicket := strings.Repeat("7", 64)
 
@@ -132,8 +138,15 @@ func TestRunConnectCLIIntegration(t *testing.T) {
 	}
 
 	connectURL := fmt.Sprintf("%s/api/collector/connect#%s", connectServer.URL, validTicket)
-	err := runConnect([]string{"--state-dir", stateDir, connectURL})
+	err = runConnect([]string{"--state-dir", stateDir, connectURL})
 	if err != nil {
 		t.Fatalf("runConnect failed: %v", err)
+	}
+	enabled, err := grants.New(stateDir).Enabled()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(enabled) != 1 || enabled[0].Source != "codex-jsonl" || filepath.Clean(enabled[0].Input) != filepath.Clean(codexDir) {
+		t.Fatalf("CLI must discover only the synthetic Codex directory: %+v", enabled)
 	}
 }

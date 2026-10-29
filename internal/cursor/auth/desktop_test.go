@@ -264,6 +264,7 @@ func TestFetchUnsupportedSchemaWhenItemTableMissing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = db.Close() })
 	if _, err := db.Exec(`CREATE TABLE synthetic_other (key TEXT)`); err != nil {
 		t.Fatal(err)
 	}
@@ -394,6 +395,9 @@ func createWALStateDB(t *testing.T, path string, keepOpen bool) *sql.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Register before any SQL or skip/fatal path. TempDir cleanup runs
+	// after this callback, so Windows never has to remove an open mapping.
+	t.Cleanup(func() { _ = db.Close() })
 	if _, err := db.Exec(`PRAGMA journal_mode=wal`); err != nil {
 		t.Fatal(err)
 	}
@@ -410,6 +414,22 @@ func createWALStateDB(t *testing.T, path string, keepOpen bool) *sql.DB {
 		return nil
 	}
 	return db
+}
+
+func TestWALFixtureClosesOnEarlySkip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.vscdb")
+	var writer *sql.DB
+	t.Run("early-skip", func(t *testing.T) {
+		writer = createWALStateDB(t, path, true)
+		t.Skip("exercise fixture cleanup before the caller can register a defer")
+	})
+	if writer == nil || writer.Stats().OpenConnections != 0 {
+		t.Fatal("synthetic WAL writer leaked across skipped subtest cleanup")
+	}
+	// This also exercises Windows' rule against removing an open DB file.
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("database is still held after subtest cleanup: %v", err)
+	}
 }
 
 // TestFetchWALModeDBCreatesNoSidecarFiles verifies the read-only contract on
@@ -575,15 +595,30 @@ func TestSQLiteReadOnlyDSNImmutablePolicy(t *testing.T) {
 	}
 }
 
-// removeSHM simulates a crashed writer by unlinking the WAL-index while the
-// writer connection stays open (possible on unix). The writer keeps its
-// mapping; new connections see an orphaned -wal without -shm.
-func removeSHM(t *testing.T, path string) {
+// orphanWAL snapshots only this test's synthetic files, then closes the writer
+// before restoring them without an SHM index. Closing first is necessary on
+// Windows, where an open SQLite mapping prevents unlinking its files. Capturing
+// before Close preserves the pre-checkpoint state for the crash simulation.
+func orphanWAL(t *testing.T, writer *sql.DB, path string) {
 	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("windows cannot unlink files an open connection maps")
+	main, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := os.Remove(path + "-shm"); err != nil {
+	wal, err := os.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close synthetic writer before restoring orphaned WAL: %v", err)
+	}
+	if err := os.WriteFile(path, main, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+"-wal", wal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path + "-shm"); err != nil && !errors.Is(err, os.ErrNotExist) {
 		t.Fatal(err)
 	}
 }
@@ -602,8 +637,7 @@ func TestFetchOrphanedWALAfterCheckpoint(t *testing.T) {
 	if _, err := writer.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 		t.Fatal(err)
 	}
-	removeSHM(t, path)
-	defer func() { _ = writer.Close() }()
+	orphanWAL(t, writer, path)
 	beforeSum := fileSum(t, path)
 	pre := dirEntries(t, filepath.Dir(path))
 	cred, err := DesktopProvider(opts).Fetch(context.Background())
@@ -633,8 +667,7 @@ func TestFetchOrphanedWALUncheckpointed(t *testing.T) {
 		t.Fatal(err)
 	}
 	writer := createWALStateDB(t, path, true)
-	removeSHM(t, path)
-	defer func() { _ = writer.Close() }()
+	orphanWAL(t, writer, path)
 	beforeSum := fileSum(t, path)
 	pre := dirEntries(t, filepath.Dir(path))
 	_, err = DesktopProvider(opts).Fetch(context.Background())

@@ -145,7 +145,11 @@ func snapshot(t *testing.T, dir string) map[string]string {
 		if err != nil {
 			return err
 		}
-		m[strings.TrimPrefix(path, dir)] = string(b)
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+		m[filepath.ToSlash(rel)] = string(b)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -158,10 +162,10 @@ func options(dir string) Options {
 func assertOriginals(t *testing.T, dir string, before map[string]string) {
 	t.Helper()
 	for path, value := range before {
-		if path == "/device.json" {
+		if path == "device.json" {
 			continue
 		}
-		b, err := os.ReadFile(dir + path)
+		b, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(path)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -170,6 +174,22 @@ func assertOriginals(t *testing.T, dir string, before map[string]string) {
 		}
 	}
 }
+func TestSnapshotUsesPortableRelativeKeys(t *testing.T) {
+	dir := t.TempDir()
+	writeJSON(t, filepath.Join(dir, "device.json"), map[string]string{"state": "before"})
+	archiveDir := filepath.Join(dir, "archives")
+	if err := os.MkdirAll(archiveDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSON(t, filepath.Join(archiveDir, "batch.json"), map[string]string{"record": "original"})
+	before := snapshot(t, dir)
+	if len(before) != 2 || before["device.json"] == "" || before["archives/batch.json"] == "" {
+		t.Fatalf("snapshot must use slash-separated relative keys: %v", before)
+	}
+	writeJSON(t, filepath.Join(dir, "device.json"), map[string]string{"state": "acknowledged"})
+	assertOriginals(t, dir, before)
+}
+
 func TestDryRunIsOfflineAndReadOnly(t *testing.T) {
 	for _, empty := range []bool{false, true} {
 		t.Run(fmt.Sprint(empty), func(t *testing.T) {
