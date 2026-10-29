@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"toktrail-collector/internal/local/grants"
 	"toktrail-collector/internal/local/outbox"
 	"toktrail-collector/internal/local/statedir"
 	"toktrail-collector/internal/syncclient"
@@ -96,20 +97,33 @@ func record(key, occurred string) json.RawMessage {
 	b, _ := json.Marshal(map[string]any{"recordKey": key, "kind": "delta", "tool": "Codex", "model": "gpt-5.4", "occurredAt": occurred, "input": "100", "output": "50", "cacheRead": "20", "cacheWrite": "5", "adapterVersion": "synthetic", "sourceType": "fixture"})
 	return b
 }
+func fixtureInput(dir string) string {
+	return filepath.Join(dir, "synthetic", "codex")
+}
+
 func fixture(t *testing.T, url string, batches ...[]json.RawMessage) string {
 	t.Helper()
 	dir := t.TempDir()
 	if err := statedir.New(dir).Save(statedir.DeviceState{DeviceID: "device-resync", DeviceSecret: strings.Repeat("a", 64), ApplicationID: "synthetic-app", ExternalSubjectID: "synthetic-user", ServerURL: url, UploadAuthorized: true, ConsentRevision: 1}); err != nil {
 		t.Fatal(err)
 	}
-	grant := map[string]any{"version": 1, "grants": []map[string]any{{"source": "codex-jsonl", "input": "/synthetic/codex", "enabled": true}}}
-	writeJSON(t, filepath.Join(dir, "grants.json"), grant)
+	input := fixtureInput(dir)
+	rel, err := filepath.Rel(dir, input)
+	if err != nil || !filepath.IsAbs(input) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		t.Fatalf("synthetic input must be absolute and inside the test directory: %q", input)
+	}
+	if err := os.MkdirAll(input, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := grants.New(dir).Enable("codex-jsonl", input); err != nil {
+		t.Fatalf("create synthetic source grant: %v", err)
+	}
 	var entries []outbox.BatchEntry
 	for idx, records := range batches {
 		id := fmt.Sprintf("batch-%02d", idx)
 		file := filepath.Join(dir, id+".json")
 		writeJSON(t, file, syncclient.BatchRequest{BatchID: id, Records: records})
-		entries = append(entries, outbox.BatchEntry{BatchID: id, File: file, Source: "codex-jsonl", Input: "/synthetic/codex", Status: outbox.StatusSynced, RecordCount: len(records), CreatedAt: time.Now().UTC()})
+		entries = append(entries, outbox.BatchEntry{BatchID: id, File: file, Source: "codex-jsonl", Input: input, Status: outbox.StatusSynced, RecordCount: len(records), CreatedAt: time.Now().UTC()})
 	}
 	if err := outbox.New(dir).Save(outbox.Outbox{Batches: entries}); err != nil {
 		t.Fatal(err)
@@ -174,6 +188,31 @@ func assertOriginals(t *testing.T, dir string, before map[string]string) {
 		}
 	}
 }
+func TestFixtureUsesNativeAbsoluteGrantPaths(t *testing.T) {
+	dir := fixture(t, "http://127.0.0.1:1", []json.RawMessage{record("fixture-path", "2026-10-28T00:00:00Z")})
+	enabled, err := grants.New(dir).Enabled()
+	if err != nil || len(enabled) != 1 {
+		t.Fatalf("load synthetic source grant: grants=%v err=%v", enabled, err)
+	}
+	input := enabled[0].Input
+	rel, err := filepath.Rel(dir, input)
+	if err != nil || !filepath.IsAbs(input) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		t.Fatalf("grant must use an absolute path inside its fixture: %q", input)
+	}
+	if info, err := os.Stat(input); err != nil || !info.IsDir() {
+		t.Fatalf("grant must refer to an existing synthetic directory: %v", err)
+	}
+	ledger, err := outbox.New(dir).Load()
+	if err != nil || len(ledger.Batches) != 1 {
+		t.Fatalf("load synthetic archives: %v", err)
+	}
+	for _, entry := range ledger.Batches {
+		if entry.Input != input || !filepath.IsAbs(entry.Input) {
+			t.Fatalf("archive input must match its native source grant: %q vs %q", entry.Input, input)
+		}
+	}
+}
+
 func TestSnapshotUsesPortableRelativeKeys(t *testing.T) {
 	dir := t.TempDir()
 	writeJSON(t, filepath.Join(dir, "device.json"), map[string]string{"state": "before"})
@@ -294,7 +333,9 @@ func TestAuthorizationStopsResync(t *testing.T) {
 			case "revoked":
 				remote.revoked = true
 			case "local-disabled":
-				writeJSON(t, filepath.Join(dir, "grants.json"), map[string]any{"version": 1, "grants": []map[string]any{{"source": "codex-jsonl", "input": "/synthetic/codex", "enabled": false}}})
+				if _, found, err := grants.New(dir).Disable("codex-jsonl", fixtureInput(dir)); err != nil || !found {
+					t.Fatalf("disable synthetic grant: found=%t err=%v", found, err)
+				}
 			case "local-missing":
 				if err := os.Remove(filepath.Join(dir, "grants.json")); err != nil {
 					t.Fatal(err)
