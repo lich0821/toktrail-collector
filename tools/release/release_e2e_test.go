@@ -57,7 +57,7 @@ func TestEndToEndRelease(t *testing.T) {
 	releaseScript := filepath.Join(repoRoot, "scripts", "release.sh")
 	buildCmd := exec.Command("sh", releaseScript, "build", version, "--dist", distRoot, "--key", keyPath)
 	buildCmd.Dir = repoRoot
-	buildCmd.Env = append(os.Environ(), "GOPROXY=off", "GOCACHE="+filepath.Join(repoRoot, ".gocache"))
+	buildCmd.Env = append(os.Environ(), "GOPROXY=off")
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("scripts/release.sh failed: %v\n%s", err, out)
 	}
@@ -143,7 +143,7 @@ func TestEndToEndRelease(t *testing.T) {
 		"-pubkey", pinPath,
 		"-version", version)
 	verifyCmd.Dir = repoRoot
-	verifyCmd.Env = append(os.Environ(), "GOPROXY=off", "GOCACHE="+filepath.Join(repoRoot, ".gocache"))
+	verifyCmd.Env = append(os.Environ(), "GOPROXY=off")
 	if out, err := verifyCmd.CombinedOutput(); err != nil {
 		t.Fatalf("tools/release verify-capabilities failed: %v\n%s", err, out)
 	}

@@ -6,6 +6,27 @@ TokTrail Collector is a local-first Go CLI for collecting privacy-filtered token
 
 The collector is designed so that local inspection stays useful without an account: `scan`, `preview`, `export`, and diagnostics work offline. Uploading requires an explicit device binding and a fresh server-side consent preflight.
 
+## WCF Token Leaderboard
+
+How many tokens did you burn today? Connect your developer tools with TokTrail Collector to track your usage on the **WCF Token Leaderboard** and explore how the community uses AI.
+
+**[View live leaderboard →](https://tt.bjxdql.cn/)** · **[Setup guide →](https://tt.bjxdql.cn/setup)**
+
+Filter by time range, tool, model and city, with optional cache read/write tokens. Uploading usage and appearing publicly require separate consent; local scanning works without an account.
+
+<details>
+<summary>Preview a leaderboard share card</summary>
+
+<p align="center">
+  <a href="https://tt.bjxdql.cn/">
+    <img src="docs/images/leaderboard-example.png" alt="WCF daily leaderboard share card showing the top three, usage rankings, tools and models" width="360" />
+  </a>
+</p>
+
+Example captured on **2026-11-11**. Visit the [live leaderboard](https://tt.bjxdql.cn/) for current rankings and data. Token usage is not a measure of developer productivity.
+
+</details>
+
 ## What it collects
 
 Supported sources in the current implementation:
@@ -355,14 +376,14 @@ Run these before committing:
 
 ```sh
 gofmt -l cmd internal tools
-GOCACHE="$PWD/.gocache" GOPROXY=off go test ./...
-GOCACHE="$PWD/.gocache" GOPROXY=off go vet ./...
+GOPROXY=off go test ./...
+GOPROXY=off go vet ./...
 ```
 
 The release end-to-end test is slower and gated explicitly:
 
 ```sh
-GOCACHE="$PWD/.gocache" GOPROXY=off TOKTRAIL_RELEASE_E2E=1 go test ./tools/release/ -run '^TestEndToEndRelease$' -count=1 -v
+GOPROXY=off TOKTRAIL_RELEASE_E2E=1 go test ./tools/release/ -run '^TestEndToEndRelease$' -count=1 -v
 ```
 
 ## Known Cursor limitations (account-level network source)

@@ -13,14 +13,14 @@ Run the standard checks from the repository root:
 
 ```sh
 gofmt -l cmd internal tools
-GOCACHE="$PWD/.gocache" GOPROXY=off go test ./...
-GOCACHE="$PWD/.gocache" GOPROXY=off go vet ./...
+GOPROXY=off go test ./...
+GOPROXY=off go vet ./...
 ```
 
 The release end-to-end test is slower and must be enabled explicitly:
 
 ```sh
-GOCACHE="$PWD/.gocache" GOPROXY=off TOKTRAIL_RELEASE_E2E=1 go test ./tools/release/ -run '^TestEndToEndRelease$' -count=1 -v
+GOPROXY=off TOKTRAIL_RELEASE_E2E=1 go test ./tools/release/ -run '^TestEndToEndRelease$' -count=1 -v
 ```
 
 ### Local Windows testing

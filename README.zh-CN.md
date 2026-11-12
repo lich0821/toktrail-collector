@@ -6,6 +6,27 @@ TokTrail Collector 是一个本地优先的 Go CLI，用于从受支持的本地
 
 Collector 的设计目标是：即使没有账号，本地检查仍然可用。`scan`、`preview`、`export` 和诊断命令都可以离线运行；上传则需要显式设备绑定，并在每次上传前进行服务端 consent 预检。
 
+## WCF 燃元榜
+
+今天，你燃了多少 Token？用 TokTrail Collector 连接开发工具，在 **WCF 燃元榜**记录个人用量，看看社区里大家的 AI 使用情况。
+
+**[查看实时榜单 →](https://tt.bjxdql.cn/)** · **[接入指引 →](https://tt.bjxdql.cn/setup)**
+
+支持按时间、工具、模型和城市筛选，并可选择是否计入缓存读写。上传用量与公开上榜分别授权；本地扫描无需账号。
+
+<details>
+<summary>展开查看榜单分享卡片</summary>
+
+<p align="center">
+  <a href="https://tt.bjxdql.cn/">
+    <img src="docs/images/leaderboard-example.png" alt="WCF 燃元榜每日分享卡片，展示前三名、用量排名及工具和模型信息" width="360" />
+  </a>
+</p>
+
+示例截图摄于 **2026-11-11**，最新排名与数据请查看[实时榜单](https://tt.bjxdql.cn/)。Token 用量不代表开发效率。
+
+</details>
+
 ## 采集什么
 
 当前实现支持：
@@ -339,14 +360,14 @@ GitHub Actions 和 `scripts/release.sh` 编排六平台构建；维护者工具�
 
 ```sh
 gofmt -l cmd internal tools
-GOCACHE="$PWD/.gocache" GOPROXY=off go test ./...
-GOCACHE="$PWD/.gocache" GOPROXY=off go vet ./...
+GOPROXY=off go test ./...
+GOPROXY=off go vet ./...
 ```
 
 较慢的 release E2E 测试需要显式开启：
 
 ```sh
-GOCACHE="$PWD/.gocache" GOPROXY=off TOKTRAIL_RELEASE_E2E=1 go test ./tools/release/ -run '^TestEndToEndRelease$' -count=1 -v
+GOPROXY=off TOKTRAIL_RELEASE_E2E=1 go test ./tools/release/ -run '^TestEndToEndRelease$' -count=1 -v
 ```
 
 ## Cursor 账号用量采集

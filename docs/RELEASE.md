@@ -35,7 +35,7 @@ The installer replaces the collector binary and, when declared by the signed Win
 Generate a key in an explicitly chosen private location:
 
 ```sh
-GOCACHE="$PWD/.gocache" GOPROXY=off go run ./cmd/toktrail-release keygen \
+GOPROXY=off go run ./cmd/toktrail-release keygen \
   -out .release-keys/release-2026.pem
 ```
 
@@ -57,7 +57,7 @@ If the key may have been stolen rather than simply lost, treat it as compromised
 From the collector repository root, use the build orchestration script:
 
 ```sh
-GOCACHE="$PWD/.gocache" GOPROXY=off sh scripts/release.sh v0.1.0 \
+GOPROXY=off sh scripts/release.sh v0.1.0 \
   --dist dist --key /trusted/path/release.pem
 ```
 
@@ -290,9 +290,9 @@ Boundaries — what an upgrade deliberately does **not** do:
 
 ```sh
 gofmt -l cmd internal tools
-GOCACHE="$PWD/.gocache" GOPROXY=off go vet ./...
-GOCACHE="$PWD/.gocache" GOPROXY=off go test ./... -count=1
-GOCACHE="$PWD/.gocache" GOPROXY=off TOKTRAIL_RELEASE_E2E=1 \
+GOPROXY=off go vet ./...
+GOPROXY=off go test ./... -count=1
+GOPROXY=off TOKTRAIL_RELEASE_E2E=1 \
   go test ./tools/release -run '^TestEndToEndRelease$' -count=1 -v
 ```
 
